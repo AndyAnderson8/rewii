@@ -74,6 +74,7 @@ def cached(url: str, name: str, max_age: float = 7 * 86400, refresh: bool = Fals
         return p
     try:
         data = get_bytes(url)
+        assert data is not None
     except NetError:
         if p.exists():
             return p

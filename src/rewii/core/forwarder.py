@@ -382,3 +382,21 @@ def channel_game_id(path: Path) -> Optional[str]:
     except Exception:
         return None
     return None
+
+
+def cover_for_channel(game_id: str, lang: str = "EN") -> bytes | None:
+    """Front cover art for the "cover" launch style: cache first, then GameTDB."""
+    from . import covers
+    for kind in ("cover", "coverfullHQ", "cover3D"):
+        p = covers.cached_cover_path(game_id, kind)
+        if p is not None:
+            return p.read_bytes()
+    try:
+        data, _region = covers.download_cover(game_id, "cover", lang)
+    except Exception:
+        return None
+    if data:
+        p = covers.cache_path(game_id, "cover")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+    return data

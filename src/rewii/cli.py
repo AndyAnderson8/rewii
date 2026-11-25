@@ -42,7 +42,7 @@ def _titles(settings: Settings):
     try:
         from .core.gametdb import TitleDB
         db = TitleDB.load(settings)
-        return lambda gid: db.title(gid, None) if db else None
+        return lambda gid: (db.get(gid).title if db.get(gid) else None)
     except Exception:
         return None
 
@@ -130,13 +130,9 @@ def cmd_channel(a) -> int:
     for p in a.files:
         cov = None
         if style == "cover":
-            try:
-                from .core.disc import disc_info
-                from .core import covers
-                cp = covers.cached_cover_path(disc_info(p).game_id, "cover", fetch=True)
-                cov = cp.read_bytes() if cp else None
-            except Exception:
-                cov = None
+            from .core.disc import disc_info
+            from .core.forwarder import cover_for_channel
+            cov = cover_for_channel(disc_info(p).game_id, s.cover_lang)
         ci = make_channel(Path(p), out, style=style, cover_png=cov, fat=not a.wbfs_partition)
         print(f"{ci.path}  ({ci.channel_id}, {style})")
     return 0

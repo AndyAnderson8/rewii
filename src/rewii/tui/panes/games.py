@@ -9,7 +9,7 @@ from textual.containers import Horizontal
 from textual.widgets import Button, DataTable, Input, Label, Static
 
 from ...core import games as G
-from ...core.forwarder import BannerBrickRisk, brick_risk, make_channel
+from ...core.forwarder import brick_risk, cover_for_channel, make_channel
 from ..base import Pane
 from ..widgets import human_size
 
@@ -105,7 +105,7 @@ class GamesPane(Pane):
             if r.drive and self.layout_:
                 try:
                     st = covers.cover_status(self.layout_, g.game_id)
-                    cov = "yes" if any(st.values()) else "-"
+                    cov = "yes" if any(v for k, v in st.items() if k != "cached") else "-"
                 except Exception:
                     cov = "?"
             status = (r.drive.problem if r.drive and r.drive.problem else
@@ -315,20 +315,13 @@ class GamesPane(Pane):
             yes="Yes", no="Just save on PC")
 
         def run(progress, cancel):
-            from ...core import covers
             from ...core.progress import Reporter
             rep = Reporter(progress, cancel, total=len(rows))
             out = []
             for r in rows:
                 g = r.drive or r.lib
                 rep.note(f"Building channel for {g.title}")
-                cov = None
-                if s.forwarder_style == "cover":
-                    try:
-                        p = covers.cached_cover_path(g.game_id, "cover", fetch=True)
-                        cov = p.read_bytes() if p else None
-                    except Exception:
-                        cov = None
+                cov = cover_for_channel(g.game_id, s.cover_lang) if s.forwarder_style == "cover" else None
                 ci = make_channel(g.path, s.channels_dir, style=s.forwarder_style, cover_png=cov,
                                   title=g.title)
                 if stage:
@@ -374,11 +367,23 @@ class GamesPane(Pane):
         layout, s = self.layout_, self.settings
 
         def run(progress, cancel):
-            return cheats.fetch_cheats(layout, ids, settings=s, progress=progress, cancel=cancel)
+            from ...core.progress import Reporter
+            rep = Reporter(progress, cancel, total=len(ids))
+            found, none = 0, []
+            for gid in ids:
+                rep.note(f"Cheats for {gid}")
+                if cheats.fetch_cheats(layout, gid):
+                    found += 1
+                else:
+                    none.append(gid)
+                rep.advance(1)
+            return found, none
 
         res = await self.job(f"Downloading cheat codes for {len(ids)} game(s)", run)
         if res is not None:
-            self.app.notify("Cheats saved to txtcodes/ — turn them on per game in USB Loader GX")
+            self.app.notify(f"Cheats saved for {res[0]} game(s) in txtcodes/" +
+                            (f"; none exist for {len(res[1])}" if res[1] else "") +
+                            ". Turn them on per game in USB Loader GX.")
 
     @work(exclusive=True, group="games-act")
     async def action_normalize(self) -> None:

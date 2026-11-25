@@ -22,7 +22,10 @@ class Pane(Vertical):
     Pane .title { text-style: bold; color: $accent; margin: 0 0 1 0; }
     Pane .hint { color: $text-muted; margin-bottom: 1; }
     Pane .toolbar { height: auto; margin-bottom: 1; }
-    Pane .toolbar Button { margin-right: 1; min-width: 8; height: 1; border: none; }
+    Pane .toolbar Button { margin-right: 1; min-width: 8; height: 1; border: none; line-pad: 1; }
+    Pane .toolbar Button.-primary, Pane .toolbar Button.-warning, Pane .toolbar Button.-error,
+    Pane .toolbar Button:focus, Pane .toolbar Button:hover { border: none; height: 1; }
+    Pane .toolbar Select { width: 30; margin-right: 1; }
     Pane .toolbar Input { height: 1; border: none; width: 30; }
     Pane DataTable { height: 1fr; }
     """
