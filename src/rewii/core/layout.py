@@ -137,6 +137,10 @@ class DriveLayout:
         return self.root / "riivolution"
 
     @property
+    def themes(self) -> Path:         # csm-installer
+        return self.root / "themes"
+
+    @property
     def bootmii(self) -> Path:
         return self.root / "bootmii"
 
