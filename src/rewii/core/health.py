@@ -178,12 +178,21 @@ def check_apps(layout: DriveLayout) -> list[Finding]:
                            "Homebrew Channel can't see those apps. ReWii can move them up.",
                            "flatten_nested_apps", nested))
     present = set()
+    data_only = {"images", "cache_bnr", "cache", "theme", "language", "gxglobal.cfg", "gxgamesettings.cfg"}
     for app in _subdirs(apps):
         if app is nested:
             continue
-        present.add(app.name.lower())
         if _has_boot(app):
+            present.add(app.name.lower())
             continue
+        # loader data (covers, banner cache, settings) saved before the app itself is installed
+        try:
+            names = {c.name.lower() for c in app.iterdir()}
+        except OSError:
+            names = set()
+        if names and names <= data_only:
+            continue
+        present.add(app.name.lower())
         inner_apps = _ci_child(app, "apps")
         if inner_apps is not None and inner_apps.is_dir():
             out.append(Finding("nested_apps", ERROR,
