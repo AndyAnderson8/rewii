@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.egg-info/
+# never commit game data, keys or Nintendo binaries
+*.wbfs
+*.wbf[0-9]
+*.iso
+*.rvz
+*.wad
+*.bin
+common-key
