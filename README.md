@@ -2,14 +2,14 @@
 
 **The all-in-one toolkit for softmodded Wiis.** One app for everything you do on the computer side once your Wii has the Homebrew Channel:
 
-- **Games** – add Wii and GameCube games (ISO, WBFS, CISO, RVZ, WIA, NKit, CleanRip dumps), put them on the drive in the right layout, verify them, back them up, and download covers and cheats.
+- **Games** – add Wii and GameCube games (ISO, WBFS, CISO, RVZ, WIA, NKit, CleanRip dumps), put them on the drive in the right layout, verify them, back them up, rename them, download covers, and pick cheat codes (for USB Loader GX and GameCube channels).
 - **Channels** – put any Wii or GameCube game on the Wii Menu. For Wii games, choose the launch screen: the game's **cover art** or a plain **black** screen. GameCube channels start the game straight in Nintendont.
 - **WADs** – inspect any WAD (type, region, IOS, signature, damage) and stage it for YAWMME. Dangerous ones (wrong region or console system files) are blocked.
 - **Homebrew** – browse, install and update all 300+ Open Shop Channel apps, or send one straight to the Wii over Wi-Fi.
 - **Saves** – back up Wii and GameCube saves with full version history, and restore any version.
 - **Backups** – snapshot the whole drive, clone it to a bigger drive, and keep verified NAND backups with an SD rescue kit for BootMii.
 - **Drive** – detect problems and fix them, **format FAT32** at any size (Windows can't format drives over 32 GB as FAT32), and set up the essential apps in one click.
-- **System & Guides** – step-by-step guides for the parts done on the Wii itself: NAND backup, Priiloader, d2x cIOS, installing channels, saves, online play. ReWii downloads the files each guide needs. It can also read SysCheck reports.
+- **System & Guides** – step-by-step guides for the parts done on the Wii itself: NAND backup, Priiloader, d2x cIOS, installing channels, saves, online play. ReWii downloads the files each guide needs. It can also read SysCheck reports, update the Homebrew Channel and BootMii (HackMii installer), keep Priiloader's hack list current or add patches, and edit BootMii's and USB Loader GX's settings.
 
 Exploiting the Wii (installing the Homebrew Channel) is out of scope. See [wii.hacks.guide](https://wii.hacks.guide) for that.
 
@@ -75,6 +75,10 @@ ReWii's channels carry their own copy of Configurable USB Loader in "direct star
 
 - Make the channel for disc 1; Nintendont switches to `disc2.iso` itself.
 - The channel points at the game's folder on the drive. If you rename or move the game, make the channel again.
+
+## License
+
+ReWii is free software under the **GNU GPL v3 or later** (see [LICENSE](LICENSE)). Bundled third-party files keep their own licenses (see [NOTICE.md](NOTICE.md)).
 
 ## Credits
 

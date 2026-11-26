@@ -17,7 +17,8 @@ PREPARE_APPS = {
     "cleanrip": ["CleanRip"],
 }
 SYSCHECK_FIX_GUIDE = {"install_priiloader": "priiloader", "install_d2x_cios": "cios",
-                      "update_43": "recovery", "restore_ios": "recovery"}
+                      "update_43": "recovery", "restore_ios": "recovery", "update_hbc": "update-hbc",
+                      "install_hbc": "update-hbc", "install_bootmii": "update-hbc"}
 
 
 class SystemPane(Pane):
@@ -37,6 +38,10 @@ class SystemPane(Pane):
             yield Button("4.3 update files", id="update")
             yield Button("Themes…", id="themes")
             yield Button("Riivolution mod…", id="riivo")
+        with Horizontal(classes="toolbar"):
+            yield Button("Update Homebrew Channel / BootMii", id="hackmii")
+            yield Button("Priiloader hacks…", id="hacks")
+            yield Button("BootMii settings (SD)…", id="bootmii")
         with Horizontal(id="main"):
             yield ListView(*[ListItem(Label(("★ " if g.essential else "  ") + g.title), id=f"g-{g.id}")
                              for g in GD.GUIDES], id="glist")
@@ -71,7 +76,8 @@ class SystemPane(Pane):
     @on(Button.Pressed)
     def _b(self, ev: Button.Pressed) -> None:
         {"prepare": self.action_prepare, "syscheck": self.action_syscheck, "cios": self.action_cios,
-         "update": self.action_update, "themes": self.action_themes, "riivo": self.action_riivo}[ev.button.id]()
+         "update": self.action_update, "themes": self.action_themes, "riivo": self.action_riivo,
+         "hackmii": self.action_hackmii, "hacks": self.action_hacks, "bootmii": self.action_bootmii}[ev.button.id]()
 
     # ------------------------------------------------------------------ prepare
     async def _install_slugs(self, slugs: list[str]) -> bool:
@@ -99,6 +105,12 @@ class SystemPane(Pane):
         if g.prepare == "cios":
             await self._cios()
             return
+        if g.prepare == "hackmii":
+            await self._hackmii()
+            return
+        if g.prepare == "priiloader-hacks":
+            await self._hacks()
+            return
         if await self._install_slugs(PREPARE_APPS[g.prepare]):
             await self.message("Ready", f"The files for “{g.title}” are on the drive. Follow the steps on the Wii.")
 
@@ -107,8 +119,12 @@ class SystemPane(Pane):
         from ...core.wad import Refused
         s, lay = self.settings, self.layout_
         if s.console_type == "mini":
-            await self.message("Wii mini", "The Wii mini needs the special d2xl cIOS installer, which isn't on "
-                               "the Open Shop Channel. Get it from https://wii.hacks.guide/cios (Wii mini tab).")
+            from ...core import sysfiles
+            if not await self.confirm("Wii mini cIOS", "The Wii mini uses the d2xl cIOS installer (from "
+                                      "wii.hacks.guide). Put it on the drive?\n\nOn the Wii: Homebrew Channel → "
+                                      "d2x cIOS Installer (mini) → base 57, slot 249 → Install."):
+                return
+            await self.job("Getting the d2xl installer", lambda p, c: sysfiles.stage_d2xl_mini(lay, p, c))
             return
         try:
             entries = nus.cios_entries(s)
@@ -152,6 +168,87 @@ class SystemPane(Pane):
                 "Menu. Have Priiloader and a NAND backup first!"):
             return
         await self.job("Downloading update files", lambda p, c: nus.prepare_update_43(lay, s, p, c))
+
+    # ------------------------------------------------------------------ HBC / Priiloader / BootMii
+    async def _hackmii(self) -> None:
+        if not self.need_drive():
+            return
+        from ...core import sysfiles
+        lay = self.layout_
+        res = await self.job("Getting the HackMii installer", lambda p, c: sysfiles.stage_hackmii(lay, p, c))
+        if res is not None:
+            self.show_guide("update-hbc")
+            await self.message("Ready", "The HackMii installer is on the drive. Follow the steps in the guide.")
+
+    @work(exclusive=True, group="sys")
+    async def action_hackmii(self) -> None:
+        await self._hackmii()
+
+    async def _hacks(self) -> None:
+        if not self.need_drive():
+            return
+        from ...core import sysfiles
+        from ..widgets import PromptText
+        lay = self.layout_
+        p = sysfiles.hacks_path(lay)
+        have = sysfiles.hack_names(p.read_text("utf-8", "replace")) if p.is_file() else []
+        update = await self.confirm(
+            "Priiloader hacks",
+            (f"The drive has {len(have)} hacks in apps/priiloader/hacks_hash.ini." if have else
+             "No Priiloader hack list on the drive yet.") +
+            "\n\nUpdate to the newest official list, or add a patch you generated?",
+            yes="Update list", no="Add a patch")
+        if update:
+            res = await self.job("Updating hack list", lambda pr, c: sysfiles.update_priiloader_hacks(lay, pr, c))
+            if res is not None:
+                await self.message("Hack list updated", f"Priiloader {res[1]} hack list saved to {res[0]}.\n\n"
+                                   "Turn hacks on in Priiloader → System Menu Hacks.")
+            return
+        text = await self.app.push_screen_wait(PromptText(
+            "Add a Priiloader patch", "Paste the patch text (it starts with a [Name] line):"))
+        if not text:
+            return
+        try:
+            sysfiles.add_custom_hack(lay, text)
+        except sysfiles.SysFileError as e:
+            await self.message("Not added", str(e), error=True)
+            return
+        await self.message("Patch added", "Now enable it on the Wii: hold RESET at power-on → Priiloader → "
+                           "System Menu Hacks.")
+
+    @work(exclusive=True, group="sys")
+    async def action_hacks(self) -> None:
+        await self._hacks()
+
+    @work(exclusive=True, group="sys")
+    async def action_bootmii(self) -> None:
+        from ...core import sysfiles
+        from ..widgets import ChoiceForm
+        picked = await self.pick("Choose the SD card (with the bootmii folder)", folder=True)
+        if not picked:
+            return
+        sd = picked[0]
+        if not (sd / "bootmii").is_dir():
+            await self.message("No BootMii here", "That card has no bootmii folder. Make one with Backups → "
+                               "Make SD rescue kit, or the HackMii installer.", error=True)
+            return
+        cur = sysfiles.read_bootmii_ini(sd)
+        fields = [
+            ("AUTOBOOT", "Start automatically", [("Wii Menu", "SYSMENU"), ("Homebrew Channel", "HBC"),
+                                                 ("Off (show BootMii menu)", "OFF")], cur.get("AUTOBOOT", "SYSMENU")),
+            ("BOOTDELAY", "Seconds before starting", [(str(i), str(i)) for i in range(11)], cur.get("BOOTDELAY", "1")),
+            ("VIDEO", "Video mode", [("NTSC", "NTSC"), ("PAL 50Hz", "PAL50"), ("PAL 60Hz", "PAL60"),
+                                     ("Progressive", "PROGRESSIVE")], cur.get("VIDEO", "NTSC")),
+        ]
+        res = await self.app.push_screen_wait(ChoiceForm(
+            "BootMii settings", "If BootMii is installed as boot2, these decide what happens at power-on. "
+            "The guide recommends: Wii Menu, 1 second.", fields))
+        if res:
+            try:
+                sysfiles.write_bootmii_ini(sd, res)
+                self.app.notify("bootmii.ini saved")
+            except sysfiles.SysFileError as e:
+                await self.message("Not saved", str(e), error=True)
 
     # ------------------------------------------------------------------ syscheck
     @work(exclusive=True, group="sys")

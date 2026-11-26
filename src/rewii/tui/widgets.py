@@ -359,3 +359,165 @@ class PickPath(ModalScreen[Optional[list[Path]]]):
                     self.app.notify("No matching files in this folder", severity="warning")
             else:
                 self.app.notify("Choose a file", severity="warning")
+
+
+class CheatPicker(ModalScreen[Optional[tuple[list[int], dict[str, dict[str, str]]]]]):
+    """Tick cheats for one game. Returns (selected indexes, placeholder values) or None."""
+
+    DEFAULT_CSS = """
+    CheatPicker { align: center middle; }
+    CheatPicker > Vertical { width: 110; max-width: 98%; height: 90%; border: thick $primary; background: $surface; padding: 0 1; }
+    CheatPicker SelectionList { height: 1fr; }
+    CheatPicker #info { height: 6; color: $text-muted; }
+    CheatPicker #vals { height: auto; max-height: 10; }
+    CheatPicker Horizontal#btns { height: auto; align-horizontal: right; }
+    CheatPicker #btns Button { margin-left: 1; }
+    """
+
+    def __init__(self, title: str, cheats: list, preselected: list[int]) -> None:
+        super().__init__()
+        self.t = title
+        self.cheats = cheats
+        self.pre = set(preselected)
+
+    def compose(self) -> ComposeResult:
+        from textual.widgets import SelectionList
+        with Vertical():
+            yield Label(f"[b]Cheats – {self.t}[/b]  [dim]Space ticks a cheat. Cheats marked ✎ need a value.[/dim]")
+            yield SelectionList(*[((("✎ " if c.needs_values else "") + c.name), i, i in self.pre)
+                                  for i, c in enumerate(self.cheats)], id="list")
+            yield Static("", id="info", markup=False)
+            yield VerticalScroll(id="vals")
+            with Horizontal(id="btns"):
+                yield Button("Cancel", id="cancel")
+                yield Button("None", id="none")
+                yield Button("Save", id="save", variant="primary")
+
+    def on_mount(self) -> None:
+        self._refresh_values()
+
+    def on_selection_list_selection_highlighted(self, ev) -> None:
+        c = self.cheats[ev.selection.value]
+        codes = "\n".join(f"{a} {b}" for a, b in c.codes[:4]) + ("\n…" if len(c.codes) > 4 else "")
+        self.query_one("#info", Static).update((c.comment or "") + "\n" + codes)
+
+    def on_selection_list_selected_changed(self) -> None:
+        self._refresh_values()
+
+    def _refresh_values(self) -> None:
+        from textual.widgets import SelectionList
+        sel = self.query_one("#list", SelectionList).selected
+        box = self.query_one("#vals", VerticalScroll)
+        box.remove_children()
+        for i in sel:
+            c = self.cheats[i]
+            for letter, width in c.placeholders.items():
+                box.mount(Label(f"{c.name}: value for {letter} ({width} hex digits)"))
+                box.mount(Input(placeholder="0" * width, id=f"v{i}_{letter}", restrict=r"[0-9a-fA-F]*",
+                                max_length=width))
+
+    @on(Button.Pressed, "#cancel")
+    def _c(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#none")
+    def _n(self) -> None:
+        self.dismiss(([], {}))
+
+    @on(Button.Pressed, "#save")
+    def _s(self) -> None:
+        from textual.widgets import SelectionList
+        sel = sorted(self.query_one("#list", SelectionList).selected)
+        values: dict[str, dict[str, str]] = {}
+        for i in sel:
+            c = self.cheats[i]
+            for letter in c.placeholders:
+                v = self.query_one(f"#v{i}_{letter}", Input).value.strip()
+                if not v:
+                    self.app.notify(f"Enter a value for {c.name}", severity="warning")
+                    return
+                values.setdefault(c.name, {})[letter] = v
+        self.dismiss((sel, values))
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
+
+
+class PromptText(ModalScreen[Optional[str]]):
+    """Multi-line text entry (paste)."""
+
+    DEFAULT_CSS = """
+    PromptText { align: center middle; }
+    PromptText > Vertical { width: 100; max-width: 98%; height: 80%; border: thick $primary; background: $surface; padding: 0 1; }
+    PromptText TextArea { height: 1fr; }
+    PromptText Horizontal { height: auto; align-horizontal: right; }
+    PromptText Button { margin-left: 1; }
+    """
+
+    def __init__(self, title: str, label: str, text: str = "") -> None:
+        super().__init__()
+        self.t, self.label, self.text = title, label, text
+
+    def compose(self) -> ComposeResult:
+        from textual.widgets import TextArea
+        with Vertical():
+            yield Label(f"[b]{self.t}[/b]")
+            yield Static(self.label, markup=False)
+            yield TextArea(self.text, id="ta")
+            with Horizontal():
+                yield Button("Cancel", id="no")
+                yield Button("OK", id="yes", variant="primary")
+
+    @on(Button.Pressed)
+    def _p(self, ev: Button.Pressed) -> None:
+        from textual.widgets import TextArea
+        self.dismiss(self.query_one("#ta", TextArea).text if ev.button.id == "yes" else None)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
+
+
+class ChoiceForm(ModalScreen[Optional[dict]]):
+    """A small form of dropdowns: fields = [(key, label, [(text, value)...], current)]."""
+
+    DEFAULT_CSS = """
+    ChoiceForm { align: center middle; }
+    ChoiceForm > Vertical { width: 90; max-width: 98%; height: auto; max-height: 90%; border: thick $primary; background: $surface; padding: 1 2; }
+    ChoiceForm .row { height: auto; }
+    ChoiceForm .row Label { width: 34; padding-top: 1; }
+    ChoiceForm .row Select { width: 44; }
+    ChoiceForm Horizontal#btns { height: auto; align-horizontal: right; margin-top: 1; }
+    ChoiceForm #btns Button { margin-left: 1; }
+    """
+
+    def __init__(self, title: str, intro: str, fields: list) -> None:
+        super().__init__()
+        self.t, self.intro, self.fields = title, intro, fields
+
+    def compose(self) -> ComposeResult:
+        from textual.widgets import Select
+        with Vertical():
+            yield Label(f"[b]{self.t}[/b]")
+            if self.intro:
+                yield Static(self.intro, markup=False)
+            with VerticalScroll():
+                for key, label, options, current in self.fields:
+                    with Horizontal(classes="row"):
+                        yield Label(label)
+                        vals = [v for _, v in options]
+                        yield Select(options, value=current if current in vals else options[0][1],
+                                     allow_blank=False, id=f"f_{key}")
+            with Horizontal(id="btns"):
+                yield Button("Cancel", id="no")
+                yield Button("Save", id="yes", variant="primary")
+
+    @on(Button.Pressed)
+    def _p(self, ev: Button.Pressed) -> None:
+        from textual.widgets import Select
+        if ev.button.id != "yes":
+            self.dismiss(None)
+            return
+        self.dismiss({k: self.query_one(f"#f_{k}", Select).value for k, *_ in self.fields})
+
+    def key_escape(self) -> None:
+        self.dismiss(None)

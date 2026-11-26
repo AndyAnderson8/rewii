@@ -195,3 +195,15 @@ def test_splash_fits():
     png = F.splash_png(buf.getvalue())
     assert len(png) <= 32080
     assert Image.open(io.BytesIO(png)).size == (640, 480)
+
+
+def test_rename_library_and_drive(wii, settings, lay, tmp_path):
+    g = G.add_to_library(settings, wii)
+    r = G.rename_library_game(settings, g, "New: Name")
+    assert r.path.name == "New Name [RTST01].wbfs" and r.path.exists()
+    d = G.install_game(lay, r.path)
+    r2 = G.rename_game(lay, d, "Other")
+    assert r2.path == lay.wbfs / "Other [RTST01]" / "RTST01.wbfs"
+    gc = G.add_to_library(settings, make_gc_iso(tmp_path / "gc.iso"))
+    r3 = G.rename_library_game(settings, gc, "GC Renamed")
+    assert r3.path.parent.name == "GC Renamed [GTST01]"

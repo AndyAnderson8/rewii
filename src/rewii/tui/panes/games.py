@@ -61,6 +61,8 @@ class GamesPane(Pane):
         with Horizontal(classes="toolbar"):
             yield Button("Covers", id="covers")
             yield Button("Cheats", id="cheats")
+            yield Button("Pick cheats…", id="pickcheats")
+            yield Button("Rename…", id="rename")
             yield Button("Verify", id="verify")
             yield Button("Fix drive layout", id="normalize")
             yield Button("Import old WBFS drive…", id="migrate")
@@ -158,7 +160,8 @@ class GamesPane(Pane):
                "backup": self.action_backup, "channel": self.action_channel, "covers": self.action_covers,
                "cheats": self.action_cheats, "verify": self.action_verify,
                "normalize": self.action_normalize, "migrate": self.action_migrate,
-               "libdel": self.action_libdel}.get(ev.button.id or "")
+               "libdel": self.action_libdel, "pickcheats": self.action_pickcheats,
+               "rename": self.action_rename}.get(ev.button.id or "")
         if act:
             act()
 
@@ -391,6 +394,69 @@ class GamesPane(Pane):
             self.app.notify(f"Cheats saved for {res[0]} game(s) in txtcodes/" +
                             (f"; none exist for {len(res[1])}" if res[1] else "") +
                             ". Turn them on per game in USB Loader GX.")
+
+    @work(exclusive=True, group="games-act")
+    async def action_pickcheats(self) -> None:
+        if not self.need_drive():
+            return
+        rows = [r for r in self._selected() if r.drive]
+        if len(rows) != 1:
+            self.app.notify("Highlight one game that's on the drive", severity="warning")
+            return
+        g = rows[0].drive
+        from ...core import cheats
+        from ..widgets import CheatPicker
+        layout = self.layout_
+        cf = await self.job(f"Getting cheats for {g.title}", lambda p, c: cheats.fetch_cheats(layout, g.game_id),
+                            quiet=True)
+        if cf is None:
+            if not cheats.txt_path(layout, g.game_id).exists():
+                await self.message("No cheats", f"No cheat codes are available for {g.title} [{g.game_id}].")
+            return
+        gct = cheats.gct_path(layout, g.game_id)
+        pre = cheats.selected_in_gct(cf, gct.read_bytes()) if gct.is_file() else []
+        res = await self.app.push_screen_wait(CheatPicker(g.title, cf.cheats, pre))
+        if res is None:
+            return
+        sel, values = res
+        try:
+            cheats.build_gct(layout, g.game_id, [cf.cheats[i] for i in sel], values)
+        except cheats.CheatError as e:
+            await self.message("Cheats not saved", str(e), error=True)
+            return
+        if not sel:
+            self.app.notify(f"Cheats turned off for {g.title}")
+        elif g.is_wii:
+            await self.message("Cheats saved", f"{len(sel)} cheat(s) saved to codes/{g.game_id}.gct.\n\n"
+                               "In USB Loader GX, open the game's settings and set Ocarina to On.")
+        else:
+            await self.message("Cheats saved", f"{len(sel)} cheat(s) saved to codes/{g.game_id}.gct.\n\n"
+                               "USB Loader GX: turn on Cheats in the game's Nintendont settings. "
+                               "A GameCube channel picks them up if you make (or remake) it now.")
+
+    @work(exclusive=True, group="games-act")
+    async def action_rename(self) -> None:
+        rows = self._selected()
+        if len(rows) != 1:
+            self.app.notify("Highlight one game", severity="warning")
+            return
+        r = rows[0]
+        new = await self.prompt("Rename game", "New name (the [ID] is kept automatically):", r.any.title)
+        if not new or not new.strip() or new.strip() == r.any.title:
+            return
+        new = new.strip()
+        try:
+            if r.drive:
+                G.rename_game(self.layout_, r.drive, new)
+            if r.lib:
+                G.rename_library_game(self.settings, r.lib, new)
+        except (G.GameError, OSError) as e:
+            await self.message("Couldn't rename", str(e), error=True)
+            return
+        if r.drive and not r.any.is_wii:
+            await self.message("Renamed", "If this game has a channel on the Wii Menu, make the channel again - "
+                               "GameCube channels open the game by its folder name.")
+        self.reload()
 
     @work(exclusive=True, group="games-act")
     async def action_normalize(self) -> None:

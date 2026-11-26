@@ -156,3 +156,14 @@ def test_osc_repacked_zip_accepted_by_binary_hash(tmp_path):
     assert osc._archive_ok(app, z)
     app.binary_hash = "1" * 32
     assert not osc._archive_ok(app, z)
+
+
+def test_gc_channel_uses_cheat_file(drive, tmp_path, certs, nin):
+    lay, game = drive
+    (lay.root / "codes").mkdir()
+    (lay.root / "codes" / "GTST01.gct").write_bytes(b"\x00\xd0\xc0\xde" * 2)
+    ci = GC.make_gc_channel(game, lay.root, tmp_path / "out", nintendont=nin)
+    cfg = F.read_argv_raw(F.unpack_wad(ci.path.read_bytes())["contents"][1]).split(b"\0", 1)[1]
+    config = struct.unpack(">I", cfg[8:12])[0]
+    assert config & GC.CFG_CHEATS and config & GC.CFG_CHEAT_PATH
+    assert cfg[275:300].split(b"\0")[0] == b"/codes/GTST01.gct"
