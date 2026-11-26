@@ -263,11 +263,12 @@ def test_mac_junk(layout):
     (layout.wbfs / "._junk.wbfs").write_bytes(b"x")
     (layout.root / ".DS_Store").write_bytes(b"x")
     f = next(f for f in check(layout) if f.id == "mac_junk")
-    assert len(f.data["paths"]) == 6 and f.auto_fixable
+    assert len(f.data["paths"]) == 5 and f.auto_fixable
     events = []
     fix(layout, f, progress=events.append)
-    assert events[-1].done == 6
+    assert events[-1].done == 5
     assert not (layout.root / ".Spotlight-V100").exists()
+    assert (layout.root / ".Trashes").exists()          # the Mac trash is the user's data
     assert (layout.apps / "usbloader_gx" / "boot.dol").exists()
     assert check(layout) == []
 

@@ -33,6 +33,7 @@ from typing import Optional
 
 from .config import Settings
 from .layout import DriveLayout
+from .fileops import copy_atomic, sha1_file
 from .progress import CancelToken, ProgressFn, Reporter
 
 KEYS_SIZE = 0x400
@@ -71,39 +72,12 @@ class NandError(Exception):
 
 # --------------------------------------------------------------------------- helpers
 def _sha1(path: Path, rep: Reporter | None = None) -> str:
-    h = hashlib.sha1()
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(4 * 1024 * 1024)
-            if not b:
-                break
-            h.update(b)
-            if rep is not None:
-                rep.advance(len(b))
-    return h.hexdigest()
+    return sha1_file(path, rep)
 
 
 def _copy(src: Path, dest: Path, rep: Reporter) -> str:
-    """Chunked copy returning the SHA-1 of the copied bytes."""
-    h = hashlib.sha1()
-    tmp = dest.with_name(dest.name + ".rewii-part")
-    try:
-        with open(src, "rb") as fi, open(tmp, "wb") as fo:
-            while True:
-                b = fi.read(4 * 1024 * 1024)
-                if not b:
-                    break
-                fo.write(b)
-                h.update(b)
-                rep.advance(len(b))
-            fo.flush()
-            os.fsync(fo.fileno())
-        os.replace(tmp, dest)
-        shutil.copystat(src, dest)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-    return h.hexdigest()
+    """Atomic, fsynced copy returning the SHA-1 of the copied bytes."""
+    return copy_atomic(src, dest, rep, want_hash=True, fsync=True)
 
 
 def _timestamp(now: datetime | None = None) -> str:
@@ -228,10 +202,8 @@ def find_nand_dumps(root: Path) -> list[NandDump]:
             if not m or not p.is_file():
                 continue
             date, serial = m.group(1), m.group(2)
+            # only this console's keys: never pair a dump with some other *keys.bin
             keys = files.get(f"{serial}_keys.bin".lower())
-            if keys is None:
-                cands = [q for name, q in files.items() if name.endswith("keys.bin")]
-                keys = cands[0] if len(cands) == 1 else None
             out.append(NandDump(p, keys, "nanddumper@ios", p.stat().st_size, serial=serial,
                                 date=date, sha1_file=files.get(p.name.lower() + ".sha1"),
                                 sha1sums=sums, bootmii_dir=bm))
@@ -590,6 +562,15 @@ def build_rescue_kit(archive: ArchivedNand, target: Path, *,
     """
     if archive.kind != "wii":
         raise NandError("BootMii can't restore a Wii U (vWii) NAND")
+    if not archive.nand.is_file() or not archive.keys.is_file():
+        raise NandError("this backup is missing nand.bin or keys.bin")
+    if archive.nand.stat().st_size == NAND_SIZE_NO_ECC:
+        raise NandError("this NAND dump has no ECC data, so BootMii can't restore it")
+    # trust the key file itself, not the label written in the manifest
+    real_id = read_keys(archive.keys).label
+    if real_id != archive.console_id:
+        raise NandError(f"this backup is filed under console {archive.console_id} but its keys.bin "
+                        f"belongs to console {real_id}; not building a kit from it")
     warnings = ["Restoring another console's NAND bricks the Wii. Only use this kit "
                 f"on the console with ID {archive.console_id}."]
     if target_keys is not None:

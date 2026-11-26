@@ -91,3 +91,14 @@ def test_update_check(lay):
     u = S.check_for_update("0.1.0", "o/r")
     assert u.newer and u.latest == "0.2.0"
     assert not S.check_for_update("0.2.0", "o/r").newer
+
+
+def test_config_files_written_with_exact_line_endings(lay, tmp_path):
+    (tmp_path / "bootmii").mkdir()
+    p = S.write_bootmii_ini(tmp_path, {"AUTOBOOT": "SYSMENU"})
+    assert p.read_bytes() == b"AUTOBOOT=SYSMENU\r\n"
+    url = "https://example.invalid/hacks_hash.ini"
+    serve({S.PRIILOADER_RELEASE_API: {"tag_name": "1", "assets": [
+        {"name": "hacks_hash.ini", "browser_download_url": url}]}, url: HACKS.replace("\n", "\r\n").encode()})
+    hp, _ = S.update_priiloader_hacks(lay)
+    assert b"\r" not in hp.read_bytes()

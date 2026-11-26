@@ -40,6 +40,22 @@ NEEDS_ADMIN = "needs admin"   # Drive.notes entry when a raw read was refused
 
 _SYSTEM_MOUNTS = {"/", "/boot", "/boot/efi", "/efi", "/usr", "/var", "/home", "[SWAP]",
                   "/System/Volumes/Data", "/private/var/vm"}
+# Linux: anything mounted under these belongs to the installed system
+_SYSTEM_PREFIXES = ("/boot/", "/usr/", "/var/", "/home/", "/etc/", "/nix/", "/opt/", "/srv/", "/snap/")
+_SYSTEM_EXACT = _SYSTEM_MOUNTS | {"/etc", "/nix", "/opt", "/srv", "/snap"}
+# member-of-something filesystems: on an internal disk these are never a Wii drive
+_MEMBER_FS = {"lvm2_member", "zfs_member", "linux_raid_member", "crypto_luks", "btrfs", "bcache", "swap"}
+
+
+def _is_system_mount(mp: str) -> bool:
+    return mp in _SYSTEM_EXACT or mp.startswith(_SYSTEM_PREFIXES)
+
+
+def _lsblk_fstypes(node: dict) -> Iterable[str]:
+    if node.get("fstype"):
+        yield str(node["fstype"]).lower()
+    for ch in node.get("children") or []:
+        yield from _lsblk_fstypes(ch)
 
 _FLASH_HINTS = re.compile(
     r"flash|cruzer|ultra fit|ultra usb|datatraveler|jumpdrive|usb disk|stick|thumb|"
@@ -268,6 +284,10 @@ def parse_lsblk(data: str | dict) -> list[Drive]:
                "virtio": "virtio", "scsi": "SCSI", "sas": "SAS"}.get(tran, tran.upper())
         serial = (node.get("serial") or "").strip()
         rm = _as_bool(node.get("rm"))
+        is_usb = tran == "usb"
+        system = any(_is_system_mount(m) for m in mounts)
+        if not is_usb and not rm and (set(_lsblk_fstypes(node)) & _MEMBER_FS):
+            system = True      # internal disk in an LVM/ZFS/RAID/LUKS/btrfs set, mounted or not
         drives.append(Drive(
             id=f"{name}:{serial or '-'}:{size}",
             device=path,
@@ -275,8 +295,8 @@ def parse_lsblk(data: str | dict) -> list[Drive]:
             model=(node.get("model") or "").strip(),
             bus=bus,
             removable=rm or _as_bool(node.get("hotplug")) or tran == "usb",
-            is_usb=tran == "usb",
-            is_system=bool(mounts & _SYSTEM_MOUNTS),
+            is_usb=is_usb,
+            is_system=system,
             partition_style=style,
             volumes=vols,
             serial=serial,
@@ -373,7 +393,8 @@ def parse_diskutil(list_data: bytes | str | dict,
                                mount_points=[mp] if mp else [],
                                cluster_size=_as_int(info.get("VolumeAllocationBlockSize")) or None))
         bus = info.get("BusProtocol") or ""
-        internal = _as_bool(info.get("Internal", False))
+        # no info record (diskutil failed) => unknown => treat as internal/system
+        internal = _as_bool(info.get("Internal", False)) if info else True
         removable_media = _as_bool(info.get("RemovableMedia") or info.get("Removable"))
         ejectable = _as_bool(info.get("Ejectable", False)) or _as_bool(
             info.get("RemovableMediaOrExternalDevice", False))
@@ -407,8 +428,8 @@ def _list_macos(run_bytes: Callable[[Sequence[str]], bytes], include_fixed: bool
         for ident in idents:
             try:
                 infos[ident] = run_bytes(["diskutil", "info", "-plist", ident])
-            except (OSError, subprocess.CalledProcessError):
-                pass
+            except (OSError, subprocess.SubprocessError):
+                pass      # parse_diskutil treats a disk without info as a system disk
     root: set[str] = set()
     try:
         ri = _plist(run_bytes(["diskutil", "info", "-plist", "/"]))
@@ -419,8 +440,10 @@ def _list_macos(run_bytes: Callable[[Sequence[str]], bytes], include_fixed: bool
             m = re.match(r"(disk\d+)", sid)
             if m:
                 root.add(m.group(1))
-    except (OSError, subprocess.CalledProcessError, ValueError):
+    except (OSError, subprocess.SubprocessError, ValueError):
         pass
+    if not root:
+        return []          # can't tell which disk runs macOS: offer nothing rather than guess
     return parse_diskutil(lst, infos, root)
 
 

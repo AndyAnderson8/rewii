@@ -22,6 +22,7 @@ from collections.abc import Iterable
 
 from .config import Settings
 from .layout import DriveLayout, safe_name
+from .fileops import UnsafePath, copy_atomic, is_inside, safe_join, sha1_file
 from .progress import CancelToken, ProgressFn, Reporter
 
 MANIFEST = "manifest.json"
@@ -100,39 +101,12 @@ def scan_tree(root: Path, *, include_games: bool = True,
 
 
 def _sha1(path: Path, rep: Reporter | None = None) -> str:
-    h = hashlib.sha1()
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(CHUNK)
-            if not b:
-                break
-            h.update(b)
-            if rep is not None:
-                rep.advance(len(b))
-    return h.hexdigest()
+    return sha1_file(path, rep)
 
 
 def _copy(src: Path, dest: Path, rep: Reporter, hash_: bool = False) -> str:
-    """Chunked copy keeping mtime; returns SHA-1 if ``hash_``."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(dest.name + ".rewii-part")
-    h = hashlib.sha1() if hash_ else None
-    try:
-        with open(src, "rb") as fi, open(tmp, "wb") as fo:
-            while True:
-                b = fi.read(CHUNK)
-                if not b:
-                    break
-                fo.write(b)
-                if h is not None:
-                    h.update(b)
-                rep.advance(len(b))
-        shutil.copystat(src, tmp)
-        os.replace(tmp, dest)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-    return h.hexdigest() if h is not None else ""
+    """Chunked atomic copy keeping mtime; returns SHA-1 if ``hash_``."""
+    return copy_atomic(src, dest, rep, want_hash=hash_)
 
 
 def _same(a: FileEntry, b: FileEntry) -> bool:
@@ -144,10 +118,10 @@ def _same(a: FileEntry, b: FileEntry) -> bool:
 
 
 def _rel_to_path(base: Path, rel: str) -> Path:
-    parts = PurePosixPath(rel).parts
-    if any(p in ("..", "") for p in parts) or PurePosixPath(rel).is_absolute():
-        raise BackupError(f"unsafe path in manifest: {rel!r}")
-    return base.joinpath(*parts)
+    try:
+        return safe_join(base, rel)
+    except UnsafePath as e:
+        raise BackupError(f"unsafe path in manifest: {rel!r}") from e
 
 
 # --------------------------------------------------------------------------- snapshots
@@ -219,6 +193,10 @@ def create_snapshot(source: Path, settings: Settings, label: str, *,
         raise BackupError(f"{source} is not a folder")
     rep = Reporter(progress, cancel, message="Scanning drive")
     entries = scan_tree(source, include_games=include_games, cancel=cancel)
+    if is_inside(settings.library, source):
+        # the library lives on the drive being backed up: never back up the backups
+        lib_rel = settings.library.resolve().relative_to(source.resolve()).as_posix()
+        entries = [e for e in entries if lib_rel and not (e.path == lib_rel or e.path.startswith(lib_rel + "/"))]
     prev = list_snapshots(settings, label)[-1:] if incremental else []
     prev_map = prev[0].entry_map() if prev else {}
     ldir = settings.drive_backups_dir / safe_name(label)
@@ -249,7 +227,6 @@ def create_snapshot(source: Path, settings: Settings, label: str, *,
                     try:
                         os.link(prev_file, dst)
                         linked = True
-                        e.sha1 = e.sha1 or old.sha1
                         rep.advance(e.size, e.path)
                     except OSError:
                         linked = False
@@ -391,8 +368,9 @@ def _plan(src_root: Path, entries: list[FileEntry], target: Path,
 def _mirror_delete(target: Path, keep: set[str], include_games: bool,
                    paths: Optional[Iterable[str]], report: CopyReport) -> None:
     paths = list(paths) if paths is not None else None
+    keep = {p.casefold() for p in keep}       # FAT32 is case-insensitive
     for e in scan_tree(target, include_games=include_games):
-        if e.path not in keep and _selected(e.path, paths):
+        if e.path.casefold() not in keep and _selected(e.path, paths):
             _rel_to_path(target, e.path).unlink()
             report.deleted.append(e.path)
     # tidy empty folders left behind (never the root, never game folders when excluded)
@@ -431,8 +409,8 @@ def restore_snapshot(snapshot: Snapshot, target: Path, *, paths: Iterable[str] |
         if not src.is_file():
             raise BackupError(f"snapshot is missing {e.path}")
         rep.message = e.path
-        digest = _copy(src, dst, rep, hash_=verify and bool(e.sha1))
-        if verify and e.sha1 and digest != e.sha1:
+        _copy(src, dst, rep)
+        if verify and e.sha1 and _sha1(dst) != e.sha1:      # re-read what landed on the drive
             report.failed_verify.append(e.path)
         report.copied.append(e.path)
         report.bytes_copied += e.size
@@ -454,8 +432,8 @@ def clone_drive(source: Path, target: Path, *, include_games: bool = True,
     source, target = Path(source), Path(target)
     if source.resolve() == target.resolve():
         raise BackupError("source and target are the same drive")
-    if target.resolve().is_relative_to(source.resolve()):
-        raise BackupError("the target is inside the source")
+    if is_inside(target, source) or is_inside(source, target):
+        raise BackupError("the source and target folders overlap")
     entries = scan_tree(source, include_games=include_games, cancel=cancel)
     report = CopyReport()
     todo = _plan(source, entries, target, None, report.skipped)
