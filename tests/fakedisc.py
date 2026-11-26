@@ -122,8 +122,15 @@ def make_wii_iso(path: Path, game_id: str = "RTST01", title: str = "TEST GAME",
 
 def make_gc_iso(path: Path, game_id: str = "GTST01", title: str = "GC TEST", disc: int = 0,
                 size: int = 0x200000) -> Path:
-    fs = bytearray(_build_fs(game_id, title, {"opening.bnr": b"BNR1" + bytes(0x1000)}, 0))
-    fs[0:0x440] = _header(game_id, title, False, disc)
+    bnr = bytearray(0x1960)
+    bnr[0:4] = b"BNR1"
+    for i in range(0x20, 0x1820, 2):                     # opaque red RGB5A3 pixels
+        bnr[i:i + 2] = b"\xfc\x00"
+    bnr[0x1820:0x1820 + 7] = b"GC TEST"
+    bnr[0x1840:0x1840 + 7] = b"TESTCO."
+    bnr[0x18E0:0x18E0 + 16] = b"A test GC game.\n"
+    fs = bytearray(_build_fs(game_id, title, {"opening.bnr": bytes(bnr)}, 0))
+    fs[0:0x400] = _header(game_id, title, False, disc)[:0x400]
     with open(path, "wb") as f:
         f.write(fs)
         f.truncate(max(size, len(fs)))

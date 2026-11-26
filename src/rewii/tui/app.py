@@ -140,6 +140,14 @@ class ReWiiApp(App):
         except Exception:
             return None
 
+    def game_info(self, game_id: str):
+        """GameTDB entry (publisher, year, synopsis…) or None."""
+        db = self._titles
+        try:
+            return db.get(game_id) if db is not None else None
+        except Exception:
+            return None
+
     def log_error(self, what: str, failure) -> None:
         log.error("%s failed: %s\n%s", what, failure, getattr(failure, "tb", ""))
 

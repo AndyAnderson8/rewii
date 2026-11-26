@@ -9,7 +9,7 @@ from textual.containers import Horizontal
 from textual.widgets import Button, DataTable, Input, Label, Static
 
 from ...core import games as G
-from ...core.forwarder import brick_risk, cover_for_channel, make_channel
+from ...core.forwarder import brick_risk
 from ..base import Pane
 from ..widgets import human_size
 
@@ -299,22 +299,25 @@ class GamesPane(Pane):
 
     @work(exclusive=True, group="games-act")
     async def action_channel(self) -> None:
-        rows = [r for r in self._selected() if r.any.is_wii]
+        from ...core.channels import build_channel, channel_problem
+        rows = self._selected()
         if not rows:
-            self.app.notify("Channels can be made for Wii games (GameCube channels aren't supported)",
-                            severity="warning")
             return
-        risky = [r.any.title for r in rows if brick_risk(r.any.game_id)]
-        if risky:
-            await self.message("Not allowed", "These games brick the Wii Menu when installed as a channel "
-                               "and will be skipped:\n  " + "\n  ".join(risky), error=True)
-            rows = [r for r in rows if not brick_risk(r.any.game_id)]
-            if not rows:
-                return
-        s, layout = self.settings, self.layout_
+        bad = [(r.any.title, channel_problem(r.any.platform, r.any.disc_number, r.any.game_id, r.drive is not None))
+               for r in rows]
+        skipped = [f"{t}: {p}" for t, p in bad if p]
+        rows = [r for r, (_t, p) in zip(rows, bad) if not p]
+        if skipped:
+            await self.message("Skipped", "No channel for:\n  " + "\n  ".join(skipped), error=not rows)
+        if not rows:
+            return
+        s, layout, rapp = self.settings, self.layout_, self.rapp
+        n_gc = sum(1 for r in rows if not r.any.is_wii)
         stage = layout is not None and await self.confirm(
-            "Channels", f"Make {len(rows)} channel(s) (launch screen: {s.forwarder_style}).\n\n"
-            "Also put them in the drive's wad/ folder so you can install them with YAWMME?",
+            "Channels", f"Make {len(rows)} channel(s)."
+            + (f"\nWii games: launch screen '{s.forwarder_style}'." if n_gc < len(rows) else "")
+            + (f"\nGameCube games start straight in Nintendont." if n_gc else "")
+            + "\n\nAlso put them in the drive's wad/ folder so you can install them with YAWMME?",
             yes="Yes", no="Just save on PC")
 
         def run(progress, cancel):
@@ -322,11 +325,10 @@ class GamesPane(Pane):
             rep = Reporter(progress, cancel, total=len(rows))
             out = []
             for r in rows:
-                g = r.drive or r.lib
+                g = r.drive if (r.drive and not r.any.is_wii) else (r.drive or r.lib)
                 rep.note(f"Building channel for {g.title}")
-                cov = cover_for_channel(g.game_id, s.cover_lang) if s.forwarder_style == "cover" else None
-                ci = make_channel(g.path, s.channels_dir, style=s.forwarder_style, cover_png=cov,
-                                  title=g.title)
+                ci = build_channel(g.path, s, drive_root=layout.root if layout else None, title=g.title,
+                                   info=rapp.game_info(g.game_id))
                 if stage:
                     layout.wad.mkdir(parents=True, exist_ok=True)
                     (layout.wad / ci.path.name).write_bytes(ci.path.read_bytes())
@@ -339,7 +341,9 @@ class GamesPane(Pane):
             await self.message("Channels ready", "\n".join(c.path.name for c in res) +
                                f"\n\nSaved in {s.channels_dir}" +
                                ("\n\nOn the Wii: open YAWMME from the Homebrew Channel, pick the WAD(s) "
-                                "and choose Install. See System → Guides → Installing channels." if stage else ""))
+                                "and choose Install. See System & Guides → Install channels and WADs." if stage else "")
+                               + ("\n\nGameCube channels open the game from where it is on the drive now - "
+                                  "if you rename or move it, make the channel again." if n_gc else ""))
 
     @work(exclusive=True, group="games-act")
     async def action_covers(self) -> None:

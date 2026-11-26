@@ -3,7 +3,7 @@
 **The all-in-one toolkit for softmodded Wiis.** One app for everything you do on the computer side once your Wii has the Homebrew Channel:
 
 - **Games** – add Wii and GameCube games (ISO, WBFS, CISO, RVZ, WIA, NKit, CleanRip dumps), put them on the drive in the right layout, verify them, back them up, and download covers and cheats.
-- **Channels** – put any Wii game on the Wii Menu. Choose the launch screen: the game's **cover art** or a plain **black** screen.
+- **Channels** – put any Wii or GameCube game on the Wii Menu. For Wii games, choose the launch screen: the game's **cover art** or a plain **black** screen. GameCube channels start the game straight in Nintendont.
 - **WADs** – inspect any WAD (type, region, IOS, signature, damage) and stage it for YAWMME. Dangerous ones (wrong region or console system files) are blocked.
 - **Homebrew** – browse, install and update all 300+ Open Shop Channel apps, or send one straight to the Wii over Wi-Fi.
 - **Saves** – back up Wii and GameCube saves with full version history, and restore any version.
@@ -71,7 +71,10 @@ ReWii's channels carry their own copy of Configurable USB Loader in "direct star
 - **Black** style: the loader is started with `intro=0`, so the screen stays black until the game starts.
 - **Classic** style: the stock loader screen.
 
-Channels for GameCube games aren't supported yet; launch those from USB Loader GX.
+**GameCube channels** contain their own copy of Nintendont (v6.509 or newer, taken from the Open Shop Channel). It's started with an autoboot config pointing at the game's folder on the USB drive, and with AHB access in the channel's TMD. The channel banner is built from USB Loader GX's GameCube banner template: the disc's own banner picture becomes the channel picture and icon, and the title, publisher, year and description from GameTDB fill the template's text. Your `nincfg.bin` settings (video mode, memory card size…) are carried over.
+
+- Make the channel for disc 1; Nintendont switches to `disc2.iso` itself.
+- The channel points at the game's folder on the drive. If you rename or move the game, make the channel again.
 
 ## Credits
 

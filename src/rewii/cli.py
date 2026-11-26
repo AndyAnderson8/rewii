@@ -123,19 +123,41 @@ def cmd_verify(a) -> int:
 
 
 def cmd_channel(a) -> int:
-    from .core.forwarder import make_channel
+    from .core.channels import build_channel
+    from .core.forwarder import ForwarderError
     s = Settings.load()
-    out = Path(a.out) if a.out else s.channels_dir
-    style = a.style or s.forwarder_style
+    if a.style:
+        s.forwarder_style = a.style
+    info_db = None
+    try:
+        from .core.gametdb import TitleDB
+        info_db = TitleDB.load(s)
+    except Exception:
+        pass
+    rc = 0
     for p in a.files:
-        cov = None
-        if style == "cover":
+        try:
             from .core.disc import disc_info
-            from .core.forwarder import cover_for_channel
-            cov = cover_for_channel(disc_info(p).game_id, s.cover_lang)
-        ci = make_channel(Path(p), out, style=style, cover_png=cov, fat=not a.wbfs_partition)
-        print(f"{ci.path}  ({ci.channel_id}, {style})")
-    return 0
+            gid = disc_info(p).game_id
+            info = info_db.get(gid) if info_db else None
+            if a.wbfs_partition:
+                from .core.forwarder import cover_for_channel, make_channel
+                cov = cover_for_channel(gid, s.cover_lang) if s.forwarder_style == "cover" else None
+                ci = make_channel(Path(p), Path(a.out) if a.out else s.channels_dir, style=s.forwarder_style,
+                                  cover_png=cov, fat=False)
+            else:
+                ci = build_channel(Path(p), s, drive_root=Path(a.drive) if a.drive else None,
+                                   title=info.title if info else None, info=info)
+                if a.out:
+                    dest = Path(a.out) / ci.path.name
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    ci.path.replace(dest)
+                    ci.path = dest
+            print(f"{ci.path}  ({ci.channel_id}, {ci.style})")
+        except ForwarderError as e:
+            print(f"{p}: {e}", file=sys.stderr)
+            rc = 1
+    return rc
 
 
 def cmd_normalize(a) -> int:
@@ -276,6 +298,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out")
     p.add_argument("--wbfs-partition", action="store_true",
                    help="for old WBFS-formatted drives instead of FAT32")
+    p.add_argument("--drive", help="the Wii drive (needed for GameCube games, which must be on it)")
     p.set_defaults(fn=cmd_channel)
     return ap
 

@@ -195,7 +195,7 @@ def test_bad_hash_rejected(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
     serve(zips={"usbloader_gx": b"PK tampered"})
     gx = App.from_api(INDEX[0])
-    with pytest.raises(net.NetError):
+    with pytest.raises(osc.OSCError):
         osc.install_app(lay, gx)
     assert not (lay.apps / "usbloader_gx").exists()
 

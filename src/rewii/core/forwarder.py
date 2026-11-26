@@ -102,7 +102,7 @@ def patch_game_id(dol: bytearray, game_id: str) -> None:
     dol[hits[0] + 1:hits[0] + 7] = game_id.encode("ascii")
 
 
-def add_argv(dol: bytes, args: list[str]) -> bytes:
+def add_argv(dol: bytes, args: list[str | bytes]) -> bytes:
     """Give a libogc DOL a command line, the way the Homebrew Channel does.
 
     libogc's crt0 has a ``__argv`` struct right after the entry branch, flagged by
@@ -122,7 +122,7 @@ def add_argv(dol: bytes, args: list[str]) -> bytes:
     bss_addr, bss_size = struct.unpack(">II", d[0xD8:0xE0])
     end = max([a + s for _o, a, s in secs if s] + [bss_addr + bss_size])
     addr = (end + 0x1F) & ~0x1F
-    cmd = b"".join(a.encode("utf-8") + b"\0" for a in args)
+    cmd = b"".join((a if isinstance(a, bytes) else a.encode("utf-8")) + b"\0" for a in args)
     blob = cmd + bytes(0x100)                      # room for argv pointers
     blob += bytes((-len(blob)) % 32)
     file_off = (len(d) + 0x1F) & ~0x1F
@@ -135,8 +135,19 @@ def add_argv(dol: bytes, args: list[str]) -> bytes:
     return bytes(d)
 
 
+def read_argv_raw(dol: bytes) -> bytes:
+    """The raw command-line buffer injected by add_argv (b"" if none)."""
+    entry = struct.unpack(">I", dol[0xE0:0xE4])[0]
+    e_off = _dol_file_offset(dol, entry)
+    magic, addr, length = struct.unpack(">III", dol[e_off + 8:e_off + 20])
+    if magic != 0x5F617267:
+        return b""
+    off = _dol_file_offset(dol, addr)
+    return dol[off:off + length]
+
+
 def read_argv(dol: bytes) -> list[str]:
-    """Inverse of add_argv (for verification)."""
+    """Inverse of add_argv for text arguments (for verification)."""
     entry = struct.unpack(">I", dol[0xE0:0xE4])[0]
     e_off = _dol_file_offset(dol, entry)
     magic, addr, length = struct.unpack(">III", dol[e_off + 8:e_off + 20])
@@ -376,6 +387,11 @@ def channel_game_id(path: Path) -> Optional[str]:
     try:
         r = unpack_wad(Path(path).read_bytes())
         dol = r["contents"][1]
+        raw = read_argv_raw(dol)               # GameCube channel: Nintendont autoboot config
+        j = raw.find(b"\x01\x07\x0c\xf6")
+        if j >= 0:
+            m = re.search(rb"\[([A-Z0-9]{6})\]", raw[j + 20:j + 275])
+            return m.group(1).decode() if m else raw[j + 536:j + 540].decode("ascii", "replace")
         i = dol.find(b"CFGUSB")
         if i > 12 and dol[i - 12:i - 11] == b"#":
             return dol[i - 11:i - 5].decode("ascii")
