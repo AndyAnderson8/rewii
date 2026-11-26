@@ -275,10 +275,10 @@ def fetch_cheats(layout: DriveLayout, game_id: str, *, wiiflow: Optional[bool] =
         try:
             data = download_txtcodes(gid)
         except net.NetError:
-            raw = cache.read_bytes() if cache.is_file() else None
-            if parsed(raw) is None:
+            cached_raw = cache.read_bytes() if cache.is_file() else None
+            if parsed(cached_raw) is None:
                 raise
-            data = raw
+            data = cached_raw
         cf = parsed(data)
         if data is None or cf is None:
             return None

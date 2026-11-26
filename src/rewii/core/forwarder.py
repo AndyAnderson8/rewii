@@ -89,14 +89,14 @@ def brick_risk(game_id: str) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------- DOL patching
-def _dol_sections(dol: bytes) -> list[tuple[int, int, int]]:
+def _dol_sections(dol: bytes | bytearray) -> list[tuple[int, int, int]]:
     offs = struct.unpack(">18I", dol[0:0x48])
     addrs = struct.unpack(">18I", dol[0x48:0x90])
     sizes = struct.unpack(">18I", dol[0x90:0xD8])
     return [(offs[i], addrs[i], sizes[i]) for i in range(18)]
 
 
-def _dol_file_offset(dol: bytes, addr: int) -> int:
+def _dol_file_offset(dol: bytes | bytearray, addr: int) -> int:
     for off, a, s in _dol_sections(dol):
         if s and a <= addr < a + s:
             return off + addr - a
@@ -181,7 +181,7 @@ def _pngs_640x480(dol: bytes) -> list[tuple[int, int]]:
     return out
 
 
-def _find_splash(dol: bytes) -> int:
+def _find_splash(dol: bytes | bytearray) -> int:
     """File offset of CFG's intro splash PNG (the 640x480 PNG of the known size)."""
     for o, end in _pngs_640x480(bytes(dol)):
         if end - o == _SPLASH_LEN:
@@ -310,7 +310,7 @@ def build_wad(banner: bytes, dol: bytes, game_id: str, *, channel_id: str | None
     # third of all channels at the Korean or vWii key.)
     tik[TIK_KEY_INDEX] = 0
     tkey = aes_cbc_decrypt(ck, tid + bytes(8), bytes(tik[0x1BF:0x1CF]))
-    tik = fakesign(bytes(tik), TIK_FAKESIGN_PAD)
+    tik_signed = fakesign(bytes(tik), TIK_FAKESIGN_PAD)
 
     tmd = bytearray(_asset("tmd_template.tmd"))
     if ios is not None:
@@ -324,7 +324,7 @@ def build_wad(banner: bytes, dol: bytes, game_id: str, *, channel_id: str | None
         rec = 0x1E4 + 36 * i
         tmd[rec + 8:rec + 16] = struct.pack(">Q", len(data))
         tmd[rec + 16:rec + 36] = hashlib.sha1(data).digest()
-    tmd = fakesign(bytes(tmd), TMD_FAKESIGN_PAD)
+    tmd_signed = fakesign(bytes(tmd), TMD_FAKESIGN_PAD)
 
     cert = cert_chain()
     trailer = _pad(b"CMiiUT" + str(int(time.time())).encode(), 0x40)
@@ -333,8 +333,10 @@ def build_wad(banner: bytes, dol: bytes, game_id: str, *, channel_id: str | None
         iv = struct.pack(">H", i) + bytes(14)
         enc.append(_pad(aes_cbc_encrypt(tkey, iv, _pad(data, 16)), 64))
     blob = b"".join(enc)
-    hdr = struct.pack(">I2sHIIIIII", 0x20, b"Is", 0, len(cert), 0, len(tik), len(tmd), len(blob), len(trailer))
-    return _pad(hdr, 64) + _pad(cert, 64) + _pad(tik, 64) + _pad(tmd, 64) + blob + _pad(trailer, 64)
+    hdr = struct.pack(">I2sHIIIIII", 0x20, b"Is", 0, len(cert), 0, len(tik_signed), len(tmd_signed),
+                      len(blob), len(trailer))
+    return (_pad(hdr, 64) + _pad(cert, 64) + _pad(tik_signed, 64) + _pad(tmd_signed, 64) + blob
+            + _pad(trailer, 64))
 
 
 def save_channel(wad: bytes, out_dir: Path, title: str, channel_id: str, game_id: str) -> Path:

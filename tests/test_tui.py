@@ -308,7 +308,7 @@ async def test_job_tells_failure_apart_from_a_none_result(tmp_path):
         async def go():
             out["none"] = await pane.job("Quiet work", lambda p, c: None, quiet=True)
             out["bad"] = await pane.job("Broken work", lambda p, c: 1 / 0)
-            out["bg"] = await pane.bg("Reading", lambda: [][0])
+            out["bg"] = await pane.bg("Reading", lambda: {}["missing"])
         task = asyncio.ensure_future(app.run_worker(go()).wait())
         msg = await dialog(pilot, Wd.Message)
         assert "division by zero" in msg.body

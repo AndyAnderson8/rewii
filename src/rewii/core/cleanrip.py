@@ -138,7 +138,7 @@ def find_dumps(folder: Path | str, *, recursive: bool = False) -> list[CleanRipD
     for d in dirs:
         files = _ci_lookup(d)
         bases: dict[str, dict[int, Path]] = {}
-        for low, p in files.items():
+        for p in files.values():
             m = _PART.match(p.name)
             if m:
                 bases.setdefault(m.group("base"), {})[int(m.group("n"))] = p

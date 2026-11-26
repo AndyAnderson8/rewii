@@ -216,3 +216,10 @@ The decisions from the second review were applied: **build everything** (no MVP 
 - GameCube channels on an actual Wii.
 - The launch-screen styles on an actual Wii. Cover and black are DOL patches; classic is byte-identical to the old make_wad.py output.
 - Formatting real devices, and anything on Windows or macOS. CI builds and tests on all three OSes, but nobody has used it by hand there yet.
+
+**Code audit (2026-11-26):** four independent reviews (games/channels, drive/format/backup, downloads/WADs/saves, UI/CLI), with every confirmed finding fixed and covered by a regression test. The suite grew from 242 to 413 tests; `ruff` and `mypy` are clean and now run in CI. Known leftovers:
+- Overwrite-install deletes the old copy just before the new one is renamed into place (the UI never overwrites).
+- Two mods with the same archive name share one library entry.
+- No "missing cover" cache, so missing covers are re-requested each run.
+- The elevated-format `sudo` fallback (Linux without `pkexec`) prompts on the terminal the app is drawing on.
+- 4Kn-sector drives aren't detected by the formatter.

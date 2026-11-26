@@ -36,3 +36,14 @@ rewii = "rewii.__main__:main"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["F", "E9", "B", "PLE"]
+ignore = ["B905"]
+
+[tool.mypy]
+ignore_missing_imports = true

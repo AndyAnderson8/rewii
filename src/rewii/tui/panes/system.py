@@ -291,9 +291,12 @@ class SystemPane(Pane):
                   for f in r.findings] or ["✔ Everything needed is installed."]
         ct, rg = SC.profile_from_syscheck(r)
         s = self.settings
-        if ct and rg and (ct != s.console_type or rg != s.console_region):
+        changed = bool(ct and rg and (ct != s.console_type or rg != s.console_region))
+        if changed:
             lines.append(f"\nSettings will be updated: console {ct}, region {rg}.")
             s.console_type, s.console_region = ct, rg
+        if changed or r.korean_region_changed != s.korean_region_changed:
+            s.korean_region_changed = r.korean_region_changed
             self.rapp.save_settings()
         await self.message("SysCheck report", "\n".join(lines))
         fixes = [f.fix for f in r.findings if f.fix in SYSCHECK_FIX_GUIDE]
