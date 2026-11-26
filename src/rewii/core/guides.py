@@ -128,7 +128,7 @@ If games don't show up: make sure the drive is in the right USB port and the cIO
 **Wii saves** – use *SaveGame Manager GX* (installed by Drive → Set up):
 1. Homebrew Channel → **SaveGame Manager GX**.
 2. **Backup**: pick saves → *Extract*. They go to the drive's **savegames/** folder.
-3. On the computer: Saves → **Back up from drive**.
+3. On the computer: Saves → **Back up all** (or *Back up selected*).
 4. **Restore**: Saves → *Restore to drive*, then in SaveGame Manager GX use *Install*.
 
 **GameCube saves** (Nintendont): kept on the drive in **saves/** as memory card files.
@@ -188,7 +188,7 @@ On the Wii:
         """\
 Priiloader's *System Menu Hacks* come from **hacks_hash.ini** in apps/priiloader on the drive.
 
-- **Update hack list:** System → *Priiloader hacks* → *Update* downloads the newest official list
+- **Update hack list:** System → *Priiloader hacks…* → *Update list* downloads the newest official list
   (patches you added are kept).
 - **Add a patch:** paste the text from a patch generator - for example the Wii U (vWii) clock fix
   from https://garyodernichts.github.io/priiloader-patch-gen - and ReWii checks and adds it.

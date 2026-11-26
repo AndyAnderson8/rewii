@@ -2,26 +2,27 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
+from collections.abc import Callable
 
-from textual import on, work
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal
 from textual.widgets import Button, DataTable, Label, Static
 
 from ...core import backup as BK
 from ...core import nand as NA
-from ..base import Pane
+from ..base import FAILED, Pane
 from ..widgets import human_size
 
 
 class BackupsPane(Pane):
-    TITLE = "Backups"
     DEFAULT_CSS = """
     BackupsPane #snaps { height: 1fr; }
     BackupsPane #nands { height: 1fr; }
     """
 
-    def __init__(self, **kw) -> None:
+    def __init__(self, **kw: Any) -> None:
         super().__init__(**kw)
         self.snaps: list[BK.Snapshot] = []
         self.nands: list[NA.ArchivedNand] = []
@@ -56,11 +57,15 @@ class BackupsPane(Pane):
 
     @work(thread=True, exclusive=True, group="bk-scan")
     def _scan(self) -> None:
-        snaps = BK.list_snapshots(self.settings)
-        nands = NA.list_archives(self.settings)
-        self.app.call_from_thread(self._fill, snaps, nands)
+        try:
+            snaps = BK.list_snapshots(self.settings)
+            nands = NA.list_archives(self.settings)
+        except Exception as e:  # noqa: BLE001 - an unreadable folder must not close the app
+            self.scan_failed("Reading the backups", e)
+            return
+        self.from_thread(self._fill, snaps, nands)
 
-    def _fill(self, snaps, nands) -> None:
+    def _fill(self, snaps: list[BK.Snapshot], nands: list[NA.ArchivedNand]) -> None:
         self.snaps, self.nands = snaps, nands
         t = self.query_one("#snaps", DataTable)
         t.clear()
@@ -76,64 +81,77 @@ class BackupsPane(Pane):
             f"Stored in {self.settings.library / 'Backups'}" +
             ("" if nands else "   ·   No NAND backup yet - make one before changing anything on the Wii!"))
 
-    def _sel(self, tid: str) -> int | None:
-        t = self.query_one(tid, DataTable)
-        if not t.row_count:
+    def _snap(self) -> BK.Snapshot | None:
+        i = self.cursor_index("#snaps")
+        if i is None or i >= len(self.snaps):
+            self.app.notify("Highlight a drive backup first", severity="warning")
             return None
-        return int(t.coordinate_to_cell_key(t.cursor_coordinate).row_key.value)
+        return self.snaps[i]
 
-    @on(Button.Pressed)
-    def _b(self, ev: Button.Pressed) -> None:
-        {"snap": self.action_snap, "restore": self.action_restore, "diff": self.action_diff,
-         "verify": self.action_verify, "delsnap": self.action_delsnap, "clone": self.action_clone,
-         "collect": self.action_collect, "addnand": self.action_addnand, "nverify": self.action_nverify,
-         "kit": self.action_kit, "nhelp": self.action_nhelp}[ev.button.id]()
+    def _nand(self) -> NA.ArchivedNand | None:
+        i = self.cursor_index("#nands")
+        if i is None or i >= len(self.nands):
+            self.app.notify("Highlight a NAND backup first", severity="warning")
+            return None
+        return self.nands[i]
+
+    def button_actions(self) -> dict[str, Callable[[], Any]]:
+        return {"snap": self.action_snap, "restore": self.action_restore, "diff": self.action_diff,
+                "verify": self.action_verify, "delsnap": self.action_delsnap, "clone": self.action_clone,
+                "collect": self.action_collect, "addnand": self.action_addnand, "nverify": self.action_nverify,
+                "kit": self.action_kit, "nhelp": self.action_nhelp}
 
     # ------------------------------------------------------------------ drive snapshots
     @work(exclusive=True, group="bk")
     async def action_snap(self) -> None:
-        if not self.need_drive():
+        lay = self.need_drive()
+        if lay is None:
             return
-        lay, s = self.layout_, self.settings
-        games = await self.confirm("Back up drive", "Include games? Games are big and you probably have them in "
-                                   "your library already. Without them the backup is apps, saves, covers, "
-                                   "settings and WADs - usually small.",
-                                   yes="Include games", no="Everything but games")
-        label = BK.suggest_label(lay.root)
+        s = self.settings
+        ch = await self.choose("Back up drive", "Include games? Games are big and you probably have them in "
+                               "your library already. Without them the backup is apps, saves, covers, "
+                               "settings and WADs - usually small.",
+                               a="Everything but games", b="Include games")
+        if ch is None:
+            return
+        games = ch == "b"
+        root = lay.root
         res = await self.job("Backing up drive",
-                             lambda p, c: BK.create_snapshot(lay.root, s, label, include_games=games,
-                                                             progress=p, cancel=c))
-        if res is not None:
+                             lambda p, c: BK.create_snapshot(root, s, BK.suggest_label(root), include_games=games,
+                                                             progress=p, cancel=c), quiet=True)
+        if res is not FAILED:
             self.app.notify(f"Backed up {len(res.files)} files ({human_size(res.size)})")
             self.reload()
 
     @work(exclusive=True, group="bk")
     async def action_restore(self) -> None:
-        i = self._sel("#snaps")
-        if i is None or not self.need_drive():
+        lay = self.need_drive()
+        snap = self._snap() if lay is not None else None
+        if lay is None or snap is None:
             return
-        snap = self.snaps[i]
-        target = self.layout_.root
+        target = lay.root
         if not await self.confirm(
                 "Restore backup", f"Copy the files from the {snap.created[:16]} backup to {target}?\n\n"
                 "Files that are already the same are skipped. Files that changed since the backup "
                 "(saves, settings) are REPLACED with the older backed-up version. Files that are only "
                 "on the drive are left alone.", yes="Restore"):
             return
-        res = await self.job("Restoring", lambda p, c: BK.restore_snapshot(snap, target, progress=p, cancel=c))
-        if res is not None:
+        res = await self.job("Restoring", lambda p, c: BK.restore_snapshot(snap, target, progress=p, cancel=c),
+                             quiet=True)
+        if res is not FAILED:
             await self.message("Restored", f"{len(res.copied)} files copied, {len(res.skipped)} already up to date."
                                + (f"\n{len(res.failed_verify)} failed verification!" if res.failed_verify else ""),
                                error=bool(res.failed_verify))
 
     @work(exclusive=True, group="bk")
     async def action_diff(self) -> None:
-        i = self._sel("#snaps")
-        if i is None or not self.need_drive():
+        lay = self.need_drive()
+        snap = self._snap() if lay is not None else None
+        if lay is None or snap is None:
             return
-        snap, root = self.snaps[i], self.layout_.root
+        root = lay.root
         d = await self.job("Comparing", lambda p, c: BK.diff_snapshot(snap, root, cancel=c), quiet=True)
-        if d is None:
+        if d is FAILED:
             return
         if d.identical:
             await self.message("Compare", "The drive matches this backup.")
@@ -147,42 +165,49 @@ class BackupsPane(Pane):
 
     @work(exclusive=True, group="bk")
     async def action_verify(self) -> None:
-        i = self._sel("#snaps")
-        if i is None:
+        snap = self._snap()
+        if snap is None:
             return
-        snap = self.snaps[i]
         bad = await self.job("Verifying backup", lambda p, c: BK.verify_snapshot(snap, p, c), quiet=True)
-        if bad is not None:
+        if bad is not FAILED:
             await self.message("Verify", "Backup is intact." if not bad else "Problems:\n" + "\n".join(map(str, bad)),
                                error=bool(bad))
 
     @work(exclusive=True, group="bk")
     async def action_delsnap(self) -> None:
-        i = self._sel("#snaps")
-        if i is None:
+        snap = self._snap()
+        if snap is None:
             return
-        snap = self.snaps[i]
-        if await self.confirm("Delete backup", f"Delete the {snap.created[:16]} backup ({human_size(snap.size)})?",
+        if await self.confirm("Delete backup", f"Delete the {snap.created[:16]} backup of {snap.label} "
+                              f"({len(snap.files)} files, {human_size(snap.size)}) from this computer?",
                               danger=True, yes="Delete"):
-            BK.delete_snapshot(snap)
+            await self.job("Deleting backup", lambda p, c: BK.delete_snapshot(snap), cancellable=False, quiet=True)
             self.reload()
 
     @work(exclusive=True, group="bk")
     async def action_clone(self) -> None:
-        if not self.need_drive():
+        lay = self.need_drive()
+        if lay is None:
             return
-        src = self.layout_.root
+        src = lay.root
         picked = await self.pick("Choose the NEW drive (already formatted FAT32)", folder=True)
         if not picked:
             return
         dst = picked[0]
-        if dst.resolve() == src.resolve():
+        try:
+            same = dst.resolve() == src.resolve()
+        except OSError:
+            same = False
+        if same:
             self.app.notify("That's the same drive", severity="error")
             return
-        if not await self.confirm("Copy drive", f"Copy everything from {src} to {dst} and check each file?"):
+        if not await self.confirm("Copy drive", f"Copy everything from {src} to {dst} and check each file?\n\n"
+                                  "Files with the same name on the new drive are replaced; other files "
+                                  "there are left alone.", yes="Copy"):
             return
-        res = await self.job("Copying drive", lambda p, c: BK.clone_drive(src, dst, progress=p, cancel=c))
-        if res is not None:
+        res = await self.job("Copying drive", lambda p, c: BK.clone_drive(src, dst, progress=p, cancel=c),
+                             quiet=True)
+        if res is not FAILED:
             await self.message("Copied", f"{len(res.copied)} files copied ({human_size(res.bytes_copied)})." +
                                (f"\n{len(res.failed_verify)} failed verification!" if res.failed_verify else ""),
                                error=bool(res.failed_verify))
@@ -192,29 +217,37 @@ class BackupsPane(Pane):
     # ------------------------------------------------------------------ NAND
     def action_nhelp(self) -> None:
         self.rapp.action_section("system")
-        self.rapp.query_one("#system").show_guide("nand-backup")  # type: ignore[attr-defined]
+        self.rapp.pane("system").show_guide("nand-backup")  # type: ignore[attr-defined]
 
     async def _archive(self, root: Path) -> None:
-        dumps = NA.find_nand_dumps(root)
-        vdumps = NA.find_vwii_dumps(root)
+        def look(progress: Any, cancel: Any) -> tuple[list[NA.NandDump], list[NA.VwiiDump], list[str]]:
+            # hashing a 512 MB nand.bin takes a while: do it here, with a progress bar
+            dumps = NA.find_nand_dumps(root)
+            vdumps = NA.find_vwii_dumps(root)
+            lines = []
+            for d in dumps:
+                v = NA.validate_dump(d, progress=progress, cancel=cancel)
+                lines.append(f"{d.nand.name} ({d.tool}): {'OK' if v.ok else 'PROBLEM'} – console {v.console_label}")
+                lines += [f"   ✖ {e}" for e in v.errors] + [f"   ! {w}" for w in v.warnings]
+            for vd in vdumps:
+                errs = NA.verify_vwii_dump(vd)
+                lines.append(f"Wii U NAND dump: {'OK' if not errs else 'PROBLEM'}")
+                lines += [f"   ✖ {e}" for e in errs]
+            return dumps, vdumps, lines
+
+        found = await self.job("Checking the NAND backup", look, quiet=True)
+        if found is FAILED:
+            return
+        dumps, vdumps, lines = found
         if not dumps and not vdumps:
             await self.message("No NAND backup found", f"Nothing found in {root}. Run nanddumper@ios on the Wii first "
                                "(System & Guides → Back up your NAND).")
             return
         s = self.settings
-        lines = []
-        for d in dumps:
-            v = NA.validate_dump(d)
-            lines.append(f"{d.nand.name} ({d.tool}): {'OK' if v.ok else 'PROBLEM'} – console {v.console_label}")
-            lines += [f"   ✖ {e}" for e in v.errors] + [f"   ! {w}" for w in v.warnings]
-        for vd in vdumps:
-            errs = NA.verify_vwii_dump(vd)
-            lines.append(f"Wii U NAND dump: {'OK' if not errs else 'PROBLEM'}")
-            lines += [f"   ✖ {e}" for e in errs]
-        if not await self.confirm("Save NAND backup", "\n".join(lines) + "\n\nSave to your library?"):
+        if not await self.confirm("Save NAND backup", "\n".join(lines) + "\n\nSave to your library?", yes="Save"):
             return
 
-        def run(progress, cancel):
+        def run(progress: Any, cancel: Any) -> list[tuple[NA.ArchivedNand, bool]]:
             out = []
             for d in dumps:
                 out.append(NA.archive_dump(d, s, progress=progress, cancel=cancel))
@@ -222,8 +255,8 @@ class BackupsPane(Pane):
                 out.append((NA.archive_vwii_dump(vd, s, progress=progress, cancel=cancel), True))
             return out
 
-        res = await self.job("Saving NAND backup", run)
-        if res is not None:
+        res = await self.job("Saving NAND backup", run, quiet=True)
+        if res is not FAILED:
             new = sum(1 for _, created in res if created)
             await self.message("NAND backup saved",
                                (f"{new} backup(s) saved" if new else "Already saved before") +
@@ -233,8 +266,9 @@ class BackupsPane(Pane):
 
     @work(exclusive=True, group="bk")
     async def action_collect(self) -> None:
-        if self.need_drive():
-            await self._archive(self.layout_.root)
+        lay = self.need_drive()
+        if lay is not None:
+            await self._archive(lay.root)
 
     @work(exclusive=True, group="bk")
     async def action_addnand(self) -> None:
@@ -244,21 +278,18 @@ class BackupsPane(Pane):
 
     @work(exclusive=True, group="bk")
     async def action_nverify(self) -> None:
-        i = self._sel("#nands")
-        if i is None:
+        a = self._nand()
+        if a is None:
             return
-        a = self.nands[i]
         bad = await self.job("Verifying NAND backup", lambda p, c: NA.verify_archive(a, p, c), quiet=True)
-        if bad is not None:
+        if bad is not FAILED:
             await self.message("Verify", "Backup is intact." if not bad else "\n".join(bad), error=bool(bad))
 
     @work(exclusive=True, group="bk")
     async def action_kit(self) -> None:
-        i = self._sel("#nands")
-        if i is None:
-            self.app.notify("Select a NAND backup first", severity="warning")
+        a = self._nand()
+        if a is None:
             return
-        a = self.nands[i]
         if not await self.confirm(
                 "SD rescue kit",
                 f"This puts the NAND backup of console {a.console_id} and BootMii on an SD card, so BootMii can "
@@ -277,7 +308,7 @@ class BackupsPane(Pane):
             dl = self.settings.downloads_dir / "bootmii"
             bootmii_dir = await self.job("Downloading BootMii", lambda p, c: NA.fetch_bootmii_sd_files(
                 dl, progress=p, cancel=c))
-            if bootmii_dir is None:
+            if bootmii_dir is FAILED:
                 return
         # a keys.bin already on the card tells us which Wii the card belongs to: let the
         # kit builder refuse if it is a different console than this backup
@@ -285,6 +316,6 @@ class BackupsPane(Pane):
         kit = await self.job("Making rescue kit", lambda p, c: NA.build_rescue_kit(
             a, target, bootmii_dir=bootmii_dir, target_keys=tk if tk.is_file() else None,
             progress=p, cancel=c))
-        if kit is not None:
+        if kit is not FAILED:
             await self.message("Rescue kit ready", "\n".join(str(f) for f in kit.files) + "\n\n" +
                                "\n".join(kit.warnings) + "\n\nSee System & Guides → If something goes wrong.")

@@ -1,10 +1,19 @@
 """Command-line interface for scripting (``rewii <command> ...``). Running ``rewii``
-with no arguments opens the full-screen app instead."""
+with no arguments opens the full-screen app instead.
+
+Exit codes: 0 = done, 1 = the operation failed (or found problems), 2 = the
+command was used wrongly (bad arguments, missing drive, needs ``-y``), 130 = Ctrl+C.
+Mistakes a user can make (wrong path, not a game, drive missing...) print one
+``error:`` line - never a traceback.
+"""
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
+from typing import Any, Optional
+from collections.abc import Callable
 
 from . import __version__
 from .core.config import Settings
@@ -31,86 +40,146 @@ class _Bar:
             sys.stderr.write("\r" + " " * 80 + "\r")
 
 
-def _drive(args) -> DriveLayout:
+class CliError(Exception):
+    """A problem to report as ``error: ...`` with an exit code (2 = wrong usage)."""
+
+    def __init__(self, message: str, code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def is_user_error(e: BaseException) -> bool:
+    """Errors that describe the user's files/drive rather than a bug: anything the OS
+    refuses (missing file, no permission, disk full) and every error type the core defines."""
+    return isinstance(e, OSError) or type(e).__module__.startswith("rewii.core.")
+
+
+def _say(e: BaseException) -> str:
+    if isinstance(e, FileNotFoundError) and e.filename:
+        return f"{e.filename}: no such file or folder"
+    if isinstance(e, PermissionError) and e.filename:
+        return f"{e.filename}: permission denied (a drive read directly needs admin rights)"
+    return str(e) or type(e).__name__
+
+
+def _fail(what: object, e: BaseException) -> None:
+    print(f"{what}: {_say(e)}", file=sys.stderr)
+
+
+def _drive_at(path: str) -> DriveLayout:
+    p = Path(path).expanduser()
+    if not p.is_dir():
+        raise CliError(f"the drive {p} isn't there (is it plugged in and mounted?)")
+    return DriveLayout(p)
+
+
+def _drive(args: Any) -> DriveLayout:
     d = args.drive or Settings.load().last_drive
     if not d:
-        sys.exit("error: give --drive PATH (the Wii drive's mount point / drive letter)")
-    return DriveLayout(Path(d))
+        raise CliError("give --drive PATH (the Wii drive's mount point / drive letter)")
+    return _drive_at(d)
 
 
-def _titles(settings: Settings):
+def _titles(settings: Settings) -> Optional[Callable[[str], Optional[str]]]:
     try:
         from .core.gametdb import TitleDB
         db = TitleDB.load(settings)
-        return lambda gid: (db.get(gid).title if db.get(gid) else None)
-    except Exception:
+    except Exception:  # noqa: BLE001 - titles then come from the discs
         return None
 
+    def look(gid: str) -> Optional[str]:
+        g = db.get(gid)
+        return g.title if g else None
+    return look
 
-def cmd_info(a) -> int:
+
+def cmd_info(a: Any) -> int:
     from .core.disc import NeedsConversion, disc_info
+    rc = 0
     for p in a.files:
         try:
             i = disc_info(p)
             print(f"{p}: {i.title} [{i.game_id}] {i.platform} disc {i.disc_number + 1} {i.region} {i.fmt}")
         except NeedsConversion as e:
             print(f"{p}: {e}")
-        except Exception as e:
-            print(f"{p}: not a game ({e})")
-    return 0
+        except Exception as e:  # noqa: BLE001 - whatever it is, it isn't a readable game
+            print(f"{p}: not a game ({_say(e)})", file=sys.stderr)
+            rc = 1
+    return rc
 
 
-def cmd_games_list(a) -> int:
+def cmd_games_list(a: Any) -> int:
     from .core import games as G
     s = Settings.load()
-    look = _titles(s)
-    rows = G.scan_drive(_drive(a), look) if a.drive or not a.library else []
     if a.library:
-        rows = G.scan_library(s, look)
+        rows = G.scan_library(s, _titles(s))
+    else:
+        lay = _drive(a)
+        rows = G.scan_drive(lay, _titles(s))
     for g in rows:
         print(f"{g.game_id}  {'Wii' if g.is_wii else 'GC '}  {g.size / 1e9:6.2f} GB  {g.title}"
               f"{'  [' + g.problem + ']' if g.problem else ''}")
     return 0
 
 
-def cmd_games_add(a) -> int:
+def cmd_games_add(a: Any) -> int:
     from .core import games as G
     s = Settings.load()
+    lay = _drive_at(a.drive) if a.drive and not a.library_only else None
     look = _titles(s)
     bar = _Bar()
     rc = 0
     for p in a.files:
         try:
-            if a.library_only or not a.drive:
+            if lay is None:
                 g = G.add_to_library(s, Path(p), scrub=s.scrub_games, lookup=look, progress=bar)
             else:
-                g = G.install_game(_drive(a), Path(p), scrub=s.scrub_games, lookup=look, progress=bar)
+                g = G.install_game(lay, Path(p), scrub=s.scrub_games, lookup=look, progress=bar)
             bar.done()
             print(f"added {g.title} [{g.game_id}] -> {g.path}")
-        except G.GameError as e:
+        except Exception as e:  # noqa: BLE001
             bar.done()
-            print(f"{p}: {e}", file=sys.stderr)
+            if not is_user_error(e):
+                raise
+            _fail(p, e)
             rc = 1
     return rc
 
 
-def cmd_games_remove(a) -> int:
+def cmd_games_remove(a: Any) -> int:
     from .core import games as G
     lay = _drive(a)
+    if not a.yes and not sys.stdin.isatty():
+        raise CliError("removing games asks for confirmation; pass -y to remove without asking")
     games = G.scan_drive(lay)
+    rc = 0
     for gid in a.ids:
         hits = [g for g in games if g.game_id == gid.upper()]
         if not hits:
             print(f"{gid}: not on the drive", file=sys.stderr)
+            rc = 1
             continue
         for g in hits:
-            if a.yes or input(f"Delete {g.title} from the drive? [y/N] ").lower() == "y":
+            if not a.yes:
+                try:
+                    answer = input(f"Delete {g.title} from the drive? [y/N] ")
+                except EOFError:
+                    raise CliError("no answer; pass -y to remove without asking") from None
+                if answer.strip().lower() not in ("y", "yes"):
+                    print(f"kept {g.title}")
+                    continue
+            try:
                 G.remove_game(lay, g)
                 print(f"removed {g.title}")
-    return 0
+            except Exception as e:  # noqa: BLE001
+                if not is_user_error(e):
+                    raise
+                _fail(g.title, e)
+                rc = 1
+    return rc
 
 
-def cmd_verify(a) -> int:
+def cmd_verify(a: Any) -> int:
     from .core.games import verify_game
     bar = _Bar()
     rc = 0
@@ -118,21 +187,23 @@ def cmd_verify(a) -> int:
         r = verify_game(Path(p), bar)
         bar.done()
         print(f"{'OK ' if r.ok else 'BAD'} {p}: {r.message}")
-        rc |= not r.ok
+        if not r.ok:
+            rc = 1
     return rc
 
 
-def cmd_channel(a) -> int:
+def cmd_channel(a: Any) -> int:
     from .core.channels import build_channel
-    from .core.forwarder import ForwarderError
     s = Settings.load()
     if a.style:
         s.forwarder_style = a.style
+    drive_root = _drive_at(a.drive).root if a.drive else None
+    out = Path(a.out).expanduser() if a.out else None
     info_db = None
     try:
         from .core.gametdb import TitleDB
         info_db = TitleDB.load(s)
-    except Exception:
+    except Exception:  # noqa: BLE001 - titles then come from the discs
         pass
     rc = 0
     for p in a.files:
@@ -143,51 +214,62 @@ def cmd_channel(a) -> int:
             if a.wbfs_partition:
                 from .core.forwarder import cover_for_channel, make_channel
                 cov = cover_for_channel(gid, s.cover_lang) if s.forwarder_style == "cover" else None
-                ci = make_channel(Path(p), Path(a.out) if a.out else s.channels_dir, style=s.forwarder_style,
-                                  cover_png=cov, fat=False)
+                ci = make_channel(Path(p), out or s.channels_dir, style=s.forwarder_style,
+                                  cover_png=cov, fat=False, title=info.title if info else None)
             else:
-                ci = build_channel(Path(p), s, drive_root=Path(a.drive) if a.drive else None,
+                ci = build_channel(Path(p), s, drive_root=drive_root,
                                    title=info.title if info else None, info=info)
-                if a.out:
-                    dest = Path(a.out) / ci.path.name
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    ci.path.replace(dest)
-                    ci.path = dest
+                if out is not None:
+                    out.mkdir(parents=True, exist_ok=True)
+                    dest = out / ci.path.name
+                    if dest.resolve() != ci.path.resolve():
+                        # --out is often the USB drive: move() also works across filesystems
+                        dest.unlink(missing_ok=True)
+                        shutil.move(str(ci.path), str(dest))
+                        ci.path = dest
             print(f"{ci.path}  ({ci.channel_id}, {ci.style})")
-        except ForwarderError as e:
-            print(f"{p}: {e}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            if not is_user_error(e):
+                raise
+            _fail(p, e)
             rc = 1
     return rc
 
 
-def cmd_normalize(a) -> int:
+def cmd_normalize(a: Any) -> int:
     from .core.games import normalize_drive
     for m in normalize_drive(_drive(a)):
         print(m)
     return 0
 
 
-def cmd_migrate(a) -> int:
+def cmd_migrate(a: Any) -> int:
     from .core.games import migrate_wbfs_partition
     from .core.wbfs import WbfsPartition, find_wbfs_partition
-    off = find_wbfs_partition(a.source)
+    src = Path(a.source)
+    lay = _drive_at(a.drive) if a.drive else None
+    off = find_wbfs_partition(src)
     if off is None:
-        sys.exit("no WBFS partition found")
+        raise CliError(f"{src}: no WBFS partition found", 1)
     if a.list:
-        p = WbfsPartition(a.source, off)
-        for g in p.games():
-            print(f"{g.slot:3}  {g.game_id}  {g.size / 1e9:6.2f} GB  {g.title}")
+        part = WbfsPartition(src, off)
+        try:
+            for g in part.games():
+                print(f"{g.slot:3}  {g.game_id}  {g.size / 1e9:6.2f} GB  {g.title}")
+        finally:
+            part.close()
         return 0
     s = Settings.load()
     bar = _Bar()
-    res = migrate_wbfs_partition(Path(a.source), _drive(a) if a.drive else None, s, None, off,
-                                 _titles(s), bar)
-    bar.done()
-    print("\n".join(res))
+    try:
+        res = migrate_wbfs_partition(src, lay, s, None, off, _titles(s), bar)
+    finally:
+        bar.done()
+    print("\n".join(res) if res else "Nothing new to copy.")
     return 0
 
 
-def cmd_drives(a) -> int:
+def cmd_drives(a: Any) -> int:
     from .core.drives import list_drives
     ds = list_drives(include_fixed=a.all)
     if not ds:
@@ -198,7 +280,7 @@ def cmd_drives(a) -> int:
     return 0
 
 
-def cmd_health(a) -> int:
+def cmd_health(a: Any) -> int:
     from .core import health
     from .core.drives import drive_for_path
     lay = _drive(a)
@@ -206,17 +288,26 @@ def cmd_health(a) -> int:
     findings = health.check(lay, drv)
     for f in findings:
         print(f"[{f.severity:5}] {f.message}" + (f"  (fix: {f.fix_id})" if f.fix_id else ""))
-    if a.fix:
-        for f in findings:
-            if f.auto_fixable:
-                for line in health.fix(lay, f):
-                    print("  fixed:", line)
     if not findings:
         print("Everything looks good.")
+    if a.fix and any(f.auto_fixable for f in findings):
+        for f in findings:
+            if not f.auto_fixable:
+                continue
+            try:
+                for line in health.fix(lay, f):
+                    print("  fixed:", line)
+            except Exception as e:  # noqa: BLE001
+                if not is_user_error(e):
+                    raise
+                print(f"  couldn't fix: {_say(e)}", file=sys.stderr)
+        findings = health.check(lay, drv)      # the exit code describes the drive as it is now
+        left = [f for f in findings if f.severity == "error"]
+        print(f"After fixing: {len(findings)} finding(s) left, {len(left)} of them errors.")
     return 1 if any(f.severity == "error" for f in findings) else 0
 
 
-def cmd_format_drive(a) -> int:
+def cmd_format_drive(a: Any) -> int:
     """Non-interactive formatter; the app runs this elevated (admin/root)."""
     from .core import formatting
     from .core.drives import list_drives
@@ -242,7 +333,8 @@ def cmd_format_drive(a) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="rewii", description="ReWii - all-in-one Wii toolkit. "
-                                 "Run without arguments for the full app.")
+                                 "Run without arguments (or with just --drive PATH) for the full app.",
+                                 epilog="Exit codes: 0 done, 1 failed or problems found, 2 wrong usage.")
     ap.add_argument("--version", action="version", version=f"ReWii {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -252,8 +344,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = sub.add_parser("games", help="manage games").add_subparsers(dest="sub", required=True)
     p = g.add_parser("list", help="list games on the drive (or --library)")
-    p.add_argument("--drive")
-    p.add_argument("--library", action="store_true")
+    where = p.add_mutually_exclusive_group()
+    where.add_argument("--drive")
+    where.add_argument("--library", action="store_true", help="list the PC library instead of the drive")
     p.set_defaults(fn=cmd_games_list)
     p = g.add_parser("add", help="add game files to the library, or to --drive")
     p.add_argument("files", nargs="+")
@@ -263,14 +356,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = g.add_parser("remove", help="remove games (by ID) from the drive")
     p.add_argument("ids", nargs="+")
     p.add_argument("--drive")
-    p.add_argument("-y", "--yes", action="store_true")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="don't ask before deleting (required when not run from a terminal)")
     p.set_defaults(fn=cmd_games_remove)
     p = g.add_parser("fix-layout", help="move misplaced games into the right folders")
     p.add_argument("--drive")
     p.set_defaults(fn=cmd_normalize)
-    p = g.add_parser("migrate", help="copy games out of an old WBFS-formatted drive/image")
+    p = g.add_parser("migrate", help="copy games out of an old WBFS-formatted drive/image into the library")
     p.add_argument("source")
-    p.add_argument("--drive")
+    p.add_argument("--drive", help="also copy them to this Wii drive")
     p.add_argument("--list", action="store_true")
     p.set_defaults(fn=cmd_migrate)
 
@@ -311,4 +405,15 @@ def main(argv: list[str]) -> int:
     try:
         return int(a.fn(a) or 0)
     except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
         return 130
+    except CliError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return e.code
+    except BrokenPipeError:
+        return 1
+    except Exception as e:  # noqa: BLE001 - user errors become one line; bugs still show a traceback
+        if not is_user_error(e):
+            raise
+        print(f"error: {_say(e)}", file=sys.stderr)
+        return 1
