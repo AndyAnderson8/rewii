@@ -1,4 +1,4 @@
-"""Writing disc images: WBFS files (with FAT32 splitting), plain ISO, CISO.
+"""Writing disc images: WBFS files (with FAT32 splitting) and plain ISO.
 
 Also reads legacy raw WBFS *partitions* (old WBFS-formatted drives or disk images
 of them) so users can migrate to the FAT32 layout.
@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Optional
 
-from .disc import (FAT32_SPLIT, WII_DL_SECTORS, WII_SECTOR, DiscReader,
-                   WbfsFileReader, parse_header, used_sectors)
+from .disc import (FAT32_SPLIT, WII_DL_SECTORS, WII_SECTOR, DiscError, DiscReader,
+                   WbfsFileReader, incomplete_reason, parse_header, used_sectors, wii_usage_table)
 from .progress import CancelToken, ProgressFn, Reporter
 
 WBFS_SEC_S = 21                    # 2 MiB WBFS blocks, what WBM/wit use for files
@@ -68,11 +68,29 @@ class SplitWriter:
         else:
             self._open(0).truncate(total)
 
-    def close(self) -> None:
+    def close(self, sync: bool = True) -> None:
+        """Close every part. With ``sync`` the data is flushed to the device first
+        and the first error is raised - after all the files have been closed."""
+        err: BaseException | None = None
         for f in self.files:
-            f.flush()
-            os.fsync(f.fileno())
-            f.close()
+            try:
+                if sync and not f.closed:
+                    f.flush()
+                    os.fsync(f.fileno())
+            except OSError as e:
+                err = err or e
+            finally:
+                try:
+                    f.close()
+                except OSError as e:
+                    err = err or e
+        if sync and err is not None:
+            raise err
+
+    def abort(self) -> None:
+        """Close without syncing and delete everything written (never raises)."""
+        self.close(sync=False)
+        _cleanup(self.paths)
 
 
 def _cleanup(paths: list[Path]) -> None:
@@ -86,7 +104,10 @@ def _cleanup(paths: list[Path]) -> None:
 def write_wbfs(d: DiscReader, dest: Path, *, scrub: bool = True, include_update: bool = False,
                split: Optional[int] = FAT32_SPLIT, progress: ProgressFn | None = None,
                cancel: CancelToken | None = None) -> list[Path]:
-    """Write a Wii disc as a WBFS file. Returns the written file paths."""
+    """Write a Wii disc as a WBFS file. Returns the written file paths.
+
+    Raises :class:`DiscError` if the source is missing data the game needs
+    (a truncated image, a lost split part); nothing is written then."""
     hdr = d.read(0, 0x100)
     _gid, _t, platform, _n, _v = parse_header(hdr)
     if platform != "wii":
@@ -96,7 +117,11 @@ def write_wbfs(d: DiscReader, dest: Path, *, scrub: bool = True, include_update:
     per_blk = sec_sz // WII_SECTOR
     rep = Reporter(progress, cancel, message="Analysing disc")
     rep.note("Analysing disc")
-    used = used_sectors(d, scrub=scrub, include_update=include_update)
+    table = wii_usage_table(d, include_update)
+    why = incomplete_reason(d, include_update=include_update, table=table)
+    if why:
+        raise DiscError(f"Can't copy this game: {why}")
+    used = used_sectors(d, scrub=scrub, include_update=include_update, table=table)
     n_blocks_disc = WII_DL_SECTORS // per_blk
     blocks = [b for b in range(n_blocks_disc)
               if any(used[b * per_blk:(b + 1) * per_blk])]
@@ -117,11 +142,10 @@ def write_wbfs(d: DiscReader, dest: Path, *, scrub: bool = True, include_update:
         w.write_at(0, head)
         w.write_at(hd_sz, info)
         w.truncate(total)
-    except BaseException:
         w.close()
-        _cleanup(w.paths)
+    except BaseException:
+        w.abort()
         raise
-    w.close()
     return w.paths
 
 
@@ -152,64 +176,26 @@ def write_iso(d: DiscReader, dest: Path, *, split: Optional[int] = None, scrub: 
             off += n
             rep.advance(n)
         w.truncate(total)
-    except BaseException:
         w.close()
-        _cleanup(w.paths)
-        raise
-    w.close()
-    return w.paths
-
-
-def write_ciso(d: DiscReader, dest: Path, *, block: int = 0, scrub: bool = True,
-               progress: ProgressFn | None = None, cancel: CancelToken | None = None) -> Path:
-    """Write a CISO image (accepted by USB Loader GX and Nintendont)."""
-    hdr = d.read(0, 0x100)
-    _gid, _t, platform, _n, _v = parse_header(hdr)
-    total = d.size
-    if not block:      # smallest power of two (>= 32 KiB) whose map fits in the header
-        block = 0x8000
-        while (total + block - 1) // block > 0x7FF8:
-            block *= 2
-    nblk = (total + block - 1) // block
-    if nblk > 0x7FF8:
-        raise ValueError("disc too large for CISO with this block size")
-    used = used_sectors(d, scrub=scrub) if platform == "wii" else None
-    rep = Reporter(progress, cancel)
-    rep.set_total(total, "Copying")
-    dest = Path(dest)
-    mp = bytearray(0x7FF8)
-    try:
-        with open(dest, "wb") as f:
-            f.write(bytes(0x8000))
-            for i in range(nblk):
-                off = i * block
-                if used is not None and not any(used[off // WII_SECTOR:(off + block + WII_SECTOR - 1) // WII_SECTOR]):
-                    rep.advance(block)
-                    continue
-                data = d.read(off, min(block, total - off))
-                if platform == "gc" and not any(data):
-                    rep.advance(block)
-                    continue
-                mp[i] = 1
-                f.write(data + bytes(block - len(data)))
-                rep.advance(block)
-            f.seek(0)
-            f.write(b"CISO" + struct.pack("<I", block) + bytes(mp))
     except BaseException:
-        _cleanup([dest])
+        w.abort()
         raise
-    return dest
+    return w.paths
 
 
 def copy_file(src: Path, dest: Path, progress: ProgressFn | None = None,
               cancel: CancelToken | None = None, rep: Reporter | None = None) -> None:
-    """Chunked copy with progress; removes the partial file on failure/cancel."""
+    """Chunked copy with progress; removes the partial file on failure/cancel.
+
+    ``dest`` is overwritten, so callers copy to a temporary name and rename."""
     size = src.stat().st_size
     rep = rep or Reporter(progress, cancel, total=size)
     if rep.total == 0:
         rep.set_total(size, f"Copying {src.name}")
+    fo = None
     try:
-        with open(src, "rb") as fi, open(dest, "wb") as fo:
+        with open(src, "rb") as fi:
+            fo = open(dest, "wb")
             while True:
                 b = fi.read(COPY_CHUNK)
                 if not b:
@@ -218,7 +204,13 @@ def copy_file(src: Path, dest: Path, progress: ProgressFn | None = None,
                 rep.advance(len(b))
             fo.flush()
             os.fsync(fo.fileno())
+            fo.close()
     except BaseException:
+        if fo is not None:
+            try:
+                fo.close()
+            except OSError:
+                pass
         _cleanup([dest])
         raise
 
@@ -228,6 +220,11 @@ class _RawFile:
     def __init__(self, path: Path, offset: int = 0):
         self.f = open(path, "rb")
         self.offset = offset
+        try:                                   # works for image files and block devices
+            end = self.f.seek(0, os.SEEK_END)
+        except OSError:
+            end = 0
+        self.total: Optional[int] = end - offset if end > offset else None
 
     def read(self, off: int, size: int) -> bytes:
         self.f.seek(self.offset + off)
@@ -253,34 +250,50 @@ class WbfsPartition:
     def __init__(self, path: Path | str, offset: int = 0):
         self.path = Path(path)
         self.raw = _RawFile(self.path, offset)
-        hdr = self.raw.read(0, 512)
-        magic, n_hd_sec, hd_s, wbfs_s = struct.unpack(">4sIBB", hdr[:10])
-        if magic != b"WBFS":
-            raise ValueError(f"{self.path}: no WBFS partition found")
-        self.hd_sz = 1 << hd_s
-        self.sec_sz = 1 << wbfs_s
-        self.n_hd_sec = n_hd_sec
-        hdr = self.raw.read(0, self.hd_sz)
+        try:
+            hdr = self.raw.read(0, 512)
+            magic, n_hd_sec, hd_s, wbfs_s = struct.unpack(">4sIBB", hdr[:10])
+            if magic != b"WBFS":
+                raise ValueError(f"{self.path}: no WBFS partition found")
+            if not (9 <= hd_s <= 16 and 15 <= wbfs_s <= 31):
+                raise ValueError(f"{self.path}: the WBFS partition header is damaged")
+            self.hd_sz = 1 << hd_s
+            self.sec_sz = 1 << wbfs_s
+            self.n_hd_sec = n_hd_sec
+            hdr = self.raw.read(0, self.hd_sz)
+        except BaseException:
+            self.raw.close()
+            raise
         self.max_discs = (self.hd_sz - 12)
         self.disc_table = hdr[12:12 + self.max_discs]
         self.n_wbfs_sec_disc = (WII_DL_SECTORS * WII_SECTOR) // self.sec_sz
+        self.skipped: list[tuple[int, str]] = []      # (slot, reason) for unreadable slots
 
     @property
     def size(self) -> int:
         return self.n_hd_sec * self.hd_sz
 
     def games(self) -> list[WbfsPartitionGame]:
+        """The games on the partition. A slot that can't be read is left out and
+        noted in :attr:`skipped` instead of failing the whole listing."""
         out = []
+        self.skipped = []
         for slot, used in enumerate(self.disc_table):
             if not used:
                 continue
-            r = self.open_game(slot)
-            gid, title, *_ = parse_header(r.header)
+            try:
+                r = self.open_game(slot)
+                gid, title, *_ = parse_header(r.header)
+            except DiscError as e:
+                self.skipped.append((slot, str(e)))
+                continue
             blocks = sum(1 for x in r.wlba if x)
             out.append(WbfsPartitionGame(slot, gid, title, blocks, blocks * self.sec_sz))
         return out
 
     def open_game(self, slot: int) -> WbfsFileReader:
+        """A reader for one game. It shares this partition's file handle, so
+        closing the reader does not close the partition."""
         return WbfsFileReader(self.path, slot=slot, _stream=self.raw, _part_off=0)
 
     def close(self) -> None:

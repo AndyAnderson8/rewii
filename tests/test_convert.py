@@ -57,6 +57,8 @@ def fake_tool(tmp_path, monkeypatch):
     p.parent.mkdir()
     p.write_text(FAKE_TOOL.format(python=sys.executable, header=gc_header(), size=OUT_SIZE))
     p.chmod(0o755)
+    # the cached tool is only run if it matches the digest recorded when it was downloaded
+    convert._digest_file(p).write_text(hashlib.sha256(p.read_bytes()).hexdigest())
     monkeypatch.setattr(convert, "cached_tool_path", lambda: p)
     monkeypatch.setattr(convert, "POLL", 0.05)
     return p
@@ -76,10 +78,10 @@ def test_to_iso_with_tool(fake_tool, tmp_path):
     out = convert.to_iso(rvz(tmp_path), tmp_path / "out" / "game.iso", progress=events.append)
     assert out.stat().st_size == OUT_SIZE
     assert events[-1].done == events[-1].total == OUT_SIZE
-    args = Path(str(tmp_path / "out" / "game.part.iso") + ".args").read_text().split("\n")
+    args = Path(str(tmp_path / "out" / ".rewii-tmp-game.iso") + ".args").read_text().split("\n")
     assert args[:2] == ["--no-color", "convert"]
-    assert args[-1].endswith("game.part.iso")
-    assert not (tmp_path / "out" / "game.part.iso").exists()
+    assert args[-1].endswith(".rewii-tmp-game.iso")
+    assert not (tmp_path / "out" / ".rewii-tmp-game.iso").exists()
 
 
 def test_tool_failure_cleans_up(fake_tool, tmp_path, monkeypatch):

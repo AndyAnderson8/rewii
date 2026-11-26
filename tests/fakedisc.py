@@ -135,3 +135,17 @@ def make_gc_iso(path: Path, game_id: str = "GTST01", title: str = "GC TEST", dis
         f.write(fs)
         f.truncate(max(size, len(fs)))
     return Path(path)
+
+
+def make_ciso(iso: Path, dest: Path, block: int = 0x200000, scan: int = 64 << 20) -> Path:
+    """Pack the first ``scan`` bytes of an ISO as a CISO (zero blocks left out)."""
+    mp = bytearray(0x7FF8)
+    body = bytearray()
+    with open(iso, "rb") as f:
+        for i in range(scan // block):
+            data = f.read(block)
+            if any(data):
+                mp[i] = 1
+                body += data + bytes(block - len(data))
+    Path(dest).write_bytes(b"CISO" + struct.pack("<I", block) + bytes(mp) + bytes(body))
+    return Path(dest)

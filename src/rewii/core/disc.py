@@ -9,11 +9,11 @@ used for scrubbing (copying only the sectors a game actually uses).
 from __future__ import annotations
 
 import os
+import re
 import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Optional
-from collections.abc import Iterator
 
 from Crypto.Cipher import AES
 
@@ -27,6 +27,19 @@ WII_SL_SIZE = WII_SL_SECTORS * WII_SECTOR   # 4,699,979,776
 WII_DL_SIZE = 8_511_160_320
 GC_DISC_SIZE = 1_459_978_240
 FAT32_SPLIT = 4 * 1024 ** 3 - 32 * 1024     # 0xFFFF8000, standard split size
+
+#: Formats that are recognised but must be converted to ISO first (see ``convert``),
+#: and the file extensions they usually have. The one place these are defined.
+NEEDS_CONVERSION = frozenset({"RVZ", "WIA", "GCZ", "NKIT", "WDF"})
+NEEDS_CONVERSION_EXTS = frozenset({".rvz", ".wia", ".gcz", ".wdf"})   # NKit files are ".nkit.iso"
+VALID_DISC_SIZES = (GC_DISC_SIZE, WII_SL_SIZE, WII_DL_SIZE)
+
+MAX_TMD_SIZE = 1024 * 1024
+MAX_FST_SIZE = 64 * 1024 * 1024
+MAX_FST_ENTRIES = 0x80000
+MAX_DISC_FILE_READ = 64 * 1024 * 1024
+_BAD_DATA = (struct.error, ValueError, OverflowError, ZeroDivisionError, IndexError, MemoryError)
+_GAME_ID = re.compile(rb"[A-Z0-9]{6}")
 
 REGION_BY_CHAR = {
     "E": "NTSC-U", "N": "NTSC-U",
@@ -80,6 +93,12 @@ class DiscReader:
         """False if the container knows this 0x8000 sector is absent (all zero)."""
         return True
 
+    def missing(self, offset: int, size: int) -> bool:
+        """True if part of this range should be stored in the file(s) but lies past
+        their end (a truncated image or a lost split part). ``read`` returns
+        zeros for such data, so callers that care must ask."""
+        return False
+
     def close(self) -> None:
         pass
 
@@ -94,8 +113,14 @@ class _MultiFile:
     """Treat split files (.wbfs + .wbf1 ... / .partN) as one contiguous stream."""
 
     def __init__(self, paths: list[Path]):
-        self.files: list[BinaryIO] = [open(p, "rb") for p in paths]
-        self.sizes = [os.fstat(f.fileno()).st_size for f in self.files]
+        self.files: list[BinaryIO] = []
+        try:
+            for p in paths:
+                self.files.append(open(p, "rb"))
+            self.sizes = [os.fstat(f.fileno()).st_size for f in self.files]
+        except BaseException:
+            self.close()
+            raise
         self.starts = []
         s = 0
         for sz in self.sizes:
@@ -111,7 +136,8 @@ class _MultiFile:
             n = min(size, self.sizes[i] - within)
             f = self.files[i]
             f.seek(within)
-            out += f.read(n)
+            b = f.read(n)
+            out += b + bytes(n - len(b))
             off += n
             size -= n
         if size > 0:
@@ -120,7 +146,10 @@ class _MultiFile:
 
     def close(self) -> None:
         for f in self.files:
-            f.close()
+            try:
+                f.close()
+            except OSError:
+                pass
 
 
 def split_parts(path: Path) -> list[Path]:
@@ -150,6 +179,9 @@ class IsoReader(DiscReader):
         b = self.f.read(size)
         return b + bytes(size - len(b))
 
+    def missing(self, offset: int, size: int) -> bool:
+        return size > 0 and offset + size > self._size
+
     @property
     def size(self) -> int:
         return self._size
@@ -165,12 +197,27 @@ class WbfsFileReader(DiscReader):
 
     def __init__(self, path: Path, slot: int = 0, _stream=None, _part_off: int = 0):
         self.path = Path(path)
+        self._owns_stream = _stream is None      # a partition's stream is shared by all its games
         self.m = _stream or _MultiFile(split_parts(self.path))
         self.part_off = _part_off
+        try:
+            self._load(slot)
+        except _BAD_DATA as e:
+            self.close()
+            raise DiscError(f"{self.path.name}: damaged WBFS header") from e
+        except BaseException:
+            self.close()
+            raise
+
+    def _load(self, slot: int) -> None:
         hdr = self.m.read(self.part_off, 12)
         magic, n_hd_sec, hd_s, wbfs_s = struct.unpack(">4sIBB", hdr[:10])
         if magic != b"WBFS":
             raise DiscError(f"{self.path.name}: not a WBFS file")
+        # 512 B..64 KiB device sectors, 32 KiB..2 GiB WBFS blocks; anything else is a
+        # damaged header (and would make the block table absurdly large)
+        if not (9 <= hd_s <= 16 and 15 <= wbfs_s <= 31 and slot >= 0):
+            raise DiscError(f"{self.path.name}: damaged WBFS header")
         self.hd_sz = 1 << hd_s
         self.sec_sz = 1 << wbfs_s
         self.n_hd_sec = n_hd_sec
@@ -181,6 +228,7 @@ class WbfsFileReader(DiscReader):
         self.wlba = struct.unpack(f">{self.n_wbfs_sec_disc}H", info[0x100:])
         used = [i for i, v in enumerate(self.wlba) if v]
         self._size = WII_DL_SIZE if used and (used[-1] + 1) * self.sec_sz > WII_SL_SIZE else WII_SL_SIZE
+        self._phys = getattr(self.m, "total", None)      # None = unknown (e.g. a raw device)
 
     def read(self, offset: int, size: int) -> bytes:
         out = bytearray()
@@ -200,12 +248,26 @@ class WbfsFileReader(DiscReader):
         idx = sector * WII_SECTOR // self.sec_sz
         return idx < len(self.wlba) and self.wlba[idx] != 0
 
+    def missing(self, offset: int, size: int) -> bool:
+        if self._phys is None or size <= 0:
+            return False
+        first, last = offset // self.sec_sz, (offset + size - 1) // self.sec_sz
+        for idx in range(first, min(last, len(self.wlba) - 1) + 1):
+            lba = self.wlba[idx]
+            if lba == 0:
+                continue
+            lo = max(offset, idx * self.sec_sz) - idx * self.sec_sz
+            hi = min(offset + size, (idx + 1) * self.sec_sz) - idx * self.sec_sz
+            if lo < hi and self.part_off + lba * self.sec_sz + hi > self._phys:
+                return True
+        return False
+
     @property
     def size(self) -> int:
         return self._size
 
     def close(self) -> None:
-        if self.part_off == 0:
+        if self._owns_stream:
             self.m.close()
 
 
@@ -217,10 +279,17 @@ class CisoReader(DiscReader):
     def __init__(self, path: Path):
         self.path = Path(path)
         self.f = open(self.path, "rb")
-        hdr = self.f.read(0x8000)
-        if hdr[:4] != b"CISO":
-            raise DiscError("not a CISO file")
-        self.block = struct.unpack("<I", hdr[4:8])[0]
+        try:
+            hdr = self.f.read(0x8000)
+            if hdr[:4] != b"CISO" or len(hdr) < 0x8000:
+                raise DiscError(f"{self.path.name}: not a CISO file")
+            self.block = struct.unpack("<I", hdr[4:8])[0]
+            if self.block < WII_SECTOR or self.block > 1 << 30 or self.block & (self.block - 1):
+                raise DiscError(f"{self.path.name}: damaged CISO header")
+            self._fsize = os.fstat(self.f.fileno()).st_size
+        except BaseException:
+            self.f.close()
+            raise
         self.map: list[int] = []
         n = 0
         for b in hdr[8:]:
@@ -252,6 +321,20 @@ class CisoReader(DiscReader):
     def sector_present(self, sector: int) -> bool:
         idx = sector * WII_SECTOR // self.block
         return idx < len(self.map) and self.map[idx] >= 0
+
+    def missing(self, offset: int, size: int) -> bool:
+        # the last block of a CISO may legitimately be short, so only data that
+        # *starts* past the end of the file counts as missing
+        if size <= 0:
+            return False
+        for idx in range(offset // self.block, min((offset + size - 1) // self.block, len(self.map) - 1) + 1):
+            phys = self.map[idx]
+            if phys < 0:
+                continue
+            lo = max(offset, idx * self.block) - idx * self.block
+            if self.base + phys * self.block + lo >= self._fsize:
+                return True
+        return False
 
     @property
     def size(self) -> int:
@@ -287,6 +370,8 @@ def sniff_format(path: Path) -> str:
 
 
 def open_disc(path: Path | str) -> DiscReader:
+    """Open an ISO/WBFS/CISO image. Raises :class:`DiscError` for anything that
+    is not a readable disc image (:class:`NeedsConversion` for RVZ and friends)."""
     path = Path(path)
     fmt = sniff_format(path)
     if fmt == "ISO":
@@ -295,7 +380,7 @@ def open_disc(path: Path | str) -> DiscReader:
         return WbfsFileReader(path)
     if fmt == "CISO":
         return CisoReader(path)
-    if fmt in ("RVZ", "WIA", "GCZ", "NKIT", "WDF"):
+    if fmt in NEEDS_CONVERSION:
         raise NeedsConversion(fmt, path)
     raise DiscError(f"{path.name}: not a recognised Wii or GameCube image")
 
@@ -319,7 +404,12 @@ class DiscInfo:
 
 
 def parse_header(hdr: bytes) -> tuple[str, str, str, int, int]:
-    game_id = hdr[:6].decode("ascii", "replace")
+    """(game_id, title, platform, disc_number, version) from the first 0x60 bytes.
+
+    The game ID ends up in folder and file names, so it is validated here once:
+    anything but six characters of A-Z/0-9 is a :class:`DiscError`."""
+    if len(hdr) < 0x60:
+        raise DiscError("disc header is too short")
     wii, gc = struct.unpack(">II", hdr[0x18:0x20])
     if wii == WII_MAGIC:
         platform = "wii"
@@ -327,6 +417,9 @@ def parse_header(hdr: bytes) -> tuple[str, str, str, int, int]:
         platform = "gc"
     else:
         raise DiscError("disc header has no Wii/GameCube magic")
+    if not _GAME_ID.fullmatch(hdr[:6]):
+        raise DiscError("disc header has an invalid game ID")
+    game_id = hdr[:6].decode("ascii")
     title = hdr[0x20:0x60].split(b"\0")[0].decode("utf-8", "replace").strip()
     return game_id, title, platform, hdr[6], hdr[7]
 
@@ -358,6 +451,13 @@ class WiiPartition:
 
 
 def wii_partitions(d: DiscReader) -> list[WiiPartition]:
+    try:
+        return _wii_partitions(d)
+    except _BAD_DATA as e:
+        raise DiscError("damaged partition table") from e
+
+
+def _wii_partitions(d: DiscReader) -> list[WiiPartition]:
     parts: list[WiiPartition] = []
     tables = d.read(0x40000, 0x20)
     for t in range(4):
@@ -372,6 +472,8 @@ def wii_partitions(d: DiscReader) -> list[WiiPartition]:
             hdr = d.read(poff, 0x2C0)
             tmd_size, tmd_off = struct.unpack(">II", hdr[0x2A4:0x2AC])
             data_off, data_size = struct.unpack(">II", hdr[0x2B8:0x2C0])
+            if tmd_size > MAX_TMD_SIZE:
+                raise DiscError("damaged partition header")
             p = WiiPartition(len(parts), ptype, poff, poff + (data_off << 2), data_size << 2,
                              data_off << 2, ticket=hdr[:0x2A4])
             p.tmd = d.read(poff + (tmd_off << 2), tmd_size)
@@ -423,7 +525,15 @@ def parse_fst(read, shift: int) -> tuple[list[FstEntry], dict]:
 
     ``read(offset, size)`` reads the decrypted partition / GC disc.
     Returns (files, layout) where layout holds boot/apploader/dol/fst extents.
+    Raises :class:`DiscError` if the table is damaged.
     """
+    try:
+        return _parse_fst(read, shift)
+    except _BAD_DATA as e:
+        raise DiscError("damaged file table") from e
+
+
+def _parse_fst(read, shift: int) -> tuple[list[FstEntry], dict]:
     boot = read(0, 0x440)
     dol_off = struct.unpack(">I", boot[0x420:0x424])[0] << shift
     fst_off = struct.unpack(">I", boot[0x424:0x428])[0] << shift
@@ -439,10 +549,14 @@ def parse_fst(read, shift: int) -> tuple[list[FstEntry], dict]:
             dol_sz = max(dol_sz, o + s)
     layout = {"dol": (dol_off, dol_sz), "fst": (fst_off, fst_sz), "apploader": (0x2440, app_sz)}
     files: list[FstEntry] = []
-    if fst_sz == 0 or fst_sz > 64 * 1024 * 1024:
+    if fst_sz == 0:
         return files, layout
+    if fst_sz > MAX_FST_SIZE:
+        raise DiscError("damaged file table")
     fst = read(fst_off, fst_sz)
     count = struct.unpack(">I", fst[8:12])[0]
+    if count > MAX_FST_ENTRIES or count * 12 > len(fst):
+        raise DiscError("damaged file table")
     strings = fst[count * 12:]
 
     def name_at(o: int) -> str:
@@ -476,76 +590,125 @@ def wii_game_partition(d: DiscReader) -> PartitionReader:
     raise DiscError("no game partition on disc")
 
 
-def read_wii_file(d: DiscReader, name: str) -> bytes:
-    """Read a file from the game partition by path (case-insensitive)."""
+def read_wii_file(d: DiscReader, name: str, max_size: int = MAX_DISC_FILE_READ) -> bytes:
+    """Read a file from the game partition by path (case-insensitive).
+
+    The size comes from the disc, so files over ``max_size`` are refused
+    instead of being decrypted into memory."""
     pr = wii_game_partition(d)
     files, _ = parse_fst(pr.read, 2)
     for f in files:
         if f.path.lower() == name.lower().lstrip("/"):
+            if f.size > max_size:
+                raise DiscError(f"{name} is implausibly large ({f.size} bytes)")
             return pr.read(f.offset, f.size)
     raise DiscError(f"{name} not found on disc")
 
 
 # --------------------------------------------------------------------------- usage / scrubbing
 def wii_usage_table(d: DiscReader, include_update: bool = False) -> list[bool]:
-    """Which 0x8000 disc sectors hold real data (like libwbfs' usage table)."""
+    """Which 0x8000 disc sectors hold real data (like libwbfs' usage table).
+
+    Partitions the container has dropped altogether (an update partition removed
+    by an earlier scrub) are skipped. A partition whose file table can't be read
+    or doesn't fit inside it is marked as used in full."""
     used = [False] * WII_DL_SECTORS
 
     def mark(off: int, size: int) -> None:
         if size <= 0:
             return
-        a = off // WII_SECTOR
+        a = max(0, off // WII_SECTOR)
         b = min(WII_DL_SECTORS, (off + size + WII_SECTOR - 1) // WII_SECTOR)
-        for s in range(a, b):
-            used[s] = True
+        if b > a:
+            used[a:b] = [True] * (b - a)
 
     mark(0, 0x50000)                       # header, partition table, region info
     for p in wii_partitions(d):
         if p.type == 1 and not include_update:
             continue
+        if not d.sector_present(p.offset // WII_SECTOR):
+            continue                       # stripped from this image
         mark(p.offset, p.header_size)
         if not p.title_key:
             mark(p.data_offset, p.data_size)
             continue
         pr = PartitionReader(d, p)
+        n_clusters = (p.data_size + WII_SECTOR - 1) // WII_SECTOR
+        extents: list[tuple[int, int]] = []
 
-        def mark_part(o: int, s: int, p=p) -> None:
+        def add(o: int, s: int) -> None:
             if s <= 0:
                 return
             c0 = o // WII_SECTOR_DATA
             c1 = (o + s + WII_SECTOR_DATA - 1) // WII_SECTOR_DATA
-            mark(p.data_offset + c0 * WII_SECTOR, (c1 - c0) * WII_SECTOR)
+            if c1 > n_clusters:
+                raise DiscError("file table points outside the partition")
+            extents.append((c0, c1))
 
         try:
             files, layout = parse_fst(pr.read, 2)
-        except Exception:
+            add(0, 0x2440)
+            for o, s in layout.values():
+                add(o, s)
+            for f in files:
+                add(f.offset, f.size)
+        except DiscError:
             mark(p.data_offset, p.data_size)
             continue
-        mark_part(0, 0x2440)
-        for o, s in layout.values():
-            mark_part(o, s)
-        for f in files:
-            mark_part(f.offset, f.size)
+        for c0, c1 in extents:
+            mark(p.data_offset + c0 * WII_SECTOR, (c1 - c0) * WII_SECTOR)
     return used
 
 
-def used_sectors(d: DiscReader, scrub: bool = True, include_update: bool = False) -> list[bool]:
-    """Sectors to copy. Without scrubbing, every sector the container has."""
+def used_sectors(d: DiscReader, scrub: bool = True, include_update: bool = False,
+                 table: list[bool] | None = None) -> list[bool]:
+    """Sectors to copy. Without scrubbing, every sector the container has.
+    ``table`` is a usage table already computed by :func:`wii_usage_table`."""
     n = d.size // WII_SECTOR
     if scrub:
-        u = wii_usage_table(d, include_update)[:n]
+        u = (table if table is not None else wii_usage_table(d, include_update))[:n]
+        u += [False] * (n - len(u))
     else:
         u = [True] * n
     return [x and d.sector_present(i) for i, x in enumerate(u)]
 
 
+INCOMPLETE = "the image is incomplete (it ends early, or a split part is missing)"
+
+
+def incomplete_reason(d: DiscReader, *, include_update: bool = False,
+                      table: list[bool] | None = None) -> Optional[str]:
+    """Why this image can't be a whole game, or None if all the data it needs is there.
+
+    Readers return zeros for data beyond the end of a file, so a truncated
+    download or a lost ``.wbf1`` would otherwise be copied (and "verified")
+    without complaint. Wii: every sector the file tables use must be stored in
+    the image. GameCube: the image must reach the end of its last file."""
+    try:
+        _gid, _t, platform, *_ = parse_header(d.read(0, 0x60))
+        if d.missing(0, 0x440):
+            return INCOMPLETE
+        if platform == "gc":
+            files, layout = parse_fst(d.read, 0)
+            end = max([o + s for o, s in layout.values()] + [f.offset + f.size for f in files if f.size])
+            if end > 2 * GC_DISC_SIZE:
+                return "the image's file table is damaged"
+            if any(d.missing(o, min(WII_SECTOR, end - o)) for o in range(0, end, WII_SECTOR)):
+                return INCOMPLETE
+            return None
+        if table is None:
+            table = wii_usage_table(d, include_update)
+        for sec, u in enumerate(table):
+            if not u:
+                continue
+            if d.missing(sec * WII_SECTOR, WII_SECTOR):
+                return INCOMPLETE
+            if not d.sector_present(sec):
+                return "the image is incomplete (data the game needs was removed from it)"
+    except DiscError as e:
+        return f"the image is damaged ({e})"
+    return None
+
+
 def _align(n: int, a: int) -> int:
     return (n + a - 1) // a * a
-
-
-def iter_chunks(d: DiscReader, total: int, chunk: int = 4 * 1024 * 1024) -> Iterator[bytes]:
-    off = 0
-    while off < total:
-        n = min(chunk, total - off)
-        yield d.read(off, n)
-        off += n

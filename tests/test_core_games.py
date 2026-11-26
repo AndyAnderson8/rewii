@@ -2,13 +2,21 @@ import shutil
 
 import pytest
 
-from fakedisc import imet_banner, make_gc_iso, make_wii_iso
+from fakedisc import imet_banner, make_ciso, make_gc_iso, make_wii_iso
 from rewii.core import disc as D
 from rewii.core import forwarder as F
 from rewii.core import games as G
 from rewii.core.config import Settings
 from rewii.core.layout import DriveLayout, game_folder_name, safe_name
-from rewii.core.wbfs import SplitWriter, WbfsPartition, write_ciso, write_iso, write_wbfs
+from rewii.core.wbfs import SplitWriter, WbfsPartition, write_iso, write_wbfs
+
+
+@pytest.fixture(autouse=True)
+def private_cache(tmp_path, monkeypatch):
+    """Keep the work folder for joins/conversions out of the real user cache."""
+    from rewii.core import config
+    monkeypatch.setattr(config, "cache_dir", lambda: tmp_path / "cache")
+    (tmp_path / "cache").mkdir()
 
 
 @pytest.fixture
@@ -72,9 +80,8 @@ def test_wbfs_split(wii, tmp_path):
         assert D.read_wii_file(w, "data.bin") == b"\x5A" * 70000
 
 
-def test_ciso_roundtrip(wii, tmp_path):
-    with D.open_disc(wii) as d:
-        c = write_ciso(d, tmp_path / "g.ciso")
+def test_ciso_reader(wii, tmp_path):
+    c = make_ciso(wii, tmp_path / "g.ciso")
     with D.open_disc(c) as r:
         assert r.format == "CISO"
         assert D.read_wii_file(r, "data.bin") == b"\x5A" * 70000
