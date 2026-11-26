@@ -139,3 +139,43 @@ def test_refresh_offline_uses_cache(tmp_path, cache):
     cf = cheats.fetch_cheats(lay2, "RMCE01", wiiflow=False, refresh=True)
     assert cf is not None and (lay2.txtcodes / "RMCE01.txt").exists()
     assert cheats.load_cheats(lay2, "RMCE01").title == "Mario Kart Wii"
+
+
+# --------------------------------------------------------------------------- regressions
+def test_selected_in_gct_only_matches_whole_lines():
+    cf = parse_txtcodes("GAME01\nT\n\nA\n11111111 22222222\n\nB\n22222222 33333333\n\n"
+                        "C\n33333333 44444444\n")
+    a, b, c = cf.cheats
+    gct = cheats.gct_bytes([a, c])       # ...11111111 22222222 33333333 44444444...
+    # B's bytes appear at a 4-byte offset (second half of A + first half of C): not selected
+    assert b.to_bytes() in gct and cheats.selected_in_gct(cf, gct) == [0, 2]
+    assert cheats.selected_in_gct(cf, cheats.gct_bytes([b])) == [1]
+    assert cheats.selected_in_gct(cf, b"junk") == []
+
+
+def test_fetch_never_raises_cheaterror_and_repairs_bad_drive_copy(tmp_path, cache):
+    lay = DriveLayout(tmp_path / "usb")
+    lay.txtcodes.mkdir(parents=True)
+    (lay.txtcodes / "RMCE01.txt").write_bytes(b"\r\n\r\n")           # unparseable
+    assert cheats.load_cheats(lay, "RMCE01") is None
+    serve({url("RMCE01"): TXT.encode()})
+    cf = cheats.fetch_cheats(lay, "RMCE01", wiiflow=False)
+    assert cf is not None and cf.game_id == "RMCE01"
+    assert (lay.txtcodes / "RMCE01.txt").read_bytes() == TXT.encode()   # replaced
+    (lay.txtcodes / "RSBE01.txt").write_bytes(b"\r\n")
+    assert cheats.fetch_cheats(lay, "RSBE01", wiiflow=False) is None    # nothing better online
+
+
+def test_invalid_ids_never_reach_urls_or_paths(tmp_path, cache):
+    lay = DriveLayout(tmp_path / "usb")
+    log: list[str] = []
+    serve({}, log)
+    for bad in ("../../x", "RMCE01&a=b", "/etc/x", "??????", "RM E01"):
+        assert cheats.fetch_cheats(lay, bad) is None
+        assert cheats.download_txtcodes(bad) is None
+        assert cheats.load_cheats(lay, bad) is None
+        for p in (cheats.txt_path(lay, bad), cheats.gct_path(lay, bad),
+                  cheats.wiiflow_txt_path(lay, bad), cheats.wiiflow_gct_path(lay, bad)):
+            assert p.parent.name in ("txtcodes", "codes", "gct") and ".." not in p.parts
+    assert log == []
+    assert cheats.txt_path(lay, "rmce01").name == "RMCE01.txt"

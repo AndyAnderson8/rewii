@@ -138,3 +138,63 @@ def test_remove_covers(tmp_path, cache):
     covers.fetch_covers(lay, ["RMCE01"], ["cover3D", "cover"], Settings(), wiiflow=False)
     assert covers.remove_covers(lay, "RMCE01") == 2
     assert covers.best_cached_cover("RMCE01") is not None
+
+
+# --------------------------------------------------------------------------- regressions
+def test_throttling_is_an_error_not_missing(tmp_path, cache):
+    lay = DriveLayout(tmp_path / "usb")
+
+    def handler(req):          # one region is throttled, every other one says "not found"
+        return httpx.Response(429 if "/US/" in str(req.url) else 404)
+    net.set_client(httpx.Client(transport=httpx.MockTransport(handler)))
+    rep = covers.fetch_covers(lay, ["RMCE01"], ["cover"], Settings(), wiiflow=False)
+    assert rep.results["RMCE01"]["cover"] == "error" and "429" in rep.errors["RMCE01/cover"]
+    serve({})                  # plain 404 everywhere is still "missing"
+    rep = covers.fetch_covers(lay, ["RMCE01"], ["cover"], Settings(), wiiflow=False)
+    assert rep.results["RMCE01"]["cover"] == "missing" and not rep.errors
+    # a cover found in a later region wins even if an earlier region failed
+    def handler2(req):
+        if "/US/" in str(req.url):
+            return httpx.Response(500)
+        return httpx.Response(200, content=PNG) if "/EN/" in str(req.url) else httpx.Response(404)
+    net.set_client(httpx.Client(transport=httpx.MockTransport(handler2)))
+    rep = covers.fetch_covers(lay, ["RMCE01"], ["cover"], Settings(), wiiflow=False)
+    assert rep.results["RMCE01"]["cover"] == "ok"
+
+
+def test_broken_cover_on_drive_is_replaced(tmp_path, cache):
+    lay = DriveLayout(tmp_path / "usb")
+    serve({art("cover3D", "US", "RMCE01"): PNG})
+    target = covers.gx_cover_path(lay, "RMCE01", "cover3D")
+    target.parent.mkdir(parents=True)
+    for junk in (b"", b"<html>error</html>" * 100, PNG[:500]):
+        target.write_bytes(junk)
+        rep = covers.fetch_covers(lay, ["RMCE01"], ["cover3D"], Settings(), wiiflow=False)
+        assert rep.results["RMCE01"]["cover3D"] == "ok" and target.read_bytes() == PNG
+    # a damaged cache copy isn't reused either
+    covers.cache_path("RMCE01", "cover3D").write_bytes(b"junk")
+    target.unlink()
+    rep = covers.fetch_covers(lay, ["RMCE01"], ["cover3D"], Settings(), wiiflow=False)
+    assert target.read_bytes() == PNG and covers.cache_path("RMCE01", "cover3D").read_bytes() == PNG
+
+
+def test_invalid_game_ids_never_reach_urls_or_paths(tmp_path, cache):
+    lay = DriveLayout(tmp_path / "usb")
+    log: list[str] = []
+    serve({}, log)
+    bad = ["../../", "/A/B/C", "RM?E01", "??????", "A&B=C1"]
+    rep = covers.fetch_covers(lay, bad, ["cover"], Settings(), wiiflow=False)
+    assert all(rep.results[g.upper()]["cover"] == "error" for g in bad) and log == []
+    assert covers.download_cover("../../", "cover") == (None, "")
+    assert covers.download_custom_banner(lay, "../../x") is None and log == []
+    outside = tmp_path / "victim.png"
+    outside.write_bytes(PNG)
+    for g in bad + ["../victim", str(tmp_path / "victim")]:
+        for p in (covers.gx_cover_path(lay, g, "cover"), covers.cache_path(g, "cover"),
+                  covers.wiiflow_cover_path(lay, g, "cover")):
+            assert ".." not in p.parts and p.name.endswith(".png") and "/" not in p.stem
+            assert p.is_relative_to(lay.root) or p.is_relative_to(cache)
+            assert p.resolve() != outside
+        assert covers.remove_covers(lay, g) == 0
+        assert not any(covers.cover_status(lay, g).values())
+    assert outside.exists()

@@ -42,6 +42,8 @@ NIN_ZIP = make_zip({"apps/Nintendont/boot.dol": b"N" * 50,
                     "apps/Nintendont/meta.xml": b"<app><name>Nintendont</name>"
                                                 b"<version>Newer than 4.431</version></app>",
                     "controllers/057E_0337.ini": b"ini"})
+D2X_ZIP = make_zip({"apps/d2x-cios-installer/boot.dol": b"D2X" * 10})
+SNES_ZIP = make_zip({"apps/snes9xgx/boot.dol": b"SNES" * 10})
 
 
 def api_entry(slug, name, version, zipdata, subdirs, platforms=("wii", "vwii", "wii_mini"),
@@ -63,16 +65,16 @@ INDEX = [
               ["/apps/usbloader_gx", "/apps/usbloader_gx/language"]),
     api_entry("Nintendont", "Nintendont", "Newer than 4.431", NIN_ZIP,
               ["/controllers", "/apps/Nintendont"]),
-    api_entry("d2x-cios-installer", "d2x cIOS installer", "3.1", GX_ZIP,
+    api_entry("d2x-cios-installer", "d2x cIOS installer", "3.1", D2X_ZIP,
               ["/apps/d2x-cios-installer"], platforms=("wii",)),
-    api_entry("snes9xgx", "Snes9x GX", "4.5", GX_ZIP, ["/apps/snes9xgx"],
+    api_entry("snes9xgx", "Snes9x GX", "4.5", SNES_ZIP, ["/apps/snes9xgx"],
               category="emulators"),
 ]
 
 
 def serve(log=None, zips=None):
     zips = zips or {"usbloader_gx": GX_ZIP, "Nintendont": NIN_ZIP,
-                    "d2x-cios-installer": GX_ZIP, "snes9xgx": GX_ZIP}
+                    "d2x-cios-installer": D2X_ZIP, "snes9xgx": SNES_ZIP}
 
     def handler(req):
         u = str(req.url)
@@ -229,3 +231,126 @@ def test_folder_without_boot_is_not_an_update(tmp_path):
     (lay.apps / "usbloader_gx" / "images").mkdir(parents=True)
     a = App("usbloader_gx", "USB Loader GX", version="4.0", subdirectories=["/apps/usbloader_gx"])
     assert osc.update_available(osc.installed_apps(lay), [a]) == {}
+
+
+# --------------------------------------------------------------------------- hash fallback / confinement
+GOOD_DOL = b"GOODDOL" * 100
+
+
+def _repacked(slug, zipdata, subdirs):
+    """Index entry whose zip hash no longer matches (repacked) but whose binary hash is published."""
+    e = api_entry(slug, slug, "1.0", b"the zip the index was built from", subdirs)
+    e["assets"]["binary"] = {"hash": hashlib.md5(GOOD_DOL).hexdigest()}
+    serve(zips={slug: zipdata})
+    return App.from_api(e)
+
+
+def test_fallback_accepts_only_the_apps_own_boot_file(tmp_path, cache):
+    lay = DriveLayout(tmp_path / "usb")
+    # honest repack: the app's own boot.dol matches -> installs
+    app = _repacked("myapp", make_zip({"apps/myapp/boot.dol": GOOD_DOL,
+                                       "apps/myapp/meta.xml": b"<app/>"}), ["/apps/myapp"])
+    assert len(osc.install_app(lay, app).files) == 2
+    # decoy: the published binary is somewhere else, the installed boot.dol is tampered
+    for i, files in enumerate([
+        {"apps/myapp/boot.dol": b"EVIL" * 100, "zz/boot.dol": GOOD_DOL},
+        {"apps/myapp/boot.dol": b"EVIL" * 100, "apps/other/boot.dol": GOOD_DOL},
+        {"apps/myapp/boot.dol": GOOD_DOL, "apps/myapp/BOOT.DOL": b"EVIL"},      # case duplicate
+        {"apps/myapp/boot.dol": GOOD_DOL, "apps/myapp/boot.elf": b"EVIL"},      # two boot files
+        {"apps/myapp/boot.dol": GOOD_DOL, "apps/myapp/../../evil": b"x"},       # unsafe archive
+    ]):
+        lay2 = DriveLayout(tmp_path / f"usb{i}")
+        app = _repacked("myapp", make_zip(files), ["/apps/myapp"])
+        with pytest.raises(OSCError, match="checksum"):
+            osc.install_app(lay2, app, refresh=True)
+        assert not lay2.root.exists() or not any(lay2.root.rglob("*.dol"))
+    # no binary hash published -> the fallback can't be used at all
+    e = api_entry("myapp", "myapp", "1.0", b"other", ["/apps/myapp"])
+    serve(zips={"myapp": make_zip({"apps/myapp/boot.dol": GOOD_DOL})})
+    with pytest.raises(OSCError, match="checksum"):
+        osc.install_app(lay, App.from_api(e), refresh=True)
+
+
+def test_extraction_is_confined_to_declared_folders(tmp_path, cache):
+    lay = DriveLayout(tmp_path / "usb")
+    (lay.apps / "priiloader").mkdir(parents=True)
+    (lay.apps / "priiloader" / "boot.dol").write_bytes(b"real priiloader")
+    z = make_zip({"apps/myapp/boot.dol": GOOD_DOL, "apps/myapp/data/x.bin": b"x",
+                  "extras/readme.txt": b"declared", "extras/deep/more.txt": b"declared",
+                  "bootmii/armboot.bin": b"evil", "apps/priiloader/boot.dol": b"evil",
+                  "rewii/osc_installed.json": b"{}", "wad/evil.wad": b"evil", "boot.elf": b"evil",
+                  "extrasX/no.txt": b"prefix trick"})
+    # a fully hash-verified zip is confined too
+    e = api_entry("myapp", "myapp", "1.0", z, ["/apps/myapp", "/apps/myapp/data", "/extras", "/rewii"])
+    serve(zips={"myapp": z})
+    res = osc.install_app(lay, App.from_api(e))
+    got = sorted(p.relative_to(lay.root).as_posix() for p in res.files)
+    assert got == ["apps/myapp/boot.dol", "apps/myapp/data/x.bin", "extras/deep/more.txt",
+                   "extras/readme.txt"]
+    assert sorted(res.skipped) == ["apps/priiloader/boot.dol", "boot.elf", "bootmii/armboot.bin",
+                                   "extrasX/no.txt", "rewii/osc_installed.json", "wad/evil.wad"]
+    assert (lay.apps / "priiloader" / "boot.dol").read_bytes() == b"real priiloader"
+    assert not (lay.root / "bootmii").exists() and not (lay.root / "wad").exists()
+    rec = json.loads((lay.rewii / osc.RECORD_NAME).read_text())     # ReWii's own record, not the zip's
+    assert rec["myapp"]["slug"] == "myapp"
+    # a zip that brings nothing for the app's own folder is an error, not a silent no-op
+    z2 = make_zip({"apps/someoneelse/boot.dol": b"x"})
+    e2 = api_entry("myapp", "myapp", "1.0", z2, ["/apps/myapp"])
+    serve(zips={"myapp": z2})
+    with pytest.raises(OSCError, match="boot"):
+        osc.install_app(DriveLayout(tmp_path / "usb2"), App.from_api(e2), refresh=True)
+
+
+def test_allowed_dirs_and_bad_index_values():
+    nin = App.from_api(INDEX[1])
+    assert nin.allowed_dirs == ["apps/nintendont", "controllers"]
+    weird = App("x", "x", subdirectories=["/apps/x", "/apps", "/", "/../etc", "/rewii/z", "/C:/w",
+                                          "\\wiiflow\\themes", "/apps/../y"])
+    assert weird.allowed_dirs == ["apps/x", "wiiflow/themes"]
+    assert App("..", "evil").allowed_dirs == []
+    # mistyped fields in the index don't crash parsing
+    a = App.from_api({"slug": "s", "assets": "nope", "description": 5, "subdirectories": "abc",
+                      "downloads": "many", "release_date": None, "flags": {"a": 1}})
+    assert a.slug == "s" and a.subdirectories == [] and a.downloads == 0 and a.archive_url == ""
+    assert not osc.extract_archive.__kwdefaults__["allowed"]        # unrestricted only when asked
+
+
+def test_install_refuses_bad_folder_and_non_https(tmp_path, cache):
+    lay = DriveLayout(tmp_path / "usb")
+    z = make_zip({"boot.dol": GOOD_DOL})
+    e = api_entry("..", "evil", "1.0", z, [])
+    e["assets"]["archive"]["url"] = "https://hbb1.oscwii.org/api/contents/myapp/myapp.zip"
+    serve(zips={"myapp": z})
+    with pytest.raises(OSCError, match="folder"):
+        osc.install_app(lay, App.from_api(e))
+    e = api_entry("myapp", "myapp", "1.0", z, ["/apps/myapp"])
+    e["assets"]["archive"]["url"] = "http://hbb1.oscwii.org/api/contents/myapp/myapp.zip"
+    with pytest.raises(OSCError, match="https"):
+        osc.install_app(lay, App.from_api(e))
+    assert not lay.root.exists()
+
+
+def test_index_error_document_is_not_cached(cache):
+    net.set_client(httpx.Client(transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, json={"error": "maintenance"}))))
+    with pytest.raises(net.NetError):
+        osc.fetch_index()
+    assert not (cache / "osc" / "contents.json").exists()
+    serve()
+    assert len(osc.fetch_index()) == 4                   # recovers at once, not a day later
+    net.set_client(httpx.Client(transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, content=b"<html>login</html>"))))
+    assert len(osc.fetch_index(refresh=True)) == 4       # good copy survives a bad refresh
+
+
+def test_meta_xml_with_unknown_encoding_does_not_break_the_list(tmp_path):
+    lay = DriveLayout(tmp_path / "usb")
+    for name, meta in (("a", b'<?xml version="1.0" encoding="shift_jisx"?><app><name>Odd</name></app>'),
+                       ("b", b"<app><name>Fine</name></app>")):
+        d = lay.apps / name
+        d.mkdir(parents=True)
+        (d / "boot.dol").write_bytes(b"x")
+        (d / "meta.xml").write_bytes(meta)
+    (lay.rewii).mkdir(parents=True)
+    (lay.rewii / osc.RECORD_NAME).write_text('{"a": "not a dict", "b": {"slug": 7}}')
+    assert [i.name for i in osc.installed_apps(lay)] == ["Odd", "Fine"]

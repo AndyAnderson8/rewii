@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Optional
+from collections.abc import Callable
 
 import httpx
 
@@ -38,34 +41,65 @@ def set_client(c: Optional[httpx.Client]) -> None:
     _client = c
 
 
+MAX_BYTES = 64 * 1024 ** 2
+"""Default cap for in-memory downloads (:func:`get_bytes`, :func:`get_json`, :func:`cached`)."""
+
+
+def _host(url: str) -> str:
+    try:
+        return httpx.URL(url).host or url
+    except Exception:
+        return url
+
+
 def get(url: str, **kw) -> httpx.Response:
     try:
         r = client().get(url, **kw)
-    except httpx.HTTPError as e:
-        raise NetError(f"Could not reach {httpx.URL(url).host}: {e}") from e
+    except (httpx.HTTPError, httpx.InvalidURL) as e:
+        raise NetError(f"Could not reach {_host(url)}: {e}") from e
     return r
 
 
-def get_bytes(url: str, ok404: bool = False) -> bytes | None:
-    r = get(url)
-    if r.status_code == 404 and ok404:
-        return None
-    if r.status_code != 200:
-        raise NetError(f"{url} returned HTTP {r.status_code}")
-    return r.content
+def get_bytes(url: str, ok404: bool = False, *, max_bytes: int | None = MAX_BYTES) -> bytes | None:
+    """GET ``url`` into memory. ``None`` for a 404 when ``ok404``.
+
+    Raises :class:`NetError` for other statuses, network problems, or a body
+    larger than ``max_bytes`` (``None`` = unlimited).
+    """
+    buf = bytearray()
+    try:
+        with client().stream("GET", url) as r:
+            if r.status_code == 404 and ok404:
+                return None
+            if r.status_code != 200:
+                raise NetError(f"{url} returned HTTP {r.status_code}")
+            for chunk in r.iter_bytes(256 * 1024):
+                buf += chunk
+                if max_bytes is not None and len(buf) > max_bytes:
+                    raise NetError(f"{_host(url)} sent more data than expected")
+    except (httpx.HTTPError, httpx.InvalidURL) as e:
+        raise NetError(f"Could not reach {_host(url)}: {e}") from e
+    return bytes(buf)
 
 
-def get_json(url: str):
-    r = get(url)
-    if r.status_code != 200:
-        raise NetError(f"{url} returned HTTP {r.status_code}")
-    return r.json()
+def get_json(url: str, *, max_bytes: int | None = MAX_BYTES):
+    data = get_bytes(url, max_bytes=max_bytes)
+    assert data is not None
+    try:
+        return json.loads(data)
+    except ValueError as e:
+        raise NetError(f"{_host(url)} sent invalid data") from e
 
 
-def cached(url: str, name: str, max_age: float = 7 * 86400, refresh: bool = False) -> Path:
+def cached(url: str, name: str, max_age: float = 7 * 86400, refresh: bool = False, *,
+           validate: Callable[[Path], bool] | None = None,
+           max_bytes: int | None = MAX_BYTES) -> Path:
     """Download ``url`` into the cache as ``name`` unless a fresh copy exists.
 
-    Falls back to a stale copy when offline.
+    Falls back to a stale copy when offline. ``validate(path)`` is run on the
+    downloaded file *before* it replaces the cached one: invalid data (a captive
+    portal page, an error document) never overwrites a good copy and is never
+    kept - the old copy is returned, or :class:`NetError` raised if there is none.
     """
     p = cache_dir() / name
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -73,37 +107,59 @@ def cached(url: str, name: str, max_age: float = 7 * 86400, refresh: bool = Fals
     if fresh and not refresh:
         return p
     try:
-        data = get_bytes(url)
+        data = get_bytes(url, max_bytes=max_bytes)
         assert data is not None
     except NetError:
         if p.exists():
             return p
         raise
-    tmp = p.with_suffix(p.suffix + ".part")
-    tmp.write_bytes(data)
-    tmp.replace(p)
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.part")
+    try:
+        tmp.write_bytes(data)
+        if validate is not None and not validate(tmp):
+            tmp.unlink(missing_ok=True)
+            if p.exists():
+                return p
+            raise NetError(f"{_host(url)} sent invalid data")
+        tmp.replace(p)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return p
 
 
 def download(url: str, dest: Path, *, md5: str | None = None, progress: ProgressFn | None = None,
-             cancel: CancelToken | None = None) -> Path:
-    """Stream a download to ``dest`` with progress; verifies md5 if given."""
+             cancel: CancelToken | None = None, max_bytes: int | None = None) -> Path:
+    """Stream a download to ``dest`` with progress; verifies md5 if given.
+
+    ``max_bytes`` aborts (with :class:`NetError`) a download that is larger.
+    """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".part")
     rep = Reporter(progress, cancel, message=f"Downloading {dest.name}")
     h = hashlib.md5()
+    got = 0
     try:
         with client().stream("GET", url) as r:
             if r.status_code != 200:
                 raise NetError(f"{url} returned HTTP {r.status_code}")
-            rep.set_total(int(r.headers.get("content-length") or 0))
+            try:
+                length = int(r.headers.get("content-length") or 0)
+            except ValueError:
+                length = 0
+            if max_bytes is not None and length > max_bytes:
+                raise NetError(f"{dest.name}: the download is larger than expected")
+            rep.set_total(length)
             with open(tmp, "wb") as f:
                 for chunk in r.iter_bytes(256 * 1024):
+                    got += len(chunk)
+                    if max_bytes is not None and got > max_bytes:
+                        raise NetError(f"{dest.name}: the download is larger than expected")
                     f.write(chunk)
                     h.update(chunk)
                     rep.advance(len(chunk))
-    except httpx.HTTPError as e:
+    except (httpx.HTTPError, httpx.InvalidURL) as e:
         tmp.unlink(missing_ok=True)
         raise NetError(f"Download failed: {e}") from e
     except BaseException:

@@ -110,14 +110,16 @@ def write_gx_config(layout: DriveLayout, updates: Mapping[str, Value]) -> dict[s
     key/value mapping. Values must not contain line breaks.
     """
     path = layout.gx_config
+    # surrogateescape keeps bytes that aren't UTF-8 (in lines ReWii doesn't touch)
+    # exactly as they were when the file is written back
     try:
-        text = path.read_text("utf-8", errors="replace")
+        text = path.read_bytes().decode("utf-8", errors="surrogateescape")
     except FileNotFoundError:
         text = ""
     lines, _ = _parse(text)
     pending = {}
     for k, v in updates.items():
-        if "=" in k or "\n" in k or not k.strip():
+        if "=" in k or "\n" in k or "\r" in k or k.startswith("#") or not k.strip():
             raise ValueError(f"Invalid setting name {k!r}")
         if v is not None and ("\n" in str(v) or "\r" in str(v)):
             raise ValueError(f"Invalid value for {k}")
@@ -141,9 +143,13 @@ def write_gx_config(layout: DriveLayout, updates: Mapping[str, Value]) -> dict[s
         out.insert(0, GX_HEADER)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text("\n".join(out) + "\n", "utf-8", newline="\n")
-    os.replace(tmp, path)
-    return _parse("\n".join(out))[1]
+    try:
+        tmp.write_bytes(("\n".join(out) + "\n").encode("utf-8", errors="surrogateescape"))
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return read_gx_config(layout)
 
 
 def set_loader_private_server(layout: DriveLayout, server: str, custom_address: Optional[str] = None) -> int:

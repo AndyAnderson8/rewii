@@ -25,6 +25,8 @@ GAMETDB_URL = ("https://www.gametdb.com/wiitdb.zip?LANG={lang}"
 """Full database (Wii + GameCube + WiiWare/VC/channels) with English fallback titles."""
 
 MAX_AGE = 7 * 86400
+MAX_ZIP_BYTES = 128 * 1024 ** 2        # download cap (the real file is ~10 MB)
+MAX_XML_BYTES = 1024 ** 3              # cap on the unpacked wiitdb.xml
 INDEX_VERSION = 1
 SYNOPSIS_LEN = 400
 LANGS = ("EN", "JA", "FR", "DE", "ES", "IT", "NL", "PT", "ZHTW", "ZHCN", "KO", "RU")
@@ -175,13 +177,24 @@ def parse_wiitdb(source: IO[bytes] | Path | str, lang: str = "EN") -> dict[str, 
     return out
 
 
+def _zip_ok(path: Path) -> bool:
+    """A real ``wiitdb.zip``: a zip archive holding an ``.xml`` (not a login/error page)."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            return any(n.lower().endswith(".xml") for n in z.namelist())
+    except (zipfile.BadZipFile, OSError):
+        return False
+
+
 def parse_wiitdb_zip(path: Path, lang: str = "EN") -> dict[str, GameInfo]:
     """Parse the ``wiitdb.xml`` inside a ``wiitdb.zip``."""
     with zipfile.ZipFile(path) as z:
-        name = next((n for n in z.namelist() if n.lower().endswith(".xml")), None)
-        if name is None:
+        info = next((i for i in z.infolist() if i.filename.lower().endswith(".xml")), None)
+        if info is None:
             raise ValueError(f"{path.name} has no XML file")
-        with z.open(name) as f:
+        if info.file_size > MAX_XML_BYTES:
+            raise ValueError(f"{path.name} is unreasonably large")
+        with z.open(info) as f:
             return parse_wiitdb(f, lang)
 
 
@@ -220,7 +233,8 @@ class TitleDB:
         idx = cls.index_path(lang)
         try:
             zpath: Optional[Path] = net.cached(GAMETDB_URL.format(lang=lang),
-                                               cls.zip_cache_name(lang), MAX_AGE, refresh)
+                                               cls.zip_cache_name(lang), MAX_AGE, refresh,
+                                               validate=_zip_ok, max_bytes=MAX_ZIP_BYTES)
         except (net.NetError, OSError):
             zpath = None
         stamp = ""
@@ -233,12 +247,17 @@ class TitleDB:
         if zpath is not None:
             try:
                 games = parse_wiitdb_zip(zpath, lang)
-            except (zipfile.BadZipFile, ET.ParseError, ValueError, OSError):
+            except (zipfile.BadZipFile, ET.ParseError, ValueError, LookupError, OSError):
                 games = {}
             if games:
                 db = cls(games, stamp, lang)
                 db._write_index(idx)
                 return db
+            # an unusable download must not sit in the cache for a week
+            try:
+                zpath.unlink(missing_ok=True)
+            except OSError:
+                pass
         return db if db is not None else cls(lang=lang)
 
     @classmethod
@@ -249,12 +268,12 @@ class TitleDB:
     def _read_index(cls, path: Path, lang: str) -> Optional[TitleDB]:
         try:
             data = json.loads(path.read_text("utf-8"))
-            if data.get("format") != INDEX_VERSION:
+            if not isinstance(data, dict) or data.get("format") != INDEX_VERSION:
                 return None
             games = {k: GameInfo.from_dict(v) for k, v in data["games"].items()}
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             return None
-        return cls(games, data.get("version", ""), lang)
+        return cls(games, str(data.get("version", "")), lang)
 
     def _write_index(self, path: Path) -> None:
         try:

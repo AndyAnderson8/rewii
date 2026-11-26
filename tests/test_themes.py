@@ -112,3 +112,30 @@ def test_content_ids() -> None:
     assert T.content_for("vwii", "PAL") == 0x22
     assert T.content_for("wii", "NTSC-K") == 0x9D
     assert T.content_for("mini", "NTSC-U") is None
+
+
+def test_only_43_themes_and_no_region_from_file_name(tmp_path: Path) -> None:
+    drive = tmp_path / "drive"
+    for minor in (1, 2):
+        p = tmp_path / f"old4{minor}.csm"
+        p.write_bytes(theme(build=f"D:\\4_{minor}\\ipl\\bin\\RVL\\Final_U\\main.elf".encode()))
+        i = T.identify_theme(p)
+        assert (i.major, i.minor) == (4, minor)
+        with pytest.raises(T.ThemeError, match=f"4.{minor}"):
+            T.stage_theme(p, drive, console_type="wii", region="NTSC-U")
+    assert not (drive / "themes").exists() or not any((drive / "themes").iterdir())
+    # a file merely *named* like the PAL 4.3 base proves nothing about its region
+    fake = tmp_path / "0000009a.app"
+    fake.write_bytes(build_u8({"/www.arc": b"w", "/layout/common/health.ash": b"h",
+                               "/sound/IplSound.brsar": b"s"}))
+    i = T.identify_theme(fake)
+    assert i.is_theme and i.regions == [] and i.platform == "wii"
+    with pytest.raises(T.ThemeError, match="region"):
+        T.stage_theme(fake, drive, console_type="wii", region="PAL")
+    # staging a theme that already sits in themes/ is a no-op, not an error
+    ok = tmp_path / "ok.csm"
+    ok.write_bytes(theme())
+    st = T.stage_theme(ok, drive, console_type="wii", region="NTSC-U")
+    again = T.stage_theme(st.dest, drive, console_type="wii", region="NTSC-U")
+    assert again.dest == st.dest and st.dest.read_bytes() == ok.read_bytes()
+    assert not list((drive / "themes").glob("*.part"))

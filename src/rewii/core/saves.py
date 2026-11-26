@@ -33,7 +33,9 @@ from collections.abc import Iterable
 
 from Crypto.Cipher import AES
 
+from . import archive
 from .config import Settings
+from .ids import valid_id4
 from .layout import DriveLayout, safe_name
 from .progress import CancelToken, ProgressFn, Reporter
 
@@ -104,8 +106,12 @@ def _utf16(b: bytes) -> str:
 
 
 def _printable_id(b: bytes) -> str:
-    """Return ASCII id text, or hex if the bytes aren't printable."""
-    if all(0x20 < c < 0x7F for c in b):
+    """Return the id as text if it is only ASCII letters/digits, else as hex.
+
+    Ids come from untrusted save files and end up in folder names, so anything
+    else (``/``, ``\\``, ``:``, ``.`` ...) is never passed through as text.
+    """
+    if b and all(chr(c).isascii() and chr(c).isalnum() for c in b):
         return b.decode("ascii")
     return b.hex().upper()
 
@@ -158,11 +164,24 @@ def _copy_path(src: Path, dest: Path) -> None:
     """Copy a file or directory tree, preserving mtimes."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if src.is_dir():
-        shutil.copytree(src, dest, dirs_exist_ok=False)
+        shutil.copytree(src, dest, dirs_exist_ok=False, copy_function=_copy_file)
     else:
         tmp = dest.with_name(dest.name + ".rewii-part")
-        shutil.copy2(src, tmp)
-        os.replace(tmp, dest)
+        try:
+            _copy_file(src, tmp)
+            os.replace(tmp, dest)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+
+
+def _copy_file(src: Path | str, dest: Path | str) -> None:
+    """Copy contents, then times/modes where the file system allows (FAT32 may not)."""
+    shutil.copyfile(src, dest)
+    try:
+        shutil.copystat(src, dest)
+    except OSError:
+        pass
 
 
 def _timestamp(now: datetime | None = None) -> str:
@@ -567,8 +586,11 @@ def export_gci(card: Path, index: int, dest_dir: Path) -> Path:
         bat_ok = [_gc_block_ok(b, 4, GC_BLOCK, 0) for b in bats]
         bctr = [struct.unpack_from(">h", b, 4)[0] for b in bats]
         bat = bats[0] if (bat_ok[0] and (not bat_ok[1] or bctr[0] >= bctr[1])) else bats[1]
-        chain = _bat_chain(bat, s.first_block, s.block_count)
-        if len(chain) != s.block_count:
+        try:
+            chain = _bat_chain(bat, s.first_block, s.block_count)
+        except struct.error:
+            chain = []
+        if len(chain) != s.block_count or not chain:
             raise SaveError(f"{s.filename}: block chain is broken")
         body = bytearray()
         for b in chain:
@@ -792,12 +814,17 @@ def _game_folder_name(game_id: str, title: str) -> str:
 def _read_version(vdir: Path) -> Optional[SaveVersion]:
     try:
         meta = json.loads((vdir / SIDECAR).read_text("utf-8"))
+        name = meta["name"]
+        # the saved item always sits directly inside its version folder
+        if not isinstance(name, str) or name in ("", ".", "..") or Path(name).name != name \
+                or "\\" in name or ":" in name:
+            return None
         return SaveVersion(dir=vdir, path=vdir / meta["name"], game_id=meta["game_id"],
                            title=meta.get("title", ""), kind=meta["kind"], app=meta.get("app", ""),
                            sha1=meta["sha1"], source=meta.get("source", ""),
                            created=meta.get("created", ""), size=int(meta.get("size", 0)),
                            title_id=meta.get("title_id", ""))
-    except (OSError, ValueError, KeyError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
 
 
@@ -816,6 +843,14 @@ def list_backups(settings: Settings, game_id: str | None = None) -> list[SaveVer
                 out.append(v)
     out.sort(key=lambda v: (v.game_id, v.created, v.dir.name))
     return out
+
+
+def _version_intact(v: SaveVersion) -> bool:
+    """True if the library copy exists and still has the SHA-1 its sidecar records."""
+    try:
+        return v.path.exists() and _sha1_path(v.path) == v.sha1
+    except OSError:
+        return False
 
 
 @dataclass
@@ -837,7 +872,8 @@ def backup_save(save: DriveSave, settings: Settings, *, now: datetime | None = N
     rep.check()
     digest = _sha1_path(save.path)
     for v in list_backups(settings, save.game_id):
-        if v.sha1 == digest:
+        # trust an existing version only if its files are really (still) there
+        if v.sha1 == digest and _version_intact(v):
             return BackupResult(v, False)
     gdir = settings.saves_dir / _game_folder_name(save.game_id, save.title)
     gdir.mkdir(parents=True, exist_ok=True)
@@ -896,28 +932,40 @@ def restore_destination(version: SaveVersion, drive_root: Path, target_app: str)
         if target_app not in (APP_SGM, APP_DATA_MGMT):
             raise SaveError("Wii saves can only be restored for SaveGame Manager GX or Data Management")
         gid = version.game_id
-        if len(gid) != 4:
+        if not valid_id4(gid):
             raise SaveError(f"can't place a Wii save with game id {gid!r}")
         return lay.private_saves / gid / "data.bin"
     if k == KIND_EXTRACTED:
         if target_app != APP_SGM:
             raise SaveError("extracted Wii saves can only be restored for SaveGame Manager GX")
         tid = version.title_id or version.path.name
-        return lay.savegames / tid
+        if not _HEX16.match(tid):
+            raise SaveError(f"can't place an extracted Wii save with title id {tid!r}")
+        return lay.savegames / tid.lower()
     if k == KIND_MEMCARD:
         if target_app == APP_NINTENDONT:
             stem = version.path.stem
             if not (re.fullmatch(r"[A-Za-z0-9]{4}", stem) or stem.lower().startswith("ninmem")):
-                stem = version.game_id if len(version.game_id) == 4 else "ninmem"
+                stem = version.game_id if valid_id4(version.game_id) else "ninmem"
             return lay.nintendont_saves / f"{stem}.raw"
         if target_app == APP_GCMM:
-            return lay.gcmm_backups / version.path.name
+            return lay.gcmm_backups / _plain_file_name(version.path.name)
         raise SaveError("GameCube memory cards can only be restored for Nintendont or GCMM")
     if k == KIND_GCI:
         if target_app != APP_GCMM:
             raise SaveError(".gci saves can only be restored for GCMM (import them with GCMM)")
-        return lay.gcmm_backups / version.path.name
+        return lay.gcmm_backups / _plain_file_name(version.path.name)
     raise SaveError(f"unknown save kind {k!r}")
+
+
+def _plain_file_name(name: str) -> str:
+    try:
+        ok = archive.safe_parts(name) == [name]
+    except archive.ArchiveError:
+        ok = False
+    if not ok:
+        raise SaveError(f"can't restore a save named {name!r}")
+    return name
 
 
 @dataclass
@@ -939,6 +987,10 @@ def restore_save(version: SaveVersion, drive_root: Path, target_app: str, settin
     rep = Reporter(progress, cancel, message=f"Restoring {version.title}")
     dest = restore_destination(version, drive_root, target_app)
     rep.check()
+    # 1. the library copy must be there and intact before anything on the drive changes
+    if not _version_intact(version):
+        raise SaveError(f"the library copy of {version.title or version.game_id} "
+                        f"({version.path}) is missing or damaged; nothing was changed")
     prev: Optional[SaveVersion] = None
     if dest.exists():
         if _sha1_path(dest) == version.sha1:
@@ -949,17 +1001,47 @@ def restore_save(version: SaveVersion, drive_root: Path, target_app: str, settin
             existing = DriveSave(dest, version.kind, target_app, version.game_id,
                                  version.title, _path_size(dest), _path_mtime(dest),
                                  title_id=version.title_id)
+        # 2. back up what is there (backup_save re-checks any copy it reuses)
         prev = backup_save(existing, settings).version
+        if not _version_intact(prev):
+            raise SaveError(f"could not back up the save at {dest}; nothing was changed")
         rep.check()
-        if dest.is_dir():
-            shutil.rmtree(dest)
+    # 3. copy next to the destination, verify, and only then swap it in
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    new = dest.with_name(dest.name + ".rewii-new")
+    old = dest.with_name(dest.name + ".rewii-old")
+    for junk in (new, old):
+        _remove_path(junk)
+    try:
+        _copy_path(version.path, new)
+        if _sha1_path(new) != version.sha1:
+            raise SaveError(f"restored copy at {dest} did not verify; the save on the drive "
+                            "was left as it was")
+        if dest.exists():
+            dest.rename(old)
+            try:
+                new.rename(dest)
+            except BaseException:
+                old.rename(dest)
+                raise
         else:
-            dest.unlink()
-    _copy_path(version.path, dest)
-    if _sha1_path(dest) != version.sha1:
-        raise SaveError(f"restored copy at {dest} did not verify")
+            new.rename(dest)
+    except BaseException:
+        _remove_path(new)
+        raise
+    _remove_path(old)
     rep.note("Restored")
     return RestoreResult(dest, True, prev)
+
+
+def _remove_path(p: Path) -> None:
+    try:
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            p.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def save_to_dict(s: DriveSave) -> dict:

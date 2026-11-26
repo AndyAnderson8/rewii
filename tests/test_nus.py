@@ -23,8 +23,13 @@ class FakeNus:
         self.files: dict[str, bytes] = {}
         self.requests: list[httpx.Request] = []
 
-    def add(self, title: Title, *, ticket: bool = True) -> None:
+    def add(self, title: Title, *, ticket: bool = True, path: str | None = None) -> None:
+        """Serve ``title`` at ``path`` (default: where NUS keeps it - vWii system
+        titles live under 00000007... although their TMD says 00000001...)."""
         tid = title.tmd.title_id.lower()
+        if title.tmd.vwii and tid.startswith("00000001"):
+            tid = "00000007" + tid[8:]
+        tid = path or tid
         tmd = title.tmd.dump()
         self.files[f"{tid}/tmd.{title.tmd.title_version}"] = tmd + CP + CA
         self.files[f"{tid}/tmd"] = tmd + CP + CA
@@ -52,9 +57,9 @@ def fake(monkeypatch):
 
 
 def ios(n: int, ver: int, vwii: bool = False, ckey: int = 0) -> Title:
-    high = "00000007" if vwii else "00000001"
-    return make_title(f"{high}{n:08x}", version=ver, ios=0, region=3, name=None, ckey=ckey,
-                      contents=[bytes([n]) * 300, b"x" * 1000], fakesign=False)
+    # real vWii IOS: TMD/ticket title id 00000001-xxxxxxxx with the TMD's vWii flag set
+    return make_title(f"00000001{n:08x}", version=ver, ios=0, region=3, name=None, ckey=ckey,
+                      contents=[bytes([n]) * 300, b"x" * 1000], fakesign=False, vwii=int(vwii))
 
 
 WII = Settings(console_type="wii", console_region="NTSC-U")
@@ -157,7 +162,11 @@ def test_prepare_cios_vwii_rekeys(fake, tmp_path):
     files = nus.prepare_cios_files(DriveLayout(tmp_path), VWII)
     for f in files:
         info = inspect_wad(f)
-        assert info.common_key_index == 0 and info.hashes_ok and info.title_id.startswith("00000007")
+        assert info.common_key_index == 0 and info.hashes_ok and info.platform == "vwii"
+        assert info.title_id.startswith("00000001")
+    n = len(fake.requests)
+    nus.prepare_cios_files(DriveLayout(tmp_path), VWII)      # already present -> no downloads
+    assert len(fake.requests) == n
 
 
 def test_prepare_update_43(fake, tmp_path):
@@ -184,7 +193,7 @@ def test_wrong_region_menu_never_written(fake, tmp_path, monkeypatch):
 
 
 def test_theme_base(fake, tmp_path):
-    menu = make_title("0000000700000002", version=609, ios=80, region=0, name=None,
+    menu = make_title("0000000100000002", version=609, ios=80, region=0, name=None, vwii=1,
                       contents=[b"a" * 50] * 0x1F + [b"THEME" * 1000], fakesign=False)
     # give content index 0x1F the id 0x1F (make_title uses cid == index)
     fake.add(menu)
@@ -195,3 +204,94 @@ def test_theme_base(fake, tmp_path):
     with pytest.raises(Refused):
         nus.theme_base(Settings(console_type="mini", console_region="PAL"))
     assert nus.theme_base(Settings(console_type="wii", console_region="PAL")).filename == "0000009A.app"
+
+
+# --------------------------------------------------------------------------- substitution / verification
+def test_other_title_served_is_rejected(fake, tmp_path):
+    """A (genuinely signed) different title answering the request must never be
+    written under the requested name."""
+    fake.add(ios(4, 65280), path="0000000100000026")          # IOS4 stub served as IOS38
+    fake.files["0000000100000026/tmd.4123"] = fake.files["0000000100000026/tmd.65280"]
+    with pytest.raises(nus.NusError, match="not genuine"):
+        nus.download_title_wad("0000000100000026", 4123, tmp_path / "IOS38-64-v4123.wad", settings=WII)
+    assert not list(tmp_path.iterdir())
+
+
+def test_other_version_served_is_rejected(fake, tmp_path):
+    t = ios(38, 3867)
+    fake.add(t)
+    fake.files["0000000100000026/tmd.4123"] = fake.files["0000000100000026/tmd.3867"]
+    with pytest.raises(nus.NusError, match="v3867"):
+        nus.download_title_wad("0000000100000026", 4123, tmp_path / "a.wad")
+    assert not list(tmp_path.iterdir())
+
+
+def test_ticket_for_other_title_is_rejected(fake):
+    fake.add(ios(38, 4123))
+    fake.files["0000000100000026/cetk"] = ios(56, 5661).ticket.dump() + XS + CA
+    with pytest.raises(nus.NusError, match="not genuine"):
+        nus.download_title("0000000100000026", 4123)
+
+
+def test_wii_title_served_for_vwii_request_is_rejected(fake):
+    fake.add(ios(38, 4380), path="0000000700000026")           # no vWii flag
+    with pytest.raises(nus.NusError, match="wrong console"):
+        nus.download_title("0000000700000026", 4380)
+
+
+def test_login_page_instead_of_tmd_is_a_nus_error(fake):
+    html = b"<html><body>Please log in to the hotel Wi-Fi</body></html>"
+    fake.files["0000000100000026/tmd.4123"] = html
+    fake.files["0000000100000026/cetk"] = html
+    with pytest.raises(nus.NusError):
+        nus.download_title("0000000100000026", 4123)
+    with pytest.raises(nus.NusError):
+        nus.download_title("not-a-title-id", 1)
+
+
+def test_content_size_must_match_tmd(fake, tmp_path):
+    fake.add(ios(38, 4123))
+    key = next(k for k in fake.files if k.endswith("/00000001"))
+    fake.files[key] = fake.files[key] + bytes(1024 * 1024)      # endless/oversized body
+    with pytest.raises(nus.NusError):
+        nus.download_title_wad("0000000100000026", 4123, tmp_path / "a.wad")
+    fake.files[key] = fake.files[key][:16]                      # truncated
+    with pytest.raises(nus.NusError, match="size"):
+        nus.download_title_wad("0000000100000026", 4123, tmp_path / "a.wad")
+    assert not list(tmp_path.iterdir())
+
+
+def test_theme_base_requires_signature_and_right_title(fake, monkeypatch, tmp_path):
+    us = Settings(console_type="wii", console_region="NTSC-U")
+    menu = make_title("0000000100000002", version=513, ios=80, region=1, name=None,
+                      contents=[b"a" * 50] * 0x97 + [b"THEME" * 1000], fakesign=False)
+    fake.add(menu)
+    assert nus.download_theme_base(us, tmp_path / "ok").read_bytes() == b"THEME" * 1000
+    # unsigned TMD/ticket: nothing may be written
+    monkeypatch.setattr(Title, "get_is_signed", lambda self: False)
+    with pytest.raises(nus.NusError, match="signature"):
+        nus.download_theme_base(us, tmp_path / "themes")
+    assert not (tmp_path / "themes").exists()
+    monkeypatch.setattr(Title, "get_is_signed", lambda self: True)
+    # another title answering for the Wii Menu
+    other = make_title("0001000148414441", version=513, name=None, fakesign=False,
+                       contents=[b"a" * 50] * 0x97 + [b"EVIL!" * 1000])
+    fake.files = {}
+    fake.add(other, path="0000000100000002")
+    with pytest.raises(nus.NusError, match="not genuine"):
+        nus.download_theme_base(us, tmp_path / "themes")
+    assert not (tmp_path / "themes").exists()
+
+
+def test_existing_modified_wad_is_downloaded_again(fake, tmp_path, monkeypatch):
+    """A WAD with the right name/ID/version but without Nintendo's signature isn't
+    accepted as 'already there'."""
+    for e in nus.CIOS_BASE["wii"]:
+        fake.add(ios(int(e.title_id[8:], 16), e.version))
+    layout = DriveLayout(tmp_path / "usb")
+    nus.prepare_cios_files(layout, WII)
+    e = nus.CIOS_BASE["wii"][0]
+    assert nus._existing_ok(layout.root / e.filename, e)
+    monkeypatch.setattr(Title, "get_is_signed", lambda self: False)
+    assert not nus._existing_ok(layout.root / e.filename, e)
+    assert not nus._existing_ok(layout.root / e.filename, nus.CIOS_BASE["wii"][1])

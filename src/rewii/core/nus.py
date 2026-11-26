@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -29,7 +30,7 @@ from libWiiPy.title import Title
 from libWiiPy.title.cert import CertificateChain
 from libWiiPy.title.crypto import decrypt_content, encrypt_title_key
 
-from . import net
+from . import net, wad
 from .config import Settings
 from .layout import DriveLayout
 from .progress import CancelToken, ProgressFn, Reporter
@@ -43,6 +44,8 @@ TMD_RECORD = 36
 TICKET_SIZE = 0x2A4
 CERT_RSA2048 = 0x300   # CP / XS certificates (signed by the 4096-bit CA)
 CERT_RSA4096 = 0x400   # CA certificate (signed by Root)
+MAX_META_BYTES = 1024 * 1024       # a TMD or cetk is a few KB
+MAX_CONTENT_BYTES = 512 * 1024 ** 2
 
 
 class NusError(Exception):
@@ -92,9 +95,7 @@ CIOS_BASE: dict[str, list[CatalogEntry]] = {
 }
 
 #: Wii Menu 4.3 per region (wii.hacks.guide docs/update.md; versions from NUSGet's database).
-SYSTEM_MENU_43 = {
-    "NTSC-U": 513, "PAL": 514, "NTSC-J": 512, "NTSC-K": 518,
-}
+SYSTEM_MENU_43 = {region: v for (plat, region), v in wad.SYSTEM_MENU_43.items() if plat == "wii"}
 _REGION_LETTER = {"NTSC-U": "U", "PAL": "E", "NTSC-J": "J", "NTSC-K": "K"}
 
 #: Latest IOS80 / IOS58 on NUS (NUSGet wii-database.json: IOS80 6943/6944, IOS58 6175/6176).
@@ -163,10 +164,15 @@ def _url(title_id: str, name: str) -> str:
     return f"{NUS_BASE}{title_id.lower()}/{name}"
 
 
-def _fetch(url: str, rep: Reporter | None = None, ok404: bool = False) -> Optional[bytes]:
-    """GET a NUS file with the NUS User-Agent, streaming with progress/cancel."""
+def _fetch(url: str, rep: Reporter | None = None, ok404: bool = False, *,
+           max_bytes: int = MAX_META_BYTES) -> Optional[bytes]:
+    """GET a NUS file with the NUS User-Agent, streaming with progress/cancel.
+
+    Raises :class:`NusError` if the server sends more than ``max_bytes``.
+    """
     buf = bytearray()
     last_err: Exception | None = None
+    what = f"{url.rsplit('/', 2)[-2]}/{url.rsplit('/', 1)[-1]}"
     for _attempt in range(2):
         buf.clear()
         try:
@@ -174,14 +180,16 @@ def _fetch(url: str, rep: Reporter | None = None, ok404: bool = False) -> Option
                 if r.status_code == 404 and ok404:
                     return None
                 if r.status_code != 200:
-                    raise NusError(f"Nintendo's server returned HTTP {r.status_code} for "
-                                   f"{url.rsplit('/', 2)[-2]}/{url.rsplit('/', 1)[-1]}")
+                    raise NusError(f"Nintendo's server returned HTTP {r.status_code} for {what}")
                 for chunk in r.iter_bytes(256 * 1024):
                     buf += chunk
+                    if len(buf) > max_bytes:
+                        raise NusError(f"Nintendo's server sent too much data for {what}; "
+                                       "the download is not genuine")
                     if rep is not None:
                         rep.advance(len(chunk))
             return bytes(buf)
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, httpx.InvalidURL) as e:
             last_err = e
             if rep is not None:
                 rep.update(max(0, rep.done - len(buf)))
@@ -222,49 +230,115 @@ def build_cert_chain(raw_tmd: bytes, cetk: bytes) -> bytes:
 
 
 # --------------------------------------------------------------------------- titles
-def download_title(title_id: str, version: Optional[int], progress: ProgressFn | None = None,
-                   cancel: CancelToken | None = None) -> Title:
-    """Download a title (TMD, ticket, certs, all contents) and verify it.
+def expected_title_id(title_id: str) -> str:
+    """The title ID a genuine TMD/ticket carries for a NUS download path.
 
-    Raises :class:`NusError` if it has no public ticket, Nintendo's signature
-    doesn't verify, or a content's SHA-1 doesn't match the TMD.
+    vWii system titles live under ``00000007xxxxxxxx`` on the server, but their
+    TMD and ticket say ``00000001xxxxxxxx`` (with the TMD's vWii flag set).
     """
-    rep = Reporter(progress, cancel)
-    rep.note(f"Downloading {title_id} metadata")
+    tid = title_id.lower()
+    return HIGH_WII_SYSTEM + tid[8:] if tid[:8] == HIGH_VWII_SYSTEM else tid
+
+
+HIGH_WII_SYSTEM = wad.HIGH_SYSTEM
+HIGH_VWII_SYSTEM = wad.HIGH_VWII_SYSTEM
+
+
+def _padded(size: int) -> int:
+    return (size + 15) // 16 * 16
+
+
+def load_verified(title_id: str, version: Optional[int]) -> Title:
+    """Download a title's TMD, ticket and certificates and prove they are genuine.
+
+    Used by every download: the TMD and ticket must parse, carry exactly the
+    title ID (and version, when one is asked for) that was requested, and have
+    valid Nintendo signatures. Anything else raises :class:`NusError`, so a
+    captive portal page or a different (even genuine) title can't be mistaken
+    for the requested one. The returned Title has no contents yet.
+    """
+    if not re.fullmatch(r"[0-9a-fA-F]{16}", title_id or ""):
+        raise NusError(f"{title_id!r} is not a title ID")
     raw_tmd = download_tmd(title_id, version)
-    rep.check()
     cetk = download_cetk(title_id)
     if cetk is None:
         raise NusError(f"Title {title_id} has no public ticket, so it can't be packed into a WAD")
     t = Title()
-    t.load_tmd(raw_tmd[:tmd_length(raw_tmd)])
-    t.load_ticket(cetk[:TICKET_SIZE])
-    t.cert_chain = CertificateChain()
     try:
+        t.load_tmd(raw_tmd[:tmd_length(raw_tmd)])
+        t.load_ticket(cetk[:TICKET_SIZE])
+        t.cert_chain = CertificateChain()
         t.cert_chain.load(build_cert_chain(raw_tmd, cetk))
+        t.load_content_records()
+        got_tid = str(t.tmd.title_id).lower()
+        got_ver = int(t.tmd.title_version)
+        tik_tid = bytes(t.ticket.title_id).hex()
+        is_vwii = bool(t.tmd.vwii)
     except NusError:
         raise
     except Exception as e:
-        raise NusError(f"Nintendo's certificates could not be read ({e})") from e
-    t.load_content_records()
+        raise NusError(f"Nintendo's server sent data for {title_id} that can't be read ({e}). "
+                       "Check your internet connection (a Wi-Fi login page can cause this).") from e
+    want = expected_title_id(title_id)
+    if got_tid != want or tik_tid != want:
+        raise NusError(f"Asked Nintendo's server for title {title_id} but received "
+                       f"{got_tid}; the download is not genuine")
+    if title_id.lower()[:8] in (HIGH_WII_SYSTEM, HIGH_VWII_SYSTEM) and \
+            is_vwii != (title_id.lower()[:8] == HIGH_VWII_SYSTEM):
+        raise NusError(f"{title_id}: received the title for the wrong console type; "
+                       "the download is not genuine")
+    if version is not None and got_ver != version:
+        raise NusError(f"Asked Nintendo's server for {title_id} v{version} but received "
+                       f"v{got_ver}; the download is not genuine")
     try:
         signed = bool(t.get_is_signed())
     except Exception:
         signed = False
     if not signed:
         raise NusError(f"{title_id}: Nintendo's signature did not verify; the download is not genuine")
+    return t
+
+
+def _fetch_content(title_id: str, t: Title, rec, rep: Reporter | None) -> tuple[bytes, bytes]:
+    """Download one content and check it: ``(encrypted, decrypted)``.
+
+    The size must be exactly what the signed TMD says and the SHA-1 must match.
+    """
+    size = _padded(rec.content_size)
+    if size > MAX_CONTENT_BYTES:
+        raise NusError(f"{title_id}: content {rec.content_id:08x} is unreasonably large")
+    data = _fetch(_url(title_id, f"{rec.content_id:08x}"), rep, max_bytes=size)
+    if data is None or len(data) != size:
+        raise NusError(f"{title_id}: content {rec.content_id:08x} has the wrong size")
+    try:
+        dec = decrypt_content(data, t.ticket.get_title_key(), rec.index, rec.content_size)
+        ok = hashlib.sha1(dec).hexdigest() == rec.content_hash.decode().lower()
+    except Exception as e:
+        raise NusError(f"{title_id}: content {rec.content_id:08x} could not be decrypted ({e})") from e
+    if not ok:
+        raise NusError(f"{title_id}: content {rec.content_id:08x} failed its checksum")
+    return data, dec
+
+
+def download_title(title_id: str, version: Optional[int], progress: ProgressFn | None = None,
+                   cancel: CancelToken | None = None) -> Title:
+    """Download a title (TMD, ticket, certs, all contents) and verify it.
+
+    Raises :class:`NusError` if it has no public ticket, the server answers with
+    a different title or version, Nintendo's signature doesn't verify, or a
+    content's size or SHA-1 doesn't match the TMD.
+    """
+    rep = Reporter(progress, cancel)
+    rep.note(f"Downloading {title_id} metadata")
+    rep.check()
+    t = load_verified(title_id, version)
+    rep.check()
     recs = t.tmd.content_records
-    rep.set_total(sum((r.content_size + 15) // 16 * 16 for r in recs), f"Downloading {title_id}")
-    key = t.ticket.get_title_key()
+    rep.set_total(sum(_padded(r.content_size) for r in recs), f"Downloading {title_id}")
     contents: list[bytes] = []
     for i, rec in enumerate(recs, start=1):
         rep.note(f"Downloading content {i} of {len(recs)}")
-        data = _fetch(_url(title_id, f"{rec.content_id:08x}"), rep)
-        assert data is not None
-        dec = decrypt_content(data, key, rec.index, rec.content_size)
-        if hashlib.sha1(dec).hexdigest() != rec.content_hash.decode().lower():
-            raise NusError(f"{title_id}: content {rec.content_id:08x} failed its checksum")
-        contents.append(data)
+        contents.append(_fetch_content(title_id, t, rec, rep)[0])
     t.content.content_list = contents
     return t
 
@@ -298,6 +372,7 @@ def download_title_wad(title_id: str, version: Optional[int], dest: Path | str,
         rekey_for_wii(title)
     if settings is not None:
         info = info_from_title(title, verify_hashes=False)
+        info.hashes_ok = True          # download_title checked every content's SHA-1
         ensure_allowed(info, settings)
     data = title.dump_wad()
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -312,7 +387,11 @@ def download_title_wad(title_id: str, version: Optional[int], dest: Path | str,
 
 
 def _existing_ok(path: Path, entry: CatalogEntry) -> bool:
-    """True if ``path`` already holds exactly this title/version with good contents."""
+    """True if ``path`` already holds exactly this title/version with good contents.
+
+    Titles ReWii doesn't re-key must still carry Nintendo's signature, so a
+    modified WAD that merely has the right name/ID/version is downloaded again.
+    """
     if not path.is_file():
         return False
     from .wad import WadError, inspect_wad
@@ -320,8 +399,13 @@ def _existing_ok(path: Path, entry: CatalogEntry) -> bool:
         info = inspect_wad(path, verify_hashes=True)
     except WadError:
         return False
-    return (info.title_id == entry.title_id and info.version == entry.version and bool(info.hashes_ok)
-            and (info.common_key_index == 0 if entry.wii_common_key else True))
+    if info.title_id != expected_title_id(entry.title_id) or info.version != entry.version:
+        return False
+    if not info.hashes_ok or info.platform != entry.platform:
+        return False
+    if entry.wii_common_key:
+        return info.common_key_index == 0
+    return info.signed
 
 
 def _fetch_entries(entries: list[CatalogEntry], folder: Path, settings: Settings,
@@ -400,25 +484,20 @@ def download_theme_base(settings: Settings, dest_dir: Path | str, progress: Prog
     tb = theme_base(settings)
     dest = Path(dest_dir) / tb.filename
     rep = Reporter(progress, cancel)
-    raw_tmd = download_tmd(tb.title_id, tb.version)
-    cetk = download_cetk(tb.title_id)
-    if cetk is None:
-        raise NusError("The Wii Menu ticket is missing from Nintendo's server")
-    t = Title()
-    t.load_tmd(raw_tmd[:tmd_length(raw_tmd)])
-    t.load_ticket(cetk[:TICKET_SIZE])
+    rep.check()
+    t = load_verified(tb.title_id, tb.version)
     try:
         rec = next(r for r in t.tmd.content_records if r.content_id == tb.content_id)
     except StopIteration:
         raise NusError(f"Content {tb.content_id:08X} is not part of Wii Menu v{tb.version}") from None
-    rep.set_total((rec.content_size + 15) // 16 * 16, f"Downloading base theme {tb.filename}")
-    data = _fetch(_url(tb.title_id, f"{rec.content_id:08x}"), rep)
-    assert data is not None
-    dec = decrypt_content(data, t.ticket.get_title_key(), rec.index, rec.content_size)
-    if hashlib.sha1(dec).hexdigest() != rec.content_hash.decode().lower():
-        raise NusError("The base theme failed its checksum")
+    rep.set_total(_padded(rec.content_size), f"Downloading base theme {tb.filename}")
+    _enc, dec = _fetch_content(tb.title_id, t, rec, rep)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".part")
-    tmp.write_bytes(dec)
-    os.replace(tmp, dest)
+    try:
+        tmp.write_bytes(dec)
+        os.replace(tmp, dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return dest

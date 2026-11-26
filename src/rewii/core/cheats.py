@@ -30,6 +30,7 @@ from typing import Optional
 from collections.abc import Iterable, Mapping, Sequence
 
 from . import config, net
+from .ids import id_for_filename, valid_game_id
 from .layout import DriveLayout
 
 CHEAT_SOURCES: list[str] = [
@@ -177,26 +178,30 @@ def format_txtcodes(cf: CheatFile) -> str:
 
 # --------------------------------------------------------------------------- drive paths
 def txt_path(layout: DriveLayout, game_id: str) -> Path:
-    return layout.txtcodes / f"{game_id.upper()}.txt"
+    return layout.txtcodes / f"{id_for_filename(game_id)}.txt"
 
 
 def gct_path(layout: DriveLayout, game_id: str) -> Path:
-    return layout.codes / f"{game_id.upper()}.gct"
+    return layout.codes / f"{id_for_filename(game_id)}.gct"
 
 
 def wiiflow_txt_path(layout: DriveLayout, game_id: str) -> Path:
-    return layout.wiiflow / "codes" / f"{game_id.upper()}.txt"
+    return layout.wiiflow / "codes" / f"{id_for_filename(game_id)}.txt"
 
 
 def wiiflow_gct_path(layout: DriveLayout, game_id: str) -> Path:
-    return layout.wiiflow / "codes" / "gct" / f"{game_id.upper()}.gct"
+    return layout.wiiflow / "codes" / "gct" / f"{id_for_filename(game_id)}.gct"
 
 
 def _write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".part")
-    tmp.write_bytes(data)
-    tmp.replace(path)
+    try:
+        tmp.write_bytes(data)
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _looks_valid(data: Optional[bytes], game_id: str) -> bool:
@@ -212,6 +217,8 @@ def download_txtcodes(game_id: str) -> Optional[bytes]:
     Raises :class:`net.NetError` only when every source was unreachable.
     """
     gid = game_id.strip().upper()
+    if not valid_game_id(gid):
+        return None
     last: Optional[net.NetError] = None
     reached = False
     for src in CHEAT_SOURCES:
@@ -233,38 +240,56 @@ def fetch_cheats(layout: DriveLayout, game_id: str, *, wiiflow: Optional[bool] =
     """Make sure ``txtcodes/<ID>.txt`` exists on the drive and return it parsed.
 
     Uses the drive copy (then the local cache) unless ``refresh``. Returns None if no
-    cheats exist for this game. ``wiiflow=None`` also writes WiiFlow's copy if a
+    cheats exist for this game or ``game_id`` isn't a valid ID. Like
+    :func:`load_cheats` it never raises :class:`CheatError`: an unreadable copy on
+    the drive is replaced by a fresh download. ``wiiflow=None`` also writes WiiFlow's copy if a
     ``wiiflow/`` folder exists. Raises :class:`net.NetError` if offline with no copy.
     """
     gid = game_id.strip().upper()
+    if not valid_game_id(gid):
+        return None
     if wiiflow is None:
         wiiflow = layout.wiiflow.is_dir()
     dest = txt_path(layout, gid)
     cache = config.cache_dir() / "cheats" / f"{gid}.txt"
+
+    def parsed(raw: Optional[bytes]) -> Optional[CheatFile]:
+        try:
+            return parse_txtcodes(raw) if raw else None
+        except CheatError:
+            return None
+
     data: Optional[bytes] = None
+    cf: Optional[CheatFile] = None
     if not refresh:
+        # a damaged copy on the drive (or in the cache) is skipped and replaced below
         for p in (dest, cache):
             if p.is_file():
-                data = p.read_bytes()
-                break
+                raw = p.read_bytes()
+                cf = parsed(raw)
+                if cf is not None:
+                    data = raw
+                    break
+    replace = refresh or data is None
     if data is None:
         try:
             data = download_txtcodes(gid)
         except net.NetError:
-            if cache.is_file():
-                data = cache.read_bytes()
-            else:
+            raw = cache.read_bytes() if cache.is_file() else None
+            if parsed(raw) is None:
                 raise
-        if data is None:
+            data = raw
+        cf = parsed(data)
+        if data is None or cf is None:
             return None
         _write(cache, data)
-    if refresh or not dest.is_file():
+    if replace or not dest.is_file():
         _write(dest, data)
     if wiiflow:
         wf = wiiflow_txt_path(layout, gid)
-        if refresh or not wf.is_file():
+        if replace or not wf.is_file():
             _write(wf, data)
-    return parse_txtcodes(data)
+    return cf
 
 
 def load_cheats(layout: DriveLayout, game_id: str) -> Optional[CheatFile]:
@@ -307,14 +332,16 @@ def build_gct(layout: DriveLayout, game_id: str, cheats: Sequence[Cheat],
 def selected_in_gct(cf: CheatFile, gct: bytes) -> list[int]:
     """Indexes of cheats whose (placeholder-free) code bytes appear in ``gct``,
     mirroring USB Loader GX's ``IsCheatIncluded``."""
-    body = gct[len(GCT_HEADER):-len(GCT_FOOTER)] if gct.startswith(GCT_HEADER) else b""
+    body = gct[len(GCT_HEADER):] if gct.startswith(GCT_HEADER) else b""
+    if body.endswith(GCT_FOOTER) and len(body) % 8 == 0:
+        body = body[:-len(GCT_FOOTER)]
     out = []
     for i, c in enumerate(cf.cheats):
         if c.needs_values:
             continue
         b = c.to_bytes()
         pos = body.find(b)
-        while pos != -1 and pos % 4:
+        while pos != -1 and pos % 8:        # code lines are 8 bytes; only whole lines count
             pos = body.find(b, pos + 1)
         if b and pos != -1:
             out.append(i)

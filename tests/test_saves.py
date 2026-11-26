@@ -238,3 +238,89 @@ def test_restore_destinations(tmp_path: Path, settings: Settings) -> None:
     shutil.rmtree(drive / "savegames")
     res = S.restore_save(ext, drive, S.APP_SGM, settings)
     assert (res.dest / "advsv0.bin").read_bytes() == b"1" * 100
+
+
+# --------------------------------------------------------------------------- regressions
+def test_game_id_from_save_cannot_leave_the_drive(tmp_path: Path, settings: Settings) -> None:
+    assert S._printable_id(b"/tmp") == "2F746D70" and S._printable_id(b"RMCE") == "RMCE"
+    assert S._printable_id(b"a:\\b") != "a:\\b" and S._printable_id(b"../.") != "../."
+    evil = tmp_path / "evil.bin"
+    evil.write_bytes(make_databin(game="/tmp"))
+    s = S.classify_save(evil)
+    assert s is not None and s.game_id == "2F746D70"
+    v = S.backup_save(s, settings).version
+    with pytest.raises(S.SaveError):
+        S.restore_destination(v, tmp_path / "drive", S.APP_DATA_MGMT)
+    # a hand-edited sidecar can't smuggle a path in either
+    for gid in ("/tmp", "..\\x", "C:/a", "a/..", "    "):
+        v.game_id = gid
+        with pytest.raises(S.SaveError):
+            S.restore_destination(v, tmp_path / "drive", S.APP_DATA_MGMT)
+    v.kind, v.title_id = S.KIND_EXTRACTED, "../../outside"
+    with pytest.raises(S.SaveError):
+        S.restore_destination(v, tmp_path / "drive", S.APP_SGM)
+
+
+def test_backup_is_not_trusted_when_library_copy_is_gone(tmp_path: Path, settings: Settings) -> None:
+    drive = tmp_path / "drive"
+    make_drive(drive)
+    mkw = next(s for s in S.discover_saves(drive) if s.game_id == "RMCE")
+    r1 = S.backup_save(mkw, settings, now=datetime(2026, 1, 1))
+    r1.version.path.unlink()                      # sidecar stays, the save itself is gone
+    r2 = S.backup_save(mkw, settings, now=datetime(2026, 1, 2))
+    assert r2.created and r2.version.path.is_file() and r2.version.dir != r1.version.dir
+    r2.version.path.write_bytes(b"bit rot")       # or silently damaged
+    r3 = S.backup_save(mkw, settings, now=datetime(2026, 1, 3))
+    assert r3.created and S.sha1_file(r3.version.path) == r3.version.sha1
+
+
+def test_restore_keeps_drive_save_when_library_copy_is_bad(tmp_path: Path, settings: Settings) -> None:
+    drive = tmp_path / "drive"
+    make_drive(drive)
+    card = next(s for s in S.discover_saves(drive) if s.path.name == "GALE.raw")
+    v = S.backup_save(card, settings).version
+    newer = make_memcard([("GALE", "01", "newer", 4, "Melee")])
+    card.path.write_bytes(newer)
+    v.path.unlink()                               # library copy missing
+    with pytest.raises(S.SaveError, match="nothing was changed"):
+        S.restore_save(v, drive, S.APP_NINTENDONT, settings)
+    assert card.path.read_bytes() == newer
+    v.path.write_bytes(b"damaged")                # library copy damaged
+    with pytest.raises(S.SaveError, match="nothing was changed"):
+        S.restore_save(v, drive, S.APP_NINTENDONT, settings)
+    assert card.path.read_bytes() == newer
+    assert [p.name for p in card.path.parent.iterdir() if "rewii" in p.name] == []
+
+
+def test_restore_failure_midway_leaves_drive_save(tmp_path: Path, settings: Settings, monkeypatch) -> None:
+    drive = tmp_path / "drive"
+    make_drive(drive)
+    card = next(s for s in S.discover_saves(drive) if s.path.name == "GALE.raw")
+    v = S.backup_save(card, settings).version
+    newer = make_memcard([("GALE", "01", "newer", 4, "Melee")])
+    card.path.write_bytes(newer)
+    real = S._copy_path
+
+    def failing(src: Path, dest: Path) -> None:
+        if Path(dest).parent == card.path.parent:  # the copy onto the drive fails (drive full)
+            raise OSError(28, "No space left on device")
+        real(src, dest)
+    monkeypatch.setattr(S, "_copy_path", failing)
+    with pytest.raises(OSError):
+        S.restore_save(v, drive, S.APP_NINTENDONT, settings)
+    assert card.path.read_bytes() == newer         # still there, and it was backed up first
+    assert len(S.list_backups(settings, "GALE")) == 2
+    assert sorted(p.name for p in card.path.parent.iterdir() if "rewii" in p.name) == []
+
+
+def test_sidecar_cannot_point_outside_its_version_folder(tmp_path: Path, settings: Settings) -> None:
+    drive = tmp_path / "drive"
+    make_drive(drive)
+    v = S.backup_save(S.discover_saves(drive)[0], settings).version
+    side = v.dir / S.SIDECAR
+    meta = json.loads(side.read_text())
+    for bad in ("../../x", "/etc/passwd", "", ".."):
+        side.write_text(json.dumps({**meta, "name": bad}))
+        assert S._read_version(v.dir) is None
+    side.write_text("[1, 2]")
+    assert S._read_version(v.dir) is None
