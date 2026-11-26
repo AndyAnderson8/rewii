@@ -14,7 +14,8 @@ import re
 import string
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
+from collections.abc import Iterable
 
 from libWiiPy.archive.u8 import IMETHeader
 from libWiiPy.title import Title

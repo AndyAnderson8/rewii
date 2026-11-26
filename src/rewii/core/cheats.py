@@ -26,7 +26,8 @@ import re
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Optional
+from collections.abc import Iterable, Mapping, Sequence
 
 from . import config, net
 from .layout import DriveLayout

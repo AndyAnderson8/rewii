@@ -97,7 +97,7 @@ class Settings:
         return config_dir() / "settings.json"
 
     @classmethod
-    def load(cls, path: Path | None = None) -> "Settings":
+    def load(cls, path: Path | None = None) -> Settings:
         path = path or cls.path()
         s = cls()
         if path.exists():

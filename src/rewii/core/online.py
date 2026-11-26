@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Mapping, Optional, Union
+from typing import Optional, Union
+from collections.abc import Mapping
 
 from .layout import DriveLayout
 

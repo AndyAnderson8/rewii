@@ -28,7 +28,8 @@ import struct
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
+from collections.abc import Iterable
 
 from Crypto.Cipher import AES
 

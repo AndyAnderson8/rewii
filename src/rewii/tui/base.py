@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Optional
+from collections.abc import Callable
 
 from textual.containers import Vertical
 
@@ -31,7 +32,7 @@ class Pane(Vertical):
     """
 
     @property
-    def rapp(self) -> "ReWiiApp":
+    def rapp(self) -> ReWiiApp:
         return self.app  # type: ignore[return-value]
 
     @property

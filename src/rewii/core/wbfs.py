@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Optional
 
-from .disc import (FAT32_SPLIT, GC_DISC_SIZE, WII_DL_SECTORS, WII_SECTOR, DiscReader,
+from .disc import (FAT32_SPLIT, WII_DL_SECTORS, WII_SECTOR, DiscReader,
                    WbfsFileReader, parse_header, used_sectors)
 from .progress import CancelToken, ProgressFn, Reporter
 

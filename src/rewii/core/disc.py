@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import os
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Iterator, Optional
+from typing import BinaryIO, Optional
+from collections.abc import Iterator
 
 from Crypto.Cipher import AES
 

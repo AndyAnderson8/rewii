@@ -25,7 +25,8 @@ import subprocess
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
+from typing import Any, Optional
+from collections.abc import Callable, Iterable, Mapping, Sequence
 
 import psutil
 

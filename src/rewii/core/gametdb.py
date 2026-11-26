@@ -13,7 +13,8 @@ import unicodedata
 import zipfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import IO, Iterable, Optional
+from typing import IO, Optional
+from collections.abc import Iterable
 from xml.etree import ElementTree as ET
 
 from . import config, net
@@ -65,7 +66,7 @@ class GameInfo:
         return self.type.startswith("VC")
 
     @classmethod
-    def from_dict(cls, d: dict) -> "GameInfo":
+    def from_dict(cls, d: dict) -> GameInfo:
         kw = dict(d)
         for k in ("languages", "genre", "controllers", "required_controllers"):
             kw[k] = tuple(kw.get(k) or ())
@@ -209,7 +210,7 @@ class TitleDB:
 
     @classmethod
     def load(cls, settings: Optional[Settings] = None, refresh: bool = False,
-             lang: Optional[str] = None) -> "TitleDB":
+             lang: Optional[str] = None) -> TitleDB:
         """Load the database, downloading/rebuilding as needed.
 
         Never raises for network or parse problems: falls back to the existing
@@ -241,11 +242,11 @@ class TitleDB:
         return db if db is not None else cls(lang=lang)
 
     @classmethod
-    def from_games(cls, games: Iterable[GameInfo], lang: str = "EN") -> "TitleDB":
+    def from_games(cls, games: Iterable[GameInfo], lang: str = "EN") -> TitleDB:
         return cls({g.id: g for g in games}, "", lang)
 
     @classmethod
-    def _read_index(cls, path: Path, lang: str) -> Optional["TitleDB"]:
+    def _read_index(cls, path: Path, lang: str) -> Optional[TitleDB]:
         try:
             data = json.loads(path.read_text("utf-8"))
             if data.get("format") != INDEX_VERSION:
