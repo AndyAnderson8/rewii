@@ -54,6 +54,7 @@ class App:
     uncompressed_size: int = 0
     archive_url: str = ""
     archive_hash: str = ""             # md5 of the zip
+    binary_hash: str = ""              # md5 of the app's boot.dol/boot.elf
     icon_url: str = ""
     subdirectories: list[str] = field(default_factory=list)
     flags: list[str] = field(default_factory=list)   # e.g. WRITES_TO_NAND, DEPRECATED
@@ -80,6 +81,7 @@ class App:
             uncompressed_size=int(d.get("uncompressed_size") or 0),
             archive_url=str(archive.get("url") or ""),
             archive_hash=str(archive.get("hash") or ""),
+            binary_hash=str((assets.get("binary") or {}).get("hash") or ""),
             icon_url=str((assets.get("icon") or {}).get("url") or ""),
             subdirectories=list(d.get("subdirectories") or []),
             flags=list(d.get("flags") or []),
@@ -413,11 +415,36 @@ def download_archive(app: App, progress: Optional[ProgressFn] = None,
     tag = (app.archive_hash or app.version or "latest")[:12]
     safe_slug = re.sub(r"[^A-Za-z0-9._-]", "_", app.slug)
     dest = config.cache_dir() / "osc" / "zips" / f"{safe_slug}-{tag}.zip"
-    if dest.is_file() and not refresh:
-        if not app.archive_hash or _md5(dest) == app.archive_hash.lower():
-            return dest
-    return net.download(app.archive_url, dest, md5=app.archive_hash or None,
-                        progress=progress, cancel=cancel)
+    if dest.is_file() and not refresh and _archive_ok(app, dest):
+        return dest
+    net.download(app.archive_url, dest, progress=progress, cancel=cancel)
+    if not _archive_ok(app, dest):
+        dest.unlink(missing_ok=True)
+        raise OSCError(f"{app.name}: the download is damaged (checksum mismatch)")
+    return dest
+
+
+def _archive_ok(app: App, zip_path: Path) -> bool:
+    """Zip MD5 matches - or, when the shop repacked the zip without updating its
+    hash, the app's boot.dol/boot.elf inside matches the published binary hash."""
+    if not app.archive_hash:
+        return True
+    if _md5(zip_path) == app.archive_hash.lower():
+        return True
+    if not app.binary_hash:
+        return False
+    import hashlib
+    import zipfile
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            for n in zf.namelist():
+                low = n.lower()
+                if low.endswith(("/boot.dol", "/boot.elf")) and low.count("/") <= 2:
+                    if hashlib.md5(zf.read(n)).hexdigest() == app.binary_hash.lower():
+                        return True
+    except (OSError, zipfile.BadZipFile):
+        return False
+    return False
 
 
 def _md5(path: Path) -> str:

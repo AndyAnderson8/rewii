@@ -196,10 +196,12 @@ The decisions from the second review were applied: **build everything** (no MVP 
 - Cheats come from codes.rc24.xyz. The `wiidev/cheats` repo doesn't exist.
 
 **Not yet:**
-- Channels for GameCube games. CFG direct start only boots Wii games, so these would need a custom forwarder DOL built with devkitPPC.
 - Building `.csm` themes from `.mym`.
 - Ohneschwanzenegger-style stock NAND building.
 
+**Added after the first build:** GameCube game channels. Each one embeds Nintendont with an injected autoboot config, gets AHB access and IOS58 through its TMD, and uses a banner built from USB Loader GX's GameCube template.
+
 **Untested on real hardware:**
+- GameCube channels on an actual Wii.
 - The launch-screen styles on an actual Wii. Cover and black are DOL patches; classic is byte-identical to the old make_wad.py output.
 - Formatting real devices, and anything on Windows or macOS. CI builds and tests on all three OSes, but nobody has used it by hand there yet.

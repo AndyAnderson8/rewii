@@ -10,7 +10,7 @@ from textual.containers import Horizontal
 from textual.widgets import Button, DataTable, Label, Static
 
 from ...core import wad as W
-from ...core.forwarder import brick_risk, channel_game_id, cover_for_channel, make_channel
+from ...core.forwarder import channel_game_id
 from ..base import Pane
 from ..widgets import human_size
 
@@ -202,12 +202,13 @@ class ChannelsPane(Pane):
             return
         from ...core import games as G
         have = {channel_game_id(w.path) for _, w in self.items.values() if w.path}
+        from ...core.channels import build_channel, channel_problem
         games = [g for g in G.scan_drive(self.layout_, self.rapp.title_lookup)
-                 if g.is_wii and g.game_id not in have and not brick_risk(g.game_id)]
+                 if g.game_id not in have and not channel_problem(g.platform, g.disc_number, g.game_id, True)]
         if not games:
             self.app.notify("Every Wii game on the drive already has a channel")
             return
-        s, layout = self.settings, self.layout_
+        s, layout, rapp = self.settings, self.layout_, self.rapp
         if not await self.confirm("Make channels", f"Make channels for {len(games)} game(s) "
                                   f"(launch screen: {s.forwarder_style}) and copy them to the drive's wad/ folder?"
                                   + ("\n\nThe Wii Menu holds about 48 channels." if len(games) > 20 else "")):
@@ -219,8 +220,8 @@ class ChannelsPane(Pane):
             out = []
             for g in games:
                 rep.note(f"Building channel for {g.title}")
-                cov = cover_for_channel(g.game_id, s.cover_lang) if s.forwarder_style == "cover" else None
-                ci = make_channel(g.path, s.channels_dir, style=s.forwarder_style, cover_png=cov, title=g.title)
+                ci = build_channel(g.path, s, drive_root=layout.root, title=g.title,
+                                   info=rapp.game_info(g.game_id))
                 W.stage_wads(layout, [ci.path], settings=s)
                 out.append(ci.path.name)
                 rep.advance(1)

@@ -35,7 +35,7 @@ Your Wii already has the **Homebrew Channel**. With ReWii everything lives on **
 4. On the Wii: **Install Priiloader** (brick protection).
 5. On the Wii: **Install the d2x cIOS** (needed to play games from USB).
 6. **Games → Add games**, then **Put on drive**, then **Covers**.
-7. Optional: **Make channels** so games show up on the Wii Menu.
+7. Optional: **Make channels** so games (Wii and GameCube) show up on the Wii Menu.
 
 Plug the drive into the **back USB port closest to the edge of the Wii** (port 0).
 Hard drives and SSDs are more reliable than flash sticks. 3.5" drives need their own power.
@@ -97,7 +97,8 @@ Wii mini uses the special *d2xl* installer: only **base 57 → slot 249**.
         "Put game channels, Virtual Console or WiiWare titles on the Wii Menu.",
         """\
 **Prepare:** Games → *Make channel*, or Channels & WADs → *Put on drive*. Files go to the
-drive's **wad/** folder.
+drive's **wad/** folder. GameCube channels start the game in Nintendont; make them after the
+game is on the drive, and make them again if you rename or move the game.
 
 On the Wii:
 1. Homebrew Channel → **YAWM ModMii Edition**. Choose **USB** as the source if asked.
