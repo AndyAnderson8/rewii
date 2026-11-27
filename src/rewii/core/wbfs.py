@@ -111,7 +111,7 @@ def write_wbfs(d: DiscReader, dest: Path, *, scrub: bool = True, include_update:
     hdr = d.read(0, 0x100)
     _gid, _t, platform, _n, _v = parse_header(hdr)
     if platform != "wii":
-        raise ValueError("WBFS is only for Wii games; GameCube games stay ISO")
+        raise DiscError("WBFS is only for Wii games; GameCube games stay ISO")
     sec_sz = 1 << WBFS_SEC_S
     hd_sz = 1 << HD_SEC_S
     per_blk = sec_sz // WII_SECTOR
@@ -254,9 +254,9 @@ class WbfsPartition:
             hdr = self.raw.read(0, 512)
             magic, n_hd_sec, hd_s, wbfs_s = struct.unpack(">4sIBB", hdr[:10])
             if magic != b"WBFS":
-                raise ValueError(f"{self.path}: no WBFS partition found")
+                raise DiscError(f"{self.path}: no WBFS partition found")
             if not (9 <= hd_s <= 16 and 15 <= wbfs_s <= 31):
-                raise ValueError(f"{self.path}: the WBFS partition header is damaged")
+                raise DiscError(f"{self.path}: the WBFS partition header is damaged")
             self.hd_sz = 1 << hd_s
             self.sec_sz = 1 << wbfs_s
             self.n_hd_sec = n_hd_sec

@@ -116,6 +116,7 @@ def test_fetch_and_build(tmp_path, cache):
 
 def test_missing_and_offline(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     serve({url("ZZZE01"): b"<html>nope</html>"})
     assert cheats.fetch_cheats(lay, "ZZZE01", wiiflow=False) is None
     assert cheats.fetch_cheats(lay, "QQQE01", wiiflow=False) is None
@@ -129,6 +130,7 @@ def test_missing_and_offline(tmp_path, cache):
 
 def test_refresh_offline_uses_cache(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     serve({url("RMCE01"): TXT.encode()})
     cheats.fetch_cheats(lay, "RMCE01", wiiflow=False)
 
@@ -136,6 +138,7 @@ def test_refresh_offline_uses_cache(tmp_path, cache):
         raise httpx.ConnectError("offline")
     net.set_client(httpx.Client(transport=httpx.MockTransport(boom)))
     lay2 = DriveLayout(tmp_path / "usb2")
+    lay2.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     cf = cheats.fetch_cheats(lay2, "RMCE01", wiiflow=False, refresh=True)
     assert cf is not None and (lay2.txtcodes / "RMCE01.txt").exists()
     assert cheats.load_cheats(lay2, "RMCE01").title == "Mario Kart Wii"
@@ -168,6 +171,7 @@ def test_fetch_never_raises_cheaterror_and_repairs_bad_drive_copy(tmp_path, cach
 
 def test_invalid_ids_never_reach_urls_or_paths(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     log: list[str] = []
     serve({}, log)
     for bad in ("../../x", "RMCE01&a=b", "/etc/x", "??????", "RM E01"):

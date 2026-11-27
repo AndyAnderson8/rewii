@@ -221,7 +221,7 @@ class DrivePane(Pane):
                 try:
                     log += H.fix(lay, f, progress, cancel)
                 except (H.FixError, OSError) as e:
-                    log.append(f"couldn't fix: {e}")
+                    log.append(f"{H.NOT_FIXED} {self.explain(e)}")
             return log
 
         log = await self.job("Fixing", run)
@@ -320,7 +320,7 @@ class DrivePane(Pane):
                 if lay.gx_config.parent.exists():
                     set_loader_private_server(lay, s.online_server)
             except Exception as e:  # noqa: BLE001 - reported, the apps are installed anyway
-                note = f"USB Loader GX's online server wasn't set: {e}"
+                note = f"USB Loader GX's online server wasn't set: {self.explain(e)}"
             return rep, note
 
         res = await self.job("Setting up the drive", run, quiet=True)

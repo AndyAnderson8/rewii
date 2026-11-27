@@ -248,6 +248,7 @@ def fetch_cheats(layout: DriveLayout, game_id: str, *, wiiflow: Optional[bool] =
     gid = game_id.strip().upper()
     if not valid_game_id(gid):
         return None
+    layout.require_root()
     if wiiflow is None:
         wiiflow = layout.wiiflow.is_dir()
     dest = txt_path(layout, gid)
@@ -316,6 +317,7 @@ def build_gct(layout: DriveLayout, game_id: str, cheats: Sequence[Cheat],
     selected cheats. Raises :class:`CheatError` for missing placeholder values.
     An empty selection removes the gct (no cheats applied)."""
     gid = game_id.strip().upper()
+    layout.require_root()
     if wiiflow is None:
         wiiflow = layout.wiiflow.is_dir()
     targets = [gct_path(layout, gid)] + ([wiiflow_gct_path(layout, gid)] if wiiflow else [])

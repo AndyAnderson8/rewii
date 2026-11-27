@@ -1,11 +1,13 @@
 """One safe zip extractor shared by everything that unpacks untrusted archives.
 
-Rejected outright (:class:`ArchiveError`): absolute paths, ``..``, a ``:`` or
-control character in *any* path component (Windows drive letters / alternate
-streams), Windows reserved device names (``CON``, ``NUL``, ``COM1`` ...), names
-ending in a dot or space (invalid on FAT32/Windows), two entries that only differ
-by upper/lower case, archives whose contents exceed a size cap, and anything
-that would resolve outside the destination folder.
+Rejected outright (:class:`ArchiveError`): absolute paths, ``..``, a ``:`` in
+*any* path component (Windows drive letters / alternate streams), two entries
+that only differ by upper/lower case, archives whose contents exceed a size
+cap, and anything that would resolve outside the destination folder.
+
+Skipped but harmless (listed in ``Extracted.skipped``): entries whose names
+can't exist on FAT32/Windows - control or ``*?"<>|`` characters, reserved
+device names (``CON``, ``NUL``, ``COM1`` ...), names ending in a dot or space.
 """
 from __future__ import annotations
 
@@ -29,6 +31,12 @@ class ArchiveError(Exception):
     """The archive is unsafe or unreadable."""
 
 
+class UnusableName(ArchiveError):
+    """An entry whose name can't exist on a FAT32/Windows drive (odd characters, a
+    reserved device name, a trailing dot...). Harmless, so extraction skips it
+    instead of refusing the whole archive."""
+
+
 def is_reserved_name(part: str) -> bool:
     """True for Windows device names (``CON``, ``nul.txt``, ``COM1`` ...)."""
     return _RESERVED.match(part.split(".", 1)[0].rstrip(" ")) is not None
@@ -45,12 +53,15 @@ def safe_parts(name: str) -> Optional[list[str]]:
     is_dir = n.endswith("/")
     parts = [p for p in n.split("/") if p not in ("", ".")]
     for p in parts:
-        if p == ".." or any(c in _BAD_CHARS for c in p) or any(ord(c) < 32 for c in p):
+        if p == ".." or ":" in p:           # traversal / drive letters / alternate streams
             raise ArchiveError(f"unsafe path in archive: {name!r}")
+    for p in parts:
+        if any(c in _BAD_CHARS for c in p) or any(ord(c) < 32 for c in p):
+            raise UnusableName(f"name not allowed on the drive: {name!r}")
         if p.rstrip(" .") != p:
-            raise ArchiveError(f"invalid FAT32 name in archive: {name!r}")
+            raise UnusableName(f"invalid FAT32 name in archive: {name!r}")
         if is_reserved_name(p):
-            raise ArchiveError(f"reserved file name in archive: {name!r}")
+            raise UnusableName(f"reserved file name in archive: {name!r}")
     if is_dir or not parts:
         return None
     return parts
@@ -76,17 +87,24 @@ def _identity(names: Sequence[str]) -> dict[str, str]:
 
 
 def plan_zip(z: zipfile.ZipFile, mapping: Optional[Mapping] = None,
-             max_total: int = MAX_UNCOMPRESSED) -> list[tuple[zipfile.ZipInfo, str]]:
+             max_total: int = MAX_UNCOMPRESSED,
+             skipped: Optional[list[str]] = None) -> list[tuple[zipfile.ZipInfo, str]]:
     """Validate every entry of ``z`` and return ``(info, destination)`` pairs
     (POSIX paths relative to the extraction root) for its files.
 
     ``mapping`` turns the entry names into destinations (default: unchanged);
     entries it leaves out are dropped. Destinations are validated again.
     """
-    infos = z.infolist()
-    for i in infos:
-        safe_parts(i.filename)                       # directories are checked too
-    files = [i for i in infos if not i.is_dir()]
+    usable: dict[str, zipfile.ZipInfo] = {}          # an exact repeat of a name: the last one wins
+    for i in z.infolist():
+        try:
+            safe_parts(i.filename)                   # directories are checked too
+        except UnusableName:
+            if skipped is not None and not i.is_dir():
+                skipped.append(i.filename)
+            continue
+        usable[i.filename] = i
+    files = [i for i in usable.values() if not i.is_dir()]
     if sum(i.file_size for i in files) > max_total:
         raise ArchiveError("archive is unreasonably large")
     plan = (mapping or _identity)([i.filename for i in files])
@@ -136,7 +154,7 @@ def extract_zip(zip_path: Path | str, dest_root: Path | str, *,
         raise ArchiveError(f"{Path(zip_path).name} is not a valid zip") from e
     with z:
         todo: list[tuple[zipfile.ZipInfo, Path]] = []
-        for info, rel in plan_zip(z, mapping, max_total):
+        for info, rel in plan_zip(z, mapping, max_total, res.skipped):
             if allow is not None and not allow(rel):
                 res.skipped.append(rel)
                 continue

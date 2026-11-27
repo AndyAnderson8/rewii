@@ -59,6 +59,7 @@ def app(layout: DriveLayout, *parts: str, boot: bool = True) -> Path:
 @pytest.fixture
 def layout(tmp_path) -> DriveLayout:
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     lay.ensure_dirs()
     for name in ("usbloader_gx", "nintendont", "yawmme", "savegame_manager_gx", "wiixplorer"):
         app(lay, name)

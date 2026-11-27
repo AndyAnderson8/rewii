@@ -284,7 +284,7 @@ def _header_info(first: bytes) -> tuple[Optional[str], str]:
         return None, ""
     wii, gc = struct.unpack(">II", first[0x18:0x20])
     plat = "wii" if wii == WII_MAGIC else "gc" if gc == GC_MAGIC else None
-    gid = first[:6].decode("ascii") if plat and re.fullmatch(rb"[A-Z0-9]{6}", first[:6]) else ""
+    gid = first[:6].decode("ascii") if plat and re.fullmatch(rb"[A-Za-z0-9]{6}", first[:6]) else ""
     return plat, gid
 
 

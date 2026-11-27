@@ -66,6 +66,9 @@ class BackupsPane(Pane):
         self.from_thread(self._fill, snaps, nands)
 
     def _fill(self, snaps: list[BK.Snapshot], nands: list[NA.ArchivedNand]) -> None:
+        # newest first: the highlighted row is the one "Restore" and "Compare" act on,
+        # and after "Back up drive" that should be the backup just made, not the oldest
+        snaps = sorted(snaps, key=lambda s: (s.created, s.dir.name), reverse=True)
         self.snaps, self.nands = snaps, nands
         t = self.query_one("#snaps", DataTable)
         t.clear()

@@ -19,8 +19,7 @@ def make(path: Path, files: dict[str, bytes]) -> Path:
 @pytest.mark.parametrize("name", [
     "../evil", "a/../../evil", "/abs/file", "C:/x", "C:x", "\\\\server\\share\\x",
     "foo/D:/evil.txt",            # a drive letter in a later component moves to that drive on Windows
-    "a/b:stream", "a\\..\\b", "x/con", "x/NUL.txt", "COM1/x", "lpt9.dat", "a/aux.tar.gz",
-    "trail./x", "x/space ", "a/b\x01c", "a/what?.txt", "a/star*.bin",
+    "a/b:stream", "a\\..\\b",
 ])
 def test_unsafe_names_rejected(tmp_path, name):
     with pytest.raises(A.ArchiveError):
@@ -29,6 +28,19 @@ def test_unsafe_names_rejected(tmp_path, name):
     with pytest.raises(A.ArchiveError):
         A.extract_zip(z, tmp_path / "out")
     assert not (tmp_path / "out").exists() or not any((tmp_path / "out").rglob("*"))
+
+
+@pytest.mark.parametrize("name", [
+    "x/con", "x/NUL.txt", "COM1/x", "lpt9.dat", "a/aux.tar.gz", "trail./x", "x/space ",
+    "a/b\x01c", "a/what?.txt", "a/star*.bin", "Icon\r",
+])
+def test_unrepresentable_names_are_skipped_not_fatal(tmp_path, name):
+    """One odd file (macOS 'Icon\\r', a '?' in a readme name) must not block a whole mod."""
+    with pytest.raises(A.UnusableName):
+        A.safe_parts(name)
+    z = make(tmp_path / "odd.zip", {"ok/file.txt": b"1", name: b"2"})
+    res = A.extract_zip(z, tmp_path / "out")
+    assert [p.name for p in res.written] == ["file.txt"] and res.skipped == [name]
 
 
 def test_why_drive_letters_matter():

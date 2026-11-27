@@ -83,12 +83,14 @@ def test_fetch_writes_gx_wiiflow_and_cache(tmp_path, cache):
 
 def test_skip_existing_and_use_cache_offline(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     serve({art("cover3D", "US", "RMCE01"): PNG})
     covers.fetch_covers(lay, ["RMCE01"], ["cover3D"], Settings(), wiiflow=False)
     rep = covers.fetch_covers(lay, ["RMCE01"], ["cover3D"], Settings(), wiiflow=False)
     assert rep.results["RMCE01"]["cover3D"] == "skipped"
     # new drive, no network: served from the local cache
     lay2 = DriveLayout(tmp_path / "usb2")
+    lay2.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     log: list[str] = []
     serve({}, log)
     rep = covers.fetch_covers(lay2, ["RMCE01"], ["cover3D"], Settings(), wiiflow=False)
@@ -98,6 +100,7 @@ def test_skip_existing_and_use_cache_offline(tmp_path, cache):
 
 def test_placeholder_and_network_error(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     serve({art("cover", "US", "RMCE01"): b"\x89PNG\r\n\x1a\n" + b"\0" * 100})
     rep = covers.fetch_covers(lay, ["RMCE01"], ["cover"], Settings(), wiiflow=False)
     assert rep.results["RMCE01"]["cover"] == "missing"
@@ -112,6 +115,7 @@ def test_placeholder_and_network_error(tmp_path, cache):
 
 def test_cancel(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     serve({})
     tok = CancelToken()
     tok.cancel()
@@ -134,6 +138,7 @@ def test_custom_banner(tmp_path, cache):
 
 def test_remove_covers(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     serve({art("cover3D", "US", "RMCE01"): PNG, art("cover", "US", "RMCE01"): PNG})
     covers.fetch_covers(lay, ["RMCE01"], ["cover3D", "cover"], Settings(), wiiflow=False)
     assert covers.remove_covers(lay, "RMCE01") == 2
@@ -143,6 +148,7 @@ def test_remove_covers(tmp_path, cache):
 # --------------------------------------------------------------------------- regressions
 def test_throttling_is_an_error_not_missing(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
 
     def handler(req):          # one region is throttled, every other one says "not found"
         return httpx.Response(429 if "/US/" in str(req.url) else 404)
@@ -164,6 +170,7 @@ def test_throttling_is_an_error_not_missing(tmp_path, cache):
 
 def test_broken_cover_on_drive_is_replaced(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     serve({art("cover3D", "US", "RMCE01"): PNG})
     target = covers.gx_cover_path(lay, "RMCE01", "cover3D")
     target.parent.mkdir(parents=True)
@@ -180,6 +187,7 @@ def test_broken_cover_on_drive_is_replaced(tmp_path, cache):
 
 def test_invalid_game_ids_never_reach_urls_or_paths(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     log: list[str] = []
     serve({}, log)
     bad = ["../../", "/A/B/C", "RM?E01", "??????", "A&B=C1"]

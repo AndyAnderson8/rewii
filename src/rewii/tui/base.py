@@ -14,6 +14,7 @@ from textual.css.query import NoMatches
 from textual.widgets import Button, DataTable
 
 from ..core.config import Settings
+from ..core.fileops import explain_os_error
 from ..core.layout import DriveLayout
 from ..core.progress import Cancelled
 from .widgets import Choice, Confirm, Job, JobFailed, Message, PickPath, Prompt, cursor_key
@@ -95,7 +96,28 @@ class Pane(Vertical):
         if lay is None:
             self.app.notify("Choose your Wii's USB drive first (Drive section, or press d)",
                             severity="warning")
+            return None
+        if not lay.connected():
+            # never carry on: writing would re-create the folder on this computer's own disk
+            self.app.notify(f"The drive {lay.root} isn't connected. Plug it in (and wait until the "
+                            "computer shows it), or choose another drive in the Drive section.",
+                            severity="error", timeout=10)
+            return None
         return lay
+
+    @property
+    def live_layout(self) -> Optional[DriveLayout]:
+        """The drive in use if it is connected right now, else None (without a message)."""
+        lay = self.rapp.drive_layout
+        return lay if lay is not None and lay.connected() else None
+
+    def explain(self, exc: object) -> str:
+        """Plain words for an error shown to the user (see ``fileops.explain_os_error``)."""
+        e = getattr(exc, "exc", exc)             # a JobFailed wraps the real exception
+        lay = self.rapp.drive_layout
+        if isinstance(e, BaseException):
+            return explain_os_error(e, lay.root if lay is not None else None)
+        return str(exc)
 
     # ---- buttons: one safe dispatcher for every pane
     def button_actions(self) -> dict[str, Callable[[], Any]]:
@@ -165,7 +187,7 @@ class Pane(Vertical):
         res = await self.app.push_screen_wait(Job(title, fn, cancellable))
         if isinstance(res, JobFailed):
             self.rapp.log_error(title, res)
-            await self.message(f"{title} failed", str(res), error=True)
+            await self.message(f"{title} failed", self.explain(res), error=True)
             return FAILED
         if isinstance(res, Cancelled):
             self.app.notify(f"{title}: cancelled", severity="warning")
@@ -183,7 +205,7 @@ class Pane(Vertical):
             return await asyncio.to_thread(fn)
         except Exception as e:  # noqa: BLE001 - shown to the user
             log.error("%s failed: %s\n%s", what, e, traceback.format_exc())
-            await self.message(f"{what} failed", str(e) or type(e).__name__, error=True)
+            await self.message(f"{what} failed", self.explain(e), error=True)
             return FAILED
 
 
@@ -203,4 +225,9 @@ def kit_lines(rep: Any) -> tuple[list[str], bool]:
         lines.append("Not on the Open Shop Channel any more: " + ", ".join(rep.not_found))
     if rep.unsupported:
         lines.append("Not for this console type (skipped): " + ", ".join(rep.unsupported))
+    if getattr(rep, "needs_console", None):
+        lines.append("Left out because the console type isn't set yet: " + ", ".join(rep.needs_console)
+                     + ".\nThe cIOS installer depends on the console (Wii, Wii U or Wii mini). Set the "
+                     "console in Settings, then use System & Guides \u2192 cIOS \u2192 \"Prepare files "
+                     "for this guide\" to put the right one on the drive.")
     return lines, bool(failed or rep.not_found)

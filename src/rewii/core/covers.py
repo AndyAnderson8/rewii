@@ -20,6 +20,7 @@ from collections.abc import Iterable
 
 from . import config, net
 from .config import Settings
+from .fileops import explain_os_error
 from .ids import id_for_filename, valid_game_id
 from .layout import DriveLayout
 from .progress import CancelToken, Cancelled, ProgressFn, Reporter
@@ -94,7 +95,9 @@ def _png_file_ok(path: Path) -> bool:
 
 def cache_path(game_id: str, kind: str) -> Path:
     """Where the local cached copy of a cover lives (may not exist)."""
-    return config.cache_dir() / "covers" / id_for_filename(kind) / f"{id_for_filename(game_id)}.png"
+    if kind not in ALL_KINDS:
+        raise ValueError(f"unknown cover kind {kind!r}")
+    return config.cache_dir() / "covers" / kind / f"{id_for_filename(game_id)}.png"
 
 
 def cached_cover_path(game_id: str, kind: str = "cover3D") -> Optional[Path]:
@@ -206,6 +209,7 @@ def fetch_covers(layout: DriveLayout, game_ids: Iterable[str],
     Raises :class:`Cancelled` if cancelled.
     """
     settings = settings or Settings()
+    layout.require_root()
     kinds_l = [k for k in (kinds or settings.cover_types) if k in COVER_KINDS]
     ids = list(dict.fromkeys(g.strip().upper() for g in game_ids if g and g.strip()))
     if wiiflow is None:
@@ -259,7 +263,7 @@ def fetch_covers(layout: DriveLayout, game_ids: Iterable[str],
                 except Cancelled:
                     raise
                 except OSError as e:
-                    status, err = ERROR, str(e)
+                    status, err = ERROR, explain_os_error(e, layout.root)
                 report.results[g][k] = status
                 if err:
                     report.errors[f"{g}/{k}"] = err
@@ -336,6 +340,7 @@ def download_custom_banner(layout: DriveLayout, game_id: str, *,
     gid = game_id.strip().upper()
     if not valid_game_id(gid):
         return None
+    layout.require_root()
     if wiiflow is None:
         wiiflow = layout.wiiflow.is_dir()
     dest = gx_banner_dir(layout) / f"{gid}.bnr"

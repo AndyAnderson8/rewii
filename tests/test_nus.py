@@ -148,6 +148,7 @@ def test_prepare_cios_wii(fake, tmp_path):
     for e in nus.CIOS_BASE["wii"]:
         fake.add(ios(int(e.title_id[8:], 16), e.version))
     layout = DriveLayout(tmp_path / "usb")
+    layout.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     files = nus.prepare_cios_files(layout, WII)
     assert [f.name for f in files] == [e.filename for e in nus.CIOS_BASE["wii"]]
     assert all(f.parent == layout.root for f in files)
@@ -289,6 +290,7 @@ def test_existing_modified_wad_is_downloaded_again(fake, tmp_path, monkeypatch):
     for e in nus.CIOS_BASE["wii"]:
         fake.add(ios(int(e.title_id[8:], 16), e.version))
     layout = DriveLayout(tmp_path / "usb")
+    layout.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     nus.prepare_cios_files(layout, WII)
     e = nus.CIOS_BASE["wii"][0]
     assert nus._existing_ok(layout.root / e.filename, e)

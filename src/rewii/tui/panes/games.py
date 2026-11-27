@@ -229,7 +229,7 @@ class GamesPane(Pane):
             self.app.notify("Pick the .part0.iso of a CleanRip dump - the other parts are joined automatically",
                             severity="warning")
             return
-        layout = self.layout_
+        layout = self.live_layout
         put = False
         if layout is not None:
             ch = await self.choose("Also put on the drive?", f"Add {len(paths)} game(s) to the library. "
@@ -254,7 +254,7 @@ class GamesPane(Pane):
                 except Cancelled:
                     raise
                 except Exception as e:  # noqa: BLE001 - one bad file doesn't stop the rest
-                    errs.append(f"{p.name}: {e or type(e).__name__}")
+                    errs.append(f"{p.name}: {self.explain(e)}")
             return done, errs
 
         res = await self.job(f"Adding {len(paths)} game(s)", run)
@@ -308,7 +308,7 @@ class GamesPane(Pane):
                 except Cancelled:
                     raise
                 except Exception as e:  # noqa: BLE001 - reported per game
-                    errs.append(f"{g.title}: {e or type(e).__name__}")
+                    errs.append(f"{g.title}: {self.explain(e)}")
             return ok, errs
 
         res = await self.job("Putting games on the drive", run)
@@ -349,7 +349,7 @@ class GamesPane(Pane):
                 try:
                     G.remove_game(layout, g)
                 except Exception as e:  # noqa: BLE001 - reported per game
-                    errs.append(f"{g.title}: {e or type(e).__name__}")
+                    errs.append(f"{g.title}: {self.explain(e)}")
                 rep.advance(1)
             return errs
 
@@ -377,7 +377,7 @@ class GamesPane(Pane):
                 except Cancelled:
                     raise
                 except Exception as e:  # noqa: BLE001 - reported per game
-                    errs.append(f"{g.title}: {e or type(e).__name__}")
+                    errs.append(f"{g.title}: {self.explain(e)}")
             return errs
 
         errs = await self.job(f"Copying {len(games)} game(s) to the PC", run)
@@ -410,7 +410,7 @@ class GamesPane(Pane):
                 try:
                     G.delete_from_library(s, g)
                 except Exception as e:  # noqa: BLE001 - reported per game
-                    errs.append(f"{g.title}: {e or type(e).__name__}")
+                    errs.append(f"{g.title}: {self.explain(e)}")
                 rep.advance(1)
             return errs
 
@@ -455,7 +455,7 @@ class GamesPane(Pane):
             await self.message("Skipped", "No channel for:\n  " + "\n  ".join(skipped), error=not games)
         if not games:
             return
-        s, layout, rapp = self.settings, self.layout_, self.rapp
+        s, layout, rapp = self.settings, self.live_layout, self.rapp
         n_gc = sum(1 for g in games if not g.is_wii)
         body = (f"Make {len(games)} channel(s):\n" + titles([g.title for g in games])
                 + (f"\n\nWii games: launch screen '{s.forwarder_style}'." if n_gc < len(games) else "")
@@ -526,7 +526,7 @@ class GamesPane(Pane):
                     else:
                         none.append(gid)
                 except Exception as e:  # noqa: BLE001 - offline etc.; reported below
-                    failed.append(f"{gid}: {e or type(e).__name__}")
+                    failed.append(f"{gid}: {self.explain(e)}")
                 rep.advance(1)
             return found, none, failed
 
@@ -672,13 +672,13 @@ class GamesPane(Pane):
             return
         lst = titles([f"{g.title} [{g.game_id}] {human_size(g.size)}" for g in games], limit=60)
         layout: Optional[DriveLayout] = None
-        if self.layout_ is not None:
+        if self.live_layout is not None:
             ch = await self.choose("Where to?", f"Found {len(games)} games:\n{lst}\n\nCopy them to the "
                                    "current drive too, or only into the PC library?",
                                    a="Library + drive", b="Library only")
             if ch is None:
                 return
-            layout = self.layout_ if ch == "a" else None
+            layout = self.live_layout if ch == "a" else None
         elif not await self.confirm("Import games", f"Found {len(games)} games:\n{lst}\n\n"
                                     "Copy them into the PC library?", yes="Import"):
             return
@@ -687,4 +687,6 @@ class GamesPane(Pane):
                              lambda p, c: G.migrate_wbfs_partition(src, layout, s, None, off, look, p, c))
         self.reload()
         if res is not FAILED:
-            await self.message("Import finished", "\n".join(res) or "Nothing new to copy.")
+            bad = getattr(res, "problems", 0)
+            await self.message("Import finished - with problems" if bad else "Import finished",
+                               "\n".join(res) or "Nothing new to copy.", error=bool(bad))

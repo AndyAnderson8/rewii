@@ -21,7 +21,8 @@ from collections.abc import Iterable
 
 from .config import Settings
 from .layout import DriveLayout, safe_name
-from .fileops import UnsafePath, copy_atomic, is_inside, safe_join, sha1_file
+from .fileops import (UnsafePath, copy_atomic, is_inside, is_temp_name, require_drive, safe_join,
+                      sha1_file)
 from .progress import CancelToken, ProgressFn, Reporter
 
 MANIFEST = "manifest.json"
@@ -31,18 +32,38 @@ GAME_DIRS = ("wbfs", "games")
 SKIP_NAMES = {"system volume information", "$recycle.bin", ".spotlight-v100", ".trashes",
               ".fseventsd", ".temporaryitems", "thumbs.db", ".ds_store"}
 MTIME_SLACK = 2.0        # FAT32 stores mtimes with 2-second resolution
+TZ_SHIFT_MAX_HOURS = 26  # UTC-12..UTC+14 apart, see _same()
+FAT32_MAX_FILE = 0xFFFFFFFF          # 4 GiB - 1: the largest file FAT32 can hold
 CHUNK = 4 * 1024 * 1024
+
+
+def _human(n: int) -> str:
+    for unit, size in (("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if n >= size:
+            return f"{n / size:.1f} {unit}"
+    return f"{n} bytes"
 
 
 class BackupError(Exception):
     """A backup/restore/clone can't proceed."""
 
 
+class FileTooBig(BackupError):
+    """Files of 4 GB or more can't be stored on a FAT32 drive."""
+
+    def __init__(self, paths: list[str]):
+        shown = "\n  ".join(paths[:20]) + (f"\n  ... and {len(paths) - 20} more" if len(paths) > 20 else "")
+        super().__init__(f"{len(paths)} file(s) are 4 GB or larger, which a FAT32 drive can't hold. "
+                         f"Nothing was copied. Remove or split them first:\n  {shown}")
+        self.paths = paths
+
+
 class InsufficientSpace(BackupError):
     """The target doesn't have enough free space."""
 
     def __init__(self, needed: int, free: int):
-        super().__init__(f"needs {needed:,} bytes but only {free:,} are free")
+        super().__init__(f"Not enough free space on the target: this needs {_human(needed)} but only "
+                         f"{_human(free)} is free.")
         self.needed = needed
         self.free = free
 
@@ -63,7 +84,8 @@ def _is_game_path(rel: str) -> bool:
 
 
 def _skip(name: str) -> bool:
-    return name.lower() in SKIP_NAMES or name.endswith(".rewii-part")
+    # OS clutter, and ReWii's own unfinished files (never worth backing up or cloning)
+    return name.lower() in SKIP_NAMES or is_temp_name(name)
 
 
 def scan_tree(root: Path, *, include_games: bool = True,
@@ -109,11 +131,25 @@ def _copy(src: Path, dest: Path, rep: Reporter, hash_: bool = False) -> str:
 
 
 def _same(a: FileEntry, b: FileEntry) -> bool:
+    """Quick "unchanged" test: same size and (same SHA-1, if both known, else same time).
+
+    FAT32 stores modification times as *local* time with 2-second steps and no
+    time zone. After a daylight-saving change, or on a computer set to another
+    time zone, every file on the drive therefore appears shifted by a whole
+    number of hours. Such a shift (up to :data:`TZ_SHIFT_MAX_HOURS`, within
+    :data:`MTIME_SLACK`) with an identical size is treated as "unchanged" -
+    otherwise every file would be copied again. The price: an edit that keeps
+    the size and lands exactly N hours after the old time is not noticed by the
+    quick test (the deep, SHA-1 comparison still catches it)."""
     if a.size != b.size:
         return False
     if a.sha1 and b.sha1:
         return a.sha1 == b.sha1
-    return abs(a.mtime - b.mtime) <= MTIME_SLACK
+    d = abs(a.mtime - b.mtime)
+    if d <= MTIME_SLACK:
+        return True
+    hours = round(d / 3600)
+    return 1 <= hours <= TZ_SHIFT_MAX_HOURS and abs(d - hours * 3600) <= MTIME_SLACK
 
 
 def _rel_to_path(base: Path, rel: str) -> Path:
@@ -291,9 +327,17 @@ def diff_snapshot(snapshot: Snapshot, drive: Path, *, deep: bool = False,
     cur = {e.path: e for e in scan_tree(Path(drive), include_games=snapshot.include_games,
                                         cancel=cancel)}
     old = snapshot.entry_map()
+    # FAT32 keeps a name's upper/lower case but ignores it: "BOOT.DOL" is the snapshot's
+    # "boot.dol", not one file added and another removed
+    old_ci: dict[str, FileEntry] = {}
+    for k, v in old.items():
+        old_ci.setdefault(k.casefold(), v)
+    matched: set[str] = set()
     d = SnapshotDiff()
     for p, e in cur.items():
-        o = old.get(p)
+        o = old.get(p) or old_ci.get(p.casefold())
+        if o is not None:
+            matched.add(o.path)
         if o is None:
             d.added.append(p)
             continue
@@ -303,7 +347,7 @@ def diff_snapshot(snapshot: Snapshot, drive: Path, *, deep: bool = False,
                 d.changed.append(p)
         elif not _same(e, FileEntry(o.path, o.size, o.mtime)):
             d.changed.append(p)
-    d.removed = sorted(set(old) - set(cur))
+    d.removed = sorted(set(old) - matched)
     d.added.sort()
     d.changed.sort()
     return d
@@ -337,14 +381,85 @@ def _free_space(path: Path) -> int:
     return shutil.disk_usage(p).free
 
 
-def _check_space(target: Path, todo: list[tuple[Path, Path, FileEntry]]) -> None:
-    needed = 0
+def _cluster_size(path: Path) -> int:
+    """Allocation unit of the filesystem holding ``path`` (files take whole clusters)."""
+    p = Path(path)
+    while not p.exists() and p.parent != p:
+        p = p.parent
+    try:
+        if hasattr(os, "statvfs"):
+            st = os.statvfs(p)
+            return int(st.f_frsize or st.f_bsize) or 4096
+        import ctypes                                    # Windows
+        spc, bps = ctypes.c_ulong(0), ctypes.c_ulong(0)
+        free, total = ctypes.c_ulong(0), ctypes.c_ulong(0)
+        root = os.path.splitdrive(os.path.abspath(p))[0] + "\\"
+        if ctypes.windll.kernel32.GetDiskFreeSpaceW(  # type: ignore[attr-defined]
+                root, ctypes.byref(spc), ctypes.byref(bps), ctypes.byref(free), ctypes.byref(total)):
+            return int(spc.value * bps.value) or 4096
+    except (OSError, AttributeError, ValueError):
+        pass
+    return 4096
+
+
+def _space_needed(todo: list[tuple[Path, Path, FileEntry]], cluster: int) -> int:
+    """Most free space the copies need at any moment.
+
+    Files take whole clusters, and a file being replaced is written next to the
+    old one first (atomic copy), so for a moment both are on the drive."""
+    def alloc(n: int) -> int:
+        return -(-n // cluster) * cluster
+
+    used = peak = 0
     for _, dst, e in todo:
-        existing = dst.stat().st_size if dst.is_file() else 0
-        needed += max(0, e.size - existing)
+        try:
+            existing = alloc(dst.stat().st_size) if dst.is_file() else 0
+        except OSError:
+            existing = 0
+        new = alloc(e.size)
+        peak = max(peak, used + new)
+        used += new - existing
+    return max(peak, used, 0)
+
+
+def _check_space(target: Path, todo: list[tuple[Path, Path, FileEntry]]) -> None:
+    needed = _space_needed(todo, _cluster_size(target))
     free = _free_space(target)
     if needed > free:
         raise InsufficientSpace(needed, free)
+
+
+FAT_TYPES = frozenset({"vfat", "fat32", "fat", "msdos", "msdosfs"})
+
+
+def is_fat32(path: Path) -> Optional[bool]:
+    """Is ``path`` on a FAT32 volume? None when the filesystem can't be determined."""
+    try:
+        import psutil
+        target = os.path.realpath(path)
+        best = None
+        for part in psutil.disk_partitions(all=True):
+            mp = os.path.realpath(part.mountpoint)
+            if target == mp or target.startswith(mp.rstrip(os.sep) + os.sep):
+                if best is None or len(mp) > len(os.path.realpath(best.mountpoint)):
+                    best = part
+        if best is None or not best.fstype:
+            return None
+        return best.fstype.lower() in FAT_TYPES
+    except Exception:  # noqa: BLE001 - only a pre-check; the copy itself still reports EFBIG
+        return None
+
+
+def _check_fat32_sizes(target: Path, todo: list[tuple[Path, Path, FileEntry]]) -> None:
+    """Refuse up front (naming every file) when the target is FAT32 and can't hold a file."""
+    big = [e for _, _, e in todo if e.size > FAT32_MAX_FILE]
+    if big and is_fat32(target):
+        raise FileTooBig([e.path for e in big])
+
+
+def _check_target(target: Path, todo: list[tuple[Path, Path, FileEntry]]) -> None:
+    _check_fat32_sizes(target, todo)
+    _check_space(target, todo)
 
 
 def _plan(src_root: Path, entries: list[FileEntry], target: Path,
@@ -396,11 +511,10 @@ def restore_snapshot(snapshot: Snapshot, target: Path, *, paths: Iterable[str] |
     target that aren't in the snapshot are only deleted when ``mirror`` is True
     (and never inside game folders the snapshot didn't include).
     """
-    target = Path(target)
-    target.mkdir(parents=True, exist_ok=True)
+    target = require_drive(target)         # never (re)create a drive that isn't there
     report = CopyReport()
     todo = _plan(snapshot.files_dir, snapshot.files, target, paths, report.skipped)
-    _check_space(target, todo)
+    _check_target(target, todo)
     rep = Reporter(progress, cancel, total=sum(e.size for _, _, e in todo),
                    message="Restoring snapshot")
     for src, dst, e in todo:
@@ -428,7 +542,7 @@ def clone_drive(source: Path, target: Path, *, include_games: bool = True,
     Verification re-reads each written file and compares SHA-1 with the source.
     Files on the target not on the source are kept unless ``mirror`` is True.
     """
-    source, target = Path(source), Path(target)
+    source, target = require_drive(source), require_drive(target)
     if source.resolve() == target.resolve():
         raise BackupError("source and target are the same drive")
     if is_inside(target, source) or is_inside(source, target):
@@ -436,7 +550,7 @@ def clone_drive(source: Path, target: Path, *, include_games: bool = True,
     entries = scan_tree(source, include_games=include_games, cancel=cancel)
     report = CopyReport()
     todo = _plan(source, entries, target, None, report.skipped)
-    _check_space(target, todo)
+    _check_target(target, todo)
     total = sum(e.size for _, _, e in todo) * (2 if verify else 1)
     rep = Reporter(progress, cancel, total=total, message="Cloning drive")
     for src, dst, e in todo:

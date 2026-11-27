@@ -445,6 +445,9 @@ def classify_risk(info: WadInfo, settings: Settings) -> list[Risk]:
         elif info.platform == "wii" and ct == "vwii":
             add("error", "platform_mismatch", f"This WAD is {what} for an original Wii. "
                 "Installing it on a Wii U's vWii mode will brick it.")
+        if t == T_SYSTEM_MENU and settings.korean_region_changed:
+            add("error", "korean_region_changed", "This Wii was made for Korea and later changed to another "
+                "region. Installing a Wii Menu 4.2 or newer on it causes Error 003 (a brick).")
         if t == T_SYSTEM_MENU:
             sm_reg = system_menu_region(info.version)
             if sm_reg is None:
@@ -609,6 +612,7 @@ def stage_wads(layout: DriveLayout, paths: Iterable[Path | str], progress: Progr
     Returns the staged paths in input order.
     """
     srcs = [Path(p) for p in paths]
+    layout.require_root()
     for s in srcs:
         if not s.is_file():
             raise WadError(f"{s.name} not found")

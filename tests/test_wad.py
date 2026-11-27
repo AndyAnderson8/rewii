@@ -251,6 +251,7 @@ def test_fakesigned_forwarder_channel_still_allowed(tmp_path):
     assert info.fakesigned and info.title_type == W.T_CHANNEL
     assert _blocking(info, WII_US) == [] and _blocking(info, VWII_US) == []
     W.ensure_allowed(info, WII_US)
+    (tmp_path / "usb").mkdir()
     assert W.stage_wads(DriveLayout(tmp_path / "usb"), [info.path], settings=WII_US)
 
 
@@ -327,6 +328,7 @@ def test_scan_stage_list_unstage(tmp_path):
     assert len(res.wads) == 2 and len(res.errors) == 1
 
     layout = DriveLayout(tmp_path / "usb")
+    layout.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     events = []
     staged = W.stage_wads(layout, [a, lib / "sub" / "b.wad"], progress=events.append)
     assert [p.name for p in staged] == ["A game.wad", "b.wad"]
@@ -346,6 +348,7 @@ def test_scan_stage_list_unstage(tmp_path):
 def test_stage_refuses_blocked(tmp_path):
     sm = write_wad(tmp_path, "sm.wad", tid="0000000100000002", version=514, ios=80, region=2, name=None)
     layout = DriveLayout(tmp_path / "usb")
+    layout.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     with pytest.raises(W.Refused):
         W.stage_wads(layout, [sm], settings=WII_US)
     assert not layout.wad.exists() or not any(layout.wad.iterdir())
@@ -353,6 +356,7 @@ def test_stage_refuses_blocked(tmp_path):
 
 def test_stage_cancel(tmp_path):
     layout = DriveLayout(tmp_path / "usb")
+    layout.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     tok = CancelToken()
     tok.cancel()
     from rewii.core.progress import Cancelled
@@ -378,3 +382,10 @@ def test_unpack_pack_roundtrip(tmp_path):
     assert info.hashes_ok and info.fakesigned
     t = W.load_title(mod.read_bytes())
     assert t.get_content_by_index(1) == b"modified content"
+
+
+def test_region_changed_korean_console_never_gets_a_system_menu(tmp_path, nintendo_signed):
+    sm_u = _sm(tmp_path, 513)
+    flagged = Settings(console_type="wii", console_region="NTSC-U", korean_region_changed=True)
+    assert "korean_region_changed" in _blocking(sm_u, flagged)
+    assert "korean_region_changed" not in _blocking(sm_u, WII_US)

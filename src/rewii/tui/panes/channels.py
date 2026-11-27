@@ -268,7 +268,7 @@ class ChannelsPane(Pane):
                 try:
                     p.unlink(missing_ok=True)
                 except OSError as e:
-                    errs.append(f"{p.name}: {e}")
+                    errs.append(f"{p.name}: {self.explain(e)}")
             return errs
 
         errs = await self.job("Deleting WADs", run, cancellable=False, quiet=True)

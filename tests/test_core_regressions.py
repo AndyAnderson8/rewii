@@ -40,6 +40,7 @@ def wii(tmp_path):
 @pytest.fixture
 def lay(tmp_path):
     l = DriveLayout(tmp_path / "drive")
+    l.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     l.ensure_dirs()
     return l
 
@@ -263,7 +264,7 @@ def test_unpack_wad_key_index_handling(certs):
 
 
 # ------------------------------------------------------------------ #4 game ID validation
-@pytest.mark.parametrize("gid", [b"../../", b"/../..", b"R?P*01", b"RSP\x0001", b"rspe01", b"RSP\xff01"])
+@pytest.mark.parametrize("gid", [b"../../", b"/../..", b"R?P*01", b"RSP\x0001", b"RSP\xff01"])
 def test_invalid_game_id_is_not_a_game(tmp_path, lay, settings, gid):
     hdr = bytearray(0x60)
     hdr[:6] = gid
@@ -314,7 +315,7 @@ def test_damaged_container_headers_are_rejected_quickly(tmp_path):
         assert not G.verify_game(c).ok
     img = tmp_path / "part.img"
     img.write_bytes(struct.pack(">4sIBB", b"WBFS", 100, 255, 21) + bytes(4096))
-    with pytest.raises(ValueError):
+    with pytest.raises(D.DiscError):
         W.WbfsPartition(img)
 
 
@@ -578,3 +579,17 @@ def test_channel_id_collisions():
     got = CH.channel_id_collisions([("GALE01", "gc"), ("DALE01", "gc"), ("RALE01", "wii")])
     assert got == {"GALE": ["GALE01", "DALE01"]}
     assert CH.channel_problem("gc", 0, "GTST01", True) is None
+
+
+def test_scrubbed_retail_layout_game_verifies(tmp_path):
+    """Retail discs keep the update partition next to the disc header. Scrubbing drops
+    its data; Verify must not call the result incomplete."""
+    from rewii.core.layout import DriveLayout
+    iso = make_wii_iso(tmp_path / "retail.iso", retail_layout=True)
+    assert G.verify_game(iso).ok                        # full image: update partition checked too
+    lay = DriveLayout(tmp_path / "drive")
+    lay.root.mkdir()
+    g = G.install_game(lay, iso, scrub=True)
+    assert g.size < 8 << 20                             # the 6 MB update file was dropped
+    r = G.verify_game(g.path)
+    assert r.ok, r.message

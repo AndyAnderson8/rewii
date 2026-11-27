@@ -428,3 +428,18 @@ def test_macos_disk_without_info_is_system():
     lst = {"AllDisksAndPartitions": [{"DeviceIdentifier": "disk0", "Size": 10**12, "Partitions": []}]}
     (d,) = parse_diskutil(lst, {}, ())
     assert d.is_system
+
+
+def test_usb_drive_mounted_under_home_is_not_a_system_disk():
+    from rewii.core.drives import parse_lsblk
+    doc = {"blockdevices": [
+        {"name": "sdc", "path": "/dev/sdc", "size": 64 * 10**9, "type": "disk", "tran": "usb", "rm": True,
+         "children": [{"name": "sdc1", "type": "part", "fstype": "vfat", "size": 64 * 10**9,
+                       "mountpoints": ["/home/me/wii"]}]},
+        {"name": "sdd", "path": "/dev/sdd", "size": 64 * 10**9, "type": "disk", "tran": "usb", "rm": True,
+         "children": [{"name": "sdd1", "type": "part", "fstype": "ext4", "size": 64 * 10**9,
+                       "mountpoints": ["/"]}]},
+    ]}
+    d = {x.device: x for x in parse_lsblk(doc)}
+    assert not d["/dev/sdc"].is_system
+    assert d["/dev/sdd"].is_system          # booted from USB: still the system disk

@@ -95,6 +95,7 @@ def test_restore_space_check(tmp_path: Path, settings: Settings, monkeypatch) ->
     snap = B.create_snapshot(drive, settings, "usb")
     monkeypatch.setattr(B, "_free_space", lambda p: 10)
     with pytest.raises(B.InsufficientSpace):
+        (tmp_path / "empty").mkdir()
         B.restore_snapshot(snap, tmp_path / "empty")
 
 

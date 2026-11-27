@@ -35,6 +35,7 @@ from Crypto.Cipher import AES
 
 from . import archive
 from .config import Settings
+from .fileops import require_drive
 from .ids import valid_id4
 from .layout import DriveLayout, safe_name
 from .progress import CancelToken, ProgressFn, Reporter
@@ -985,6 +986,7 @@ def restore_save(version: SaveVersion, drive_root: Path, target_app: str, settin
     first (and the restore aborts if that backup fails).
     """
     rep = Reporter(progress, cancel, message=f"Restoring {version.title}")
+    require_drive(drive_root)
     dest = restore_destination(version, drive_root, target_app)
     rep.check()
     # 1. the library copy must be there and intact before anything on the drive changes

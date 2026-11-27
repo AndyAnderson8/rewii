@@ -196,7 +196,7 @@ class HomebrewPane(Pane):
                 except Cancelled:
                     raise
                 except Exception as e:  # noqa: BLE001 - reported per app
-                    errs.append(f"{a.name}: {e or type(e).__name__}")
+                    errs.append(f"{a.name}: {self.explain(e)}")
             return ok, errs
 
         res = await self.job(f"Installing {len(apps)} app(s)", run, quiet=True)
@@ -264,7 +264,7 @@ class HomebrewPane(Pane):
                 try:
                     osc.remove_app(layout, i.folder)
                 except Exception as e:  # noqa: BLE001 - reported per app
-                    errs.append(f"{i.display_name}: {e or type(e).__name__}")
+                    errs.append(f"{i.display_name}: {self.explain(e)}")
                 rep.advance(1)
             return errs
 

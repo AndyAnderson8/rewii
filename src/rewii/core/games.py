@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import os
 import re
 import shutil
 import tempfile
@@ -23,6 +22,7 @@ from .disc import (FAT32_SPLIT, INCOMPLETE, NEEDS_CONVERSION, NEEDS_CONVERSION_E
                    WII_SECTOR, DiscError, aes_cbc_decrypt, incomplete_reason,
                    open_disc, parse_header, region_of, sniff_format, split_parts, used_sectors,
                    wii_partitions, wii_usage_table)
+from .fileops import DriveNotConnected, explain_os_error, is_temp_name, rename_path, same_file
 from .layout import DriveLayout, game_folder_name, id_from_folder
 from .progress import CancelToken, ProgressFn, Reporter
 from .wbfs import WbfsPartition, _cleanup, copy_file, write_iso, write_wbfs
@@ -37,6 +37,9 @@ WII_EXTS = DRIVE_WII_EXTS | DRIVE_GC_EXTS | CONVERTIBLE_EXTS
 UNKNOWN_ID = "??????"             # a game that needs conversion and has no [ID] in its name
 TMP_PREFIX = ".rewii-tmp-"        # staging files; hidden from scans, removed when stale
 STALE_TMP_AGE = 24 * 3600
+
+MISPLACED = "misplaced"
+INCOMPLETE_PROBLEM = "incomplete"   # a split part is missing, or the file is cut short
 
 TitleLookup = Callable[[str], Optional[str]]
 
@@ -58,7 +61,7 @@ class Game:
     files: list[Path] = field(default_factory=list)
     size: int = 0
     location: str = "library"  # "library" | "drive"
-    problem: str = ""          # e.g. "needs conversion", "misplaced"
+    problem: str = ""          # "needs conversion", "misplaced" or INCOMPLETE_PROBLEM
 
     @property
     def is_wii(self) -> bool:
@@ -104,12 +107,28 @@ def identify(path: Path, lookup: TitleLookup | None = None, location: str = "lib
                     "needs conversion")
     if fmt not in ("ISO", "WBFS", "CISO"):
         return None
+    problem = ""
     try:
         with open_disc(path) as d:
             gid, dt, plat, num, _ver = parse_header(d.read(0, 0x60))
+            # a split game whose .wbfN part is gone: the block table points past the data there is
+            if fmt == "WBFS" and (d.missing(0, d.size) or _part_gap(path, files)):
+                problem = INCOMPLETE_PROBLEM
     except (DiscError, OSError):       # includes damaged headers and invalid game IDs
         return None
-    return Game(gid, _title(lookup, gid, dt), dt, plat, num, region_of(gid), fmt, path, files, size, location)
+    return Game(gid, _title(lookup, gid, dt), dt, plat, num, region_of(gid), fmt, path, files, size,
+                location, problem)
+
+
+def _part_gap(path: Path, files: list[Path]) -> bool:
+    """True if a later ``.wbfN`` part exists beyond the last consecutive one."""
+    try:
+        have = {f.name.lower() for f in files}
+        stem = path.stem.lower()
+        return any(x.name.lower() not in have and x.stem.lower() == stem
+                   and re.fullmatch(r"\.wbf\d+", x.suffix.lower()) for x in path.parent.iterdir())
+    except OSError:
+        return False
 
 
 def _iter_images(root: Path, exts: Iterable[str]) -> Iterable[Path]:
@@ -122,6 +141,8 @@ def _iter_images(root: Path, exts: Iterable[str]) -> Iterable[Path]:
     for p in sorted(root.rglob("*")):
         if p.name.startswith(TMP_PREFIX):
             _remove_if_stale(p)
+            continue
+        if is_temp_name(p.name):
             continue
         if p.is_file() and p.suffix.lower() in exts and not p.name.startswith("._"):
             yield p
@@ -153,17 +174,19 @@ def scan_drive(layout: DriveLayout, lookup: TitleLookup | None = None) -> list[G
             continue
         _folder_title(g, p)
         if p.parent.parent != layout.wbfs or id_from_folder(p.parent.name) != g.game_id \
-                or p.stem != g.game_id:
-            g.problem = g.problem or "misplaced"
+                or p.name != f"{g.game_id}{p.suffix.lower()}":
+            g.problem = g.problem or MISPLACED
         out.append(g)
     for p in _iter_images(layout.gc_games, DRIVE_GC_EXTS | CONVERTIBLE_EXTS):
         g = identify(p, lookup, "drive")
         if not g:
             continue
         _folder_title(g, p)
-        good_name = p.stem in ("game", "disc2")
-        if p.parent.parent != layout.gc_games or not good_name:
-            g.problem = g.problem or "misplaced"
+        # the same rules as health.check_gc_games, so both agree on what is misplaced
+        want = ("game" if g.disc_number == 0 else f"disc{g.disc_number + 1}") + p.suffix.lower()
+        if p.parent.parent != layout.gc_games or id_from_folder(p.parent.name) != g.game_id \
+                or p.name != want:
+            g.problem = g.problem or MISPLACED
         out.append(g)
     return sorted(out, key=lambda g: (g.platform != "wii", g.title.lower(), g.disc_number))
 
@@ -276,11 +299,7 @@ def _part_targets(files: list[Path], dest_main: Path) -> list[Path]:
     return [dest_main] + [dest_main.with_suffix(p.suffix.lower()) for p in files[1:]]
 
 
-def _same_file(a: Path, b: Path) -> bool:
-    try:
-        return a.exists() and b.exists() and os.path.samefile(a, b)
-    except OSError:
-        return False
+_same_file = same_file
 
 
 def _move_files(files: list[Path], dest_main: Path) -> list[Path]:
@@ -299,13 +318,13 @@ def _move_files(files: list[Path], dest_main: Path) -> list[Path]:
     try:
         for src, dst in zip(files, targets):
             if src != dst:
-                os.replace(src, dst) if _same_file(src, dst) else shutil.move(str(src), str(dst))
+                rename_path(src, dst)
             done.append((src, dst))
     except BaseException:
         for src, dst in reversed(done):
             with contextlib.suppress(OSError):
                 if src != dst:
-                    shutil.move(str(dst), str(src))
+                    rename_path(dst, src)
         if made_dir:
             with contextlib.suppress(OSError):
                 dest_main.parent.rmdir()
@@ -353,6 +372,7 @@ def install_game(layout: DriveLayout, src: Path, *, title: str | None = None, sc
     several games so the drive isn't rescanned for each one. An image that is
     incomplete (truncated, a split part missing) is refused with a GameError."""
     src = Path(src)
+    layout.require_root()
     rep = Reporter(progress, cancel)
     staged: list[Path] = []
     with _work_dir() as tdir:
@@ -409,6 +429,11 @@ def install_game(layout: DriveLayout, src: Path, *, title: str | None = None, sc
         except DiscError as e:
             _cleanup(staged)
             raise GameError(str(e)) from e
+        except OSError as e:
+            _cleanup(staged)
+            if not layout.connected():      # unplugged mid-copy: say so, not "no such file"
+                raise DriveNotConnected(layout.root) from e
+            raise
         except BaseException:
             _cleanup(staged)           # no-op for files already moved into place
             raise
@@ -467,11 +492,11 @@ def _rename_folder(folder: Path, new: Path) -> None:
         return
     if new.exists() and not _same_file(folder, new):       # same file = case-only rename
         raise GameError("a folder with that name already exists")
-    folder.rename(new)
+    rename_path(folder, new)       # also does case-only renames, which FAT32 needs a detour for
 
 
 def _check_renamable(game: Game) -> None:
-    if game.game_id == UNKNOWN_ID or game.needs_conversion or not re.fullmatch(r"[A-Z0-9]{6}", game.game_id):
+    if game.game_id == UNKNOWN_ID or game.needs_conversion or not re.fullmatch(r"[A-Za-z0-9]{6}", game.game_id):
         raise GameError("this game has no readable game ID yet - convert it first, then rename it")
 
 
@@ -507,18 +532,19 @@ def normalize_drive(layout: DriveLayout, lookup: TitleLookup | None = None,
                     progress: ProgressFn | None = None, cancel: CancelToken | None = None) -> list[str]:
     """Move misplaced games into the proper ``Title [ID]/ID.wbfs`` / ``game.iso`` layout."""
     msgs = []
-    games = [g for g in scan_drive(layout, lookup) if g.problem == "misplaced"]
+    games = [g for g in scan_drive(layout, lookup) if g.problem == MISPLACED]
     rep = Reporter(progress, cancel, total=len(games))
     for g in games:
         rep.check()
         dest = _proper_dest(layout, g, g.title)
         old_folder = g.path.parent
         try:
-            if dest.exists():
+            # a name that differs only in case is the same file on FAT32: that is a rename
+            if dest.exists() and not _same_file(g.path, dest):
                 raise GameError(f"{dest} already exists")
             _move_files(g.files or [g.path], dest)
         except (GameError, OSError) as e:
-            msgs.append(f"skipped {g.path.name}: {e}")
+            msgs.append(f"skipped {g.path.name}: {explain_os_error(e, layout.root)}")
             rep.advance(1)
             continue
         msgs.append(f"moved {g.path.relative_to(layout.root)} -> {dest.relative_to(layout.root)}")
@@ -643,7 +669,10 @@ def verify_game(path: Path, progress: ProgressFn | None = None,
                                                                 "have no checksums to verify)")
             if d.missing(0, 0x50000):
                 return VerifyResult(False, message=INCOMPLETE)
-            table = wii_usage_table(d, include_update=True)
+            # The update partition is optional (scrubbing drops its data but its header
+            # shares a WBFS block with the disc header, so it still "exists"): its stored
+            # clusters are checksummed, but missing ones are never counted as lost.
+            table = wii_usage_table(d, include_update=False)
             # a partition whose header the image doesn't store was removed by a scrub
             parts = [p for p in wii_partitions(d)
                      if p.title_key and d.sector_present(p.offset // WII_SECTOR)]
@@ -688,23 +717,52 @@ def verify_game(path: Path, progress: ProgressFn | None = None,
 
 
 # --------------------------------------------------------------------------- legacy migration
+CUT_OFF = ("the old drive (or its image file) is cut off before the end of this game, so the "
+           "game's data isn't all there. Copy the whole drive again and retry.")
+
+
+class MigrateResult(list[str]):
+    """The lines :func:`migrate_wbfs_partition` reports, plus how many games were
+    skipped and how many were copied but turned out to be damaged."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.skipped = 0
+        self.damaged = 0
+
+    @property
+    def problems(self) -> int:
+        return self.skipped + self.damaged
+
+
+def _cut_off(part: WbfsPartition, slot: int) -> bool:
+    try:
+        r = part.open_game(slot)
+        return r.missing(0, r.size)
+    except DiscError:
+        return False
+
+
 def migrate_wbfs_partition(source: Path, layout: DriveLayout | None = None,
                            settings: Settings | None = None, slots: list[int] | None = None,
                            offset: int = 0, lookup: TitleLookup | None = None,
                            progress: ProgressFn | None = None, cancel: CancelToken | None = None,
-                           *, games: list[Game] | None = None) -> list[str]:
+                           *, games: list[Game] | None = None) -> MigrateResult:
     """Copy games out of an old WBFS-formatted drive (or disk image) to the new
     layout on ``layout`` and/or into the library.
 
     Games already there (matched by game ID) are left alone. A game that can't
     be read or doesn't fit is skipped with a line in the result; the others are
     still copied. ``games`` is an optional current :func:`scan_drive` result."""
+    if layout is not None:
+        layout.require_root()
     part = WbfsPartition(source, offset)
-    out = []
+    out = MigrateResult()
     try:
         todo = [g for g in part.games() if slots is None or g.slot in slots]
         out += [f"slot {slot}: skipped - {why}" for slot, why in part.skipped
                 if slots is None or slot in slots]
+        out.skipped += len(out)
         on_drive = {g.game_id for g in (games if games is not None else scan_drive(layout))
                     if g.is_wii} if layout is not None else set()
         in_lib = {g.game_id for g in scan_library(settings) if g.is_wii} if settings is not None else set()
@@ -721,6 +779,13 @@ def migrate_wbfs_partition(source: Path, layout: DriveLayout | None = None,
             if settings is not None and pg.game_id not in in_lib:
                 dest = settings.wii_games_dir / f"{game_folder_name(title, pg.game_id)}.wbfs"
                 jobs.append(("library", settings.wii_games_dir, dest, dest.with_name(TMP_PREFIX + dest.name), None))
+            if jobs and _cut_off(part, pg.slot):
+                # readers give zeros past the end, which would otherwise surface as a
+                # baffling "no Wii/GameCube magic" (or be copied as a broken game)
+                out.append(f"{title}: skipped - {CUT_OFF}")
+                out.skipped += 1
+                continue
+            verdict: VerifyResult | None = None       # the copies are identical: check one
             for where, space_root, dest, staging, split in jobs:
                 tmp: list[Path] = []
                 try:
@@ -728,14 +793,28 @@ def migrate_wbfs_partition(source: Path, layout: DriveLayout | None = None,
                         continue
                     if free_space(space_root) < need:
                         raise GameError(f"not enough free space ({need / 1e9:.1f} GB needed)")
+                    if layout is not None and where == "drive":
+                        layout.require_root()
                     staging.parent.mkdir(parents=True, exist_ok=True)
                     tmp = write_wbfs(part.open_game(pg.slot), staging, scrub=False, split=split,
                                      progress=progress, cancel=cancel)
-                    _replace_files(tmp, dest)
-                    out.append(f"{title} -> {where}")
+                    files = _replace_files(tmp, dest)
+                    if verdict is None:
+                        rep.note(f"[{i}/{len(todo)}] Checking {title}")
+                        verdict = verify_game(files[0], progress, cancel)
+                    if verdict.ok:
+                        out.append(f"{title} -> {where}")
+                    else:
+                        out.append(f"{title} -> {where}, but the game is DAMAGED on the old drive "
+                                   f"({verdict.message}). The copy was kept; it may crash or not "
+                                   "start - rip the disc again if you can.")
+                        out.damaged += 1
                 except (DiscError, GameError, OSError) as e:      # Cancelled is not caught here
                     _cleanup(tmp)
-                    out.append(f"{title}: skipped ({where}) - {e}")
+                    why = explain_os_error(e, layout.root if layout is not None and where == "drive"
+                                           else None)
+                    out.append(f"{title}: skipped ({where}) - {why}")
+                    out.skipped += 1
                 except BaseException:
                     _cleanup(tmp)
                     raise

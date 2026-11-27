@@ -8,6 +8,7 @@ from ...core import channels as CH
 from ...core import games as G
 from ...core import wad as W
 from ...core.config import Settings
+from ...core.fileops import explain_os_error
 from ...core.layout import DriveLayout
 from ...core.progress import Cancelled, Reporter
 
@@ -63,6 +64,6 @@ def build_channels(games: Sequence[G.Game], settings: Settings, layout: Optional
         except Cancelled:
             raise
         except Exception as e:  # noqa: BLE001 - reported per game
-            errs.append(f"{g.title}: {e or type(e).__name__}")
+            errs.append(f"{g.title}: {explain_os_error(e, layout.root if layout else None)}")
         rep.advance(1)
     return out, errs

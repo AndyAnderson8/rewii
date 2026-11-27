@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import json
 import os
 import threading
@@ -52,11 +53,18 @@ def _host(url: str) -> str:
         return url
 
 
+def _unreachable(url: str, e: BaseException) -> NetError:
+    """The error for "the request never got an answer" - nearly always no internet."""
+    detail = re.sub(r"^\[(Errno|WinError) -?\d+\]\s*", "", str(e)) or type(e).__name__
+    return NetError("Couldn't connect \u2014 check your internet connection "
+                    f"({_host(url)}: {detail}).")
+
+
 def get(url: str, **kw) -> httpx.Response:
     try:
         r = client().get(url, **kw)
     except (httpx.HTTPError, httpx.InvalidURL) as e:
-        raise NetError(f"Could not reach {_host(url)}: {e}") from e
+        raise _unreachable(url, e) from e
     return r
 
 
@@ -78,7 +86,7 @@ def get_bytes(url: str, ok404: bool = False, *, max_bytes: int | None = MAX_BYTE
                 if max_bytes is not None and len(buf) > max_bytes:
                     raise NetError(f"{_host(url)} sent more data than expected")
     except (httpx.HTTPError, httpx.InvalidURL) as e:
-        raise NetError(f"Could not reach {_host(url)}: {e}") from e
+        raise _unreachable(url, e) from e
     return bytes(buf)
 
 
@@ -161,7 +169,7 @@ def download(url: str, dest: Path, *, md5: str | None = None, progress: Progress
                     rep.advance(len(chunk))
     except (httpx.HTTPError, httpx.InvalidURL) as e:
         tmp.unlink(missing_ok=True)
-        raise NetError(f"Download failed: {e}") from e
+        raise _unreachable(url, e) from e
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise

@@ -10,6 +10,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from .fileops import require_drive
+
 _BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
@@ -24,7 +26,7 @@ def game_folder_name(title: str, game_id: str) -> str:
     return f"{safe_name(title)} [{game_id}]"
 
 
-_ID_IN_NAME = re.compile(r"\[([A-Z0-9]{6})\]")
+_ID_IN_NAME = re.compile(r"\[([A-Za-z0-9]{6})\]")
 
 
 def id_from_folder(name: str) -> str | None:
@@ -170,13 +172,32 @@ class DriveLayout:
         except (OSError, ValueError):
             return {}
 
+    def require_root(self) -> Path:
+        """The drive's root if it is there, else raise ``DriveNotConnected``. Call this
+        before writing: a vanished root must never be re-created on the computer's disk."""
+        return require_drive(self.root)
+
+    def connected(self) -> bool:
+        try:
+            return self.root.is_dir()
+        except OSError:
+            return False
+
     def write_manifest(self, data: dict) -> None:
+        self.require_root()
         self.rewii.mkdir(parents=True, exist_ok=True)
         cur = self.read_manifest()
         cur.update(data)
-        self.manifest.write_text(json.dumps(cur, indent=2), "utf-8")
+        tmp = self.manifest.with_name(self.manifest.name + ".part")
+        try:
+            tmp.write_text(json.dumps(cur, indent=2), "utf-8")
+            tmp.replace(self.manifest)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
 
     def ensure_dirs(self) -> None:
+        self.require_root()
         for p in (self.apps, self.wbfs, self.gc_games, self.wad, self.txtcodes,
                   self.savegames, self.rewii):
             p.mkdir(parents=True, exist_ok=True)
