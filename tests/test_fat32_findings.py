@@ -262,7 +262,9 @@ def test_rename_path_hops_through_a_temp_name_for_case_only_changes(tmp_path, mo
     d = tmp_path / "Wii Sports [RSPE01]"
     d.mkdir()
     FO.rename_path(d, tmp_path / "WII SPORTS [RSPE01]")
-    assert (tmp_path / "WII SPORTS [RSPE01]").is_dir() and not d.exists()
+    # compare the listing, not .exists(): on a case-insensitive filesystem both spellings "exist"
+    assert "WII SPORTS [RSPE01]" in [p.name for p in tmp_path.iterdir()]
+    assert "Wii Sports [RSPE01]" not in [p.name for p in tmp_path.iterdir()]
 
 
 def test_rename_path_never_replaces_another_file_and_rolls_back(tmp_path, monkeypatch):
