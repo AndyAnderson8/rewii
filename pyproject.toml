@@ -38,6 +38,9 @@ rewii = "rewii.__main__:main"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+# delete each test's temp folder as soon as it finishes: disc images are sparse on
+# Linux/macOS but can be fully allocated elsewhere, and CI disks are small
+tmp_path_retention_policy = "none"
 
 [tool.ruff]
 line-length = 120
