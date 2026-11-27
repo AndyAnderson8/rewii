@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import struct
+import sys
 from pathlib import Path
 
 import pytest
@@ -321,6 +322,7 @@ def test_unsigned_warning(tmp_path):
 
 
 # --------------------------------------------------------------------------- library / staging
+@pytest.mark.skipif(sys.platform == "win32", reason="needs a source file name Windows can't create")
 def test_scan_stage_list_unstage(tmp_path):
     lib = tmp_path / "lib"
     (lib / "sub").mkdir(parents=True)

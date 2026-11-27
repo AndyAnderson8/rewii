@@ -1,6 +1,8 @@
 """Tests for rewii.core.ids."""
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from rewii.core import ids
@@ -55,7 +57,9 @@ def test_safe_name_never_returns_a_windows_device_name():
     assert safe_name("Console") == "Console" and safe_name("  a  b. ") == "a b" and safe_name("???") == "Game"
     assert safe_name("x" * 63 + ". y", maxlen=64) == "x" * 63            # no trailing dot after cutting
     assert game_folder_name("AUX", "RMCE01") == "_AUX [RMCE01]"
-    assert staged_name(Path("aux.wad")) == "_aux.wad" and staged_name(Path("a:b?.wad")) == "ab.wad"
+    assert staged_name(Path("aux.wad")) == "_aux.wad"
+    if sys.platform != "win32":                       # "a:" is a drive letter there, not part of the name
+        assert staged_name(Path("a:b?.wad")) == "ab.wad"
     assert staged_name(Path("....wad")) == "title.wad"
     lay = DriveLayout(Path("/x"))
     assert DriveLayout.of(lay) is lay and DriveLayout.of("/x") == lay and DriveLayout.of(Path("/x")).apps == lay.apps

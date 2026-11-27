@@ -25,6 +25,7 @@ from .drives import EXFAT, FAT16, FAT32, NTFS, UNKNOWN, WBFS, Drive, human_size
 from .fat32 import MAX_SIZE, Fat32Error, plan_fat32
 from .layout import APPS_DIR, MANAGED_TOPS, DriveLayout, game_folder_name, id_from_folder
 from .osc import starter_kit
+from . import fileops
 from .fileops import (NEW_SUFFIX, PART_SUFFIX, TEMP_IDLE_SECONDS, TEMP_PREFIX, part_path, explain_os_error, is_inside, is_temp_name,
                       rename_path, same_file)
 from .findings import SAFE_FIXES, Finding, Fix, Severity
@@ -537,7 +538,7 @@ def _move_game(src: Path, dest: Path, rep: Reporter) -> list[str]:
     else:
         targets = [dest]
         parts = parts[:1]
-    if src == dest:
+    if fileops.same_spelling(src, dest):
         return []
     for t in targets:
         # a name that differs only in case is the same file on FAT32 - that's a rename, not a clash

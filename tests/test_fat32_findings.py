@@ -452,6 +452,7 @@ def test_explain_os_error(tmp_path):
     assert "isn't connected" in FO.explain_os_error(FO.DriveNotConnected(gone), gone)
 
 
+@pytest.mark.skipif(not hasattr(os, "statvfs"), reason="read-only detection uses statvfs (not on Windows)")
 def test_health_reports_a_read_only_drive(lay, monkeypatch):
     assert [f for f in H.check(lay) if f.id == "read_only"] == []
     real = os.statvfs
