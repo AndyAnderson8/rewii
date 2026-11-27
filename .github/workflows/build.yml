@@ -1,0 +1,77 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            asset: rewii-linux-x86_64
+          - os: windows-latest
+            asset: rewii-windows-x86_64.exe
+          # GitHub retired the macos-13 and macos-14 images; these are the current labels
+          # (https://github.com/actions/runner-images): macos-15 is Apple silicon, macos-15-intel x64
+          - os: macos-15
+            asset: rewii-macos-arm64
+          - os: macos-15-intel
+            asset: rewii-macos-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-groups
+      # ruff and mypy are dev dependencies (pinned by uv.lock) and run inside the project
+      # environment, so mypy sees the real types of textual, httpx, Pillow...
+      - run: uv run ruff check src tests
+      - run: uv run mypy src/rewii
+      - run: uv run pytest -q
+      - name: A release tag must match the version in pyproject.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version="$(uv run python -c 'import rewii; print(rewii.__version__)')"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the package version $version (pyproject.toml)"
+            exit 1
+          fi
+      - run: uv run pyinstaller packaging/rewii.spec --noconfirm --distpath dist --workpath build/pyi
+      - name: Smoke test
+        shell: bash
+        run: |
+          ls dist
+          if [ -f dist/rewii.exe ]; then exe=dist/rewii.exe; else exe=dist/rewii; fi
+          "$exe" --version
+          # proves the bundled files, Pillow, pycryptodome and libWiiPy are really inside the
+          # executable: builds and verifies a Wii and a GameCube channel from synthetic discs
+          "$exe" selftest
+          mv "$exe" "dist/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          draft: true

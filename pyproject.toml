@@ -1,0 +1,54 @@
+[project]
+name = "rewii"
+version = "0.1.0"
+description = "All-in-one toolkit for softmodded Wiis: games, channels, homebrew, saves, backups."
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE", "NOTICE.md"]
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "libwiipy>=0.6.0",
+    "pillow>=13.0.0",
+    "platformdirs>=4.14.8",
+    "psutil>=7.2.2",
+    "pycryptodome>=4.6.0",
+    "textual>=8.2.8",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.8,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4.1",
+    "pyfatfs>=1.1.0",
+    "pyinstaller>=6.22.3",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.5.0",
+    "ruff>=0.17.6",
+    "setuptools<81",
+]
+
+[project.scripts]
+rewii = "rewii.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# delete each test's temp folder as soon as it finishes: disc images are sparse on
+# Linux/macOS but can be fully allocated elsewhere, and CI disks are small
+tmp_path_retention_policy = "none"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["F", "E9", "B", "PLE"]
+ignore = ["B905"]
+
+[tool.mypy]
+ignore_missing_imports = true
