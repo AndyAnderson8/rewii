@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.egg-info/
+# never commit game data, keys or Nintendo binaries ...
+*.wbfs
+*.wbf[0-9]
+*.iso
+*.rvz
+*.wad
+*.bin
+common-key
+# ... but nothing under the package's bundled assets or the tests may be hidden by
+# the patterns above: a new asset or fixture must show up in `git status`
+!/src/rewii/assets/**
+!/tests/**
+/tests/**/__pycache__/
+/src/rewii/assets/**/__pycache__/
+
+# build output
+/build/
+/dist/
+*.spec.bak
