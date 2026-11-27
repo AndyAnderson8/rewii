@@ -549,7 +549,7 @@ def _move_game(src: Path, dest: Path, rep: Reporter) -> list[str]:
     old_parent = src.parent
     for p, t in zip(parts, targets):
         rep.check()
-        if p != t:
+        if not fileops.same_spelling(p, t):
             rename_path(p, t)                  # handles case-only renames on FAT32
             done.append(f"Moved {p} -> {t}")
     if old_parent != dest.parent:

@@ -353,13 +353,13 @@ def _move_files(files: list[Path], dest_main: Path) -> list[Path]:
     done: list[tuple[Path, Path]] = []
     try:
         for src, dst in zip(files, targets):
-            if src != dst:
+            if not same_spelling(src, dst):       # not `!=`: on Windows paths compare ignoring case
                 rename_path(src, dst)
             done.append((src, dst))
     except BaseException:
         for src, dst in reversed(done):
             with contextlib.suppress(OSError):
-                if src != dst:
+                if not same_spelling(src, dst):
                     rename_path(dst, src)
         if made_dir:
             with contextlib.suppress(OSError):

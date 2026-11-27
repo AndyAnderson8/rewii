@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 import pytest
@@ -462,6 +463,7 @@ async def test_pickpath_space_ticks_files(tmp_path):
     assert got == [[pick / "b.wad"]]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="uses /dev/null as the device")
 async def test_pickpath_any_path_takes_a_typed_device_and_either_takes_a_folder(tmp_path):
     app = make_app(tmp_path)
     got = []
