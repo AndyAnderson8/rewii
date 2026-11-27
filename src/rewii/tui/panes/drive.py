@@ -215,11 +215,13 @@ class DrivePane(Pane):
         if lay is None:
             return
 
+        look = self.rapp.title_lookup
+
         def run(progress: Any, cancel: Any) -> list[str]:
             log: list[str] = []
             for f in fs:
                 try:
-                    log += H.fix(lay, f, progress, cancel)
+                    log += H.fix(lay, f, progress, cancel, lookup=look)
                 except (H.FixError, OSError) as e:
                     log.append(f"{H.NOT_FIXED} {self.explain(e)}")
             return log

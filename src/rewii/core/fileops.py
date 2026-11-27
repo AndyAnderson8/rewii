@@ -14,10 +14,11 @@ import os
 import re
 import shutil
 import sys
+import time
 import threading
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Optional, Any
 
 from .progress import Reporter
 from .errors import ReWiiError
@@ -103,6 +104,53 @@ def is_temp_name(name: str) -> bool:
     return low.startswith(TEMP_PREFIX) or low.endswith(TEMP_SUFFIXES)
 
 
+def newest_mtime(p: Path) -> float:
+    """When anything in ``p`` (a file, or a folder and everything in it) last changed."""
+    t = p.stat().st_mtime
+    if p.is_dir() and not p.is_symlink():
+        for dirpath, _dirs, files in os.walk(p):
+            with contextlib.suppress(OSError):
+                t = max(t, os.stat(dirpath).st_mtime)
+            for f in files:
+                with contextlib.suppress(OSError):
+                    t = max(t, os.stat(os.path.join(dirpath, f)).st_mtime)
+    return t
+
+
+def idle_for(p: Path, seconds: float, now: Optional[float] = None) -> bool:
+    """Nothing in ``p`` has changed for ``seconds`` (so no running copy owns it)."""
+    try:
+        return (now or time.time()) - newest_mtime(p) > seconds
+    except OSError:
+        return False
+
+
+def settle_leftover(p: Path) -> Optional[str]:
+    """Deal with one leftover of an interrupted copy or swap and say what was done.
+
+    * ``X.rewii-old`` is the previous version that an interrupted swap moved aside.
+      If ``X`` is missing, it is the only copy left, so it is put back - never deleted.
+      If ``X`` is there, the swap finished and the old copy is removed.
+    * Everything else (``*.rewii-new``, ``*.partial``, ``*.rewii-part``, ``.rewii-tmp-*``...)
+      is an unfinished copy and is removed.
+
+    Callers decide *whether* ``p`` is a leftover and that it is idle; this decides what
+    to do with it. Returns None if ``p`` no longer exists."""
+    if not (p.exists() or p.is_symlink()):
+        return None
+    name = p.name
+    if name.lower().endswith(OLD_SUFFIX):
+        original = p.with_name(name[:-len(OLD_SUFFIX)])
+        if not original.exists():
+            rename_path(p, original)
+            return f"Recovered {original.name} (put back after an interrupted update)"
+    if p.is_dir() and not p.is_symlink():
+        shutil.rmtree(p)
+    else:
+        p.unlink()
+    return f"Deleted {name}"
+
+
 def same_file(a: Path, b: Path) -> bool:
     """True if both paths exist and are the same file (e.g. names that differ only
     in case on FAT32/NTFS/APFS)."""
@@ -186,6 +234,43 @@ def _on_drive(exc: OSError, drive_root: Path | None) -> bool | None:
     return False
 
 
+#: Windows error codes that matter to the user, as POSIX errno values.
+_WINERROR_TO_ERRNO = {
+    19: errno.EROFS,       # ERROR_WRITE_PROTECT
+    21: errno.EIO,         # ERROR_NOT_READY (drive removed)
+    112: errno.ENOSPC,     # ERROR_DISK_FULL
+    39: errno.ENOSPC,      # ERROR_HANDLE_DISK_FULL
+    1006: errno.EIO,       # ERROR_FILE_INVALID (volume dismounted)
+    1117: errno.EIO,       # ERROR_IO_DEVICE
+    483: errno.EIO,        # ERROR_DEVICE_HARDWARE_ERROR
+    1167: errno.EIO,       # ERROR_DEVICE_NOT_CONNECTED
+}
+
+
+def volume_read_only(path: Path | str) -> Optional[bool]:
+    """Is the volume holding ``path`` mounted read-only? None if it can't be told.
+
+    Linux/macOS: the mount's read-only flag. Windows: the volume's
+    FILE_READ_ONLY_VOLUME flag (a locked SD card or a write-protected stick)."""
+    try:
+        if hasattr(os, "statvfs"):
+            return bool(os.statvfs(path).f_flag & getattr(os, "ST_RDONLY", 1))
+        if sys.platform == "win32":     # pragma: no cover - Windows only
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32                                   # type: ignore[attr-defined]
+            buf = ctypes.create_unicode_buffer(261)
+            if not k32.GetVolumePathNameW(str(Path(path).resolve()), buf, 261):
+                return None
+            flags = wintypes.DWORD()
+            if not k32.GetVolumeInformationW(buf.value, None, 0, None, None, ctypes.byref(flags), None, 0):
+                return None
+            return bool(flags.value & 0x00080000)                          # FILE_READ_ONLY_VOLUME
+    except (OSError, AttributeError, ValueError):
+        return None
+    return None
+
+
 def explain_os_error(exc: BaseException, drive_root: Path | str | None = None) -> str:
     """A plain sentence for an error that reaches the user.
 
@@ -196,6 +281,8 @@ def explain_os_error(exc: BaseException, drive_root: Path | str | None = None) -
         return str(exc) or type(exc).__name__
     root = Path(drive_root) if drive_root is not None else None
     code = exc.errno
+    # Windows reports some drive errors only through winerror
+    code = _WINERROR_TO_ERRNO.get(getattr(exc, "winerror", None) or 0, code)
     name = _clean_name(exc.filename2 or exc.filename) if (exc.filename2 or exc.filename) else ""
     about = f" ({name})" if name else ""
     on_drive = _on_drive(exc, root)

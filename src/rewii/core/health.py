@@ -14,8 +14,8 @@ elsewhere:
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 import shutil
-import time
 from pathlib import Path
 from typing import Optional
 from collections.abc import Callable, Iterator
@@ -26,7 +26,7 @@ from .fat32 import MAX_SIZE, Fat32Error, plan_fat32
 from .layout import APPS_DIR, MANAGED_TOPS, DriveLayout, game_folder_name, id_from_folder
 from .osc import starter_kit
 from . import fileops
-from .fileops import (NEW_SUFFIX, PART_SUFFIX, TEMP_IDLE_SECONDS, TEMP_PREFIX, part_path, explain_os_error, is_inside, is_temp_name,
+from .fileops import (NEW_SUFFIX, OLD_SUFFIX, PARTIAL_DIR_SUFFIX, PART_SUFFIX, TEMP_IDLE_SECONDS, TEMP_PREFIX, part_path, explain_os_error, is_inside, is_temp_name,
                       rename_path, same_file)
 from .findings import SAFE_FIXES, Finding, Fix, Severity
 from .progress import UNIT_STEPS, CancelToken, ProgressFn, Reporter
@@ -412,11 +412,13 @@ def check_mac_junk(layout: DriveLayout) -> list[Finding]:
 
 #: Top-level folders ReWii writes to; a generic ``*.part`` elsewhere may be the user's own file.
 _MANAGED_TOPS = MANAGED_TOPS
-_OWN_SUFFIXES = (PART_SUFFIX, NEW_SUFFIX, ".rewii-tmp")
+_OWN_SUFFIXES = (PART_SUFFIX, NEW_SUFFIX, OLD_SUFFIX, ".rewii-tmp")
+#: Folders ReWii stages whole and renames into place (save restores, mod copies)
+_OWN_DIR_SUFFIXES = (NEW_SUFFIX, OLD_SUFFIX, PARTIAL_DIR_SUFFIX)
 
 
 def _is_leftover(rel: Path) -> bool:
-    """Is this drive-relative file one of ReWii's unfinished files that is safe to delete?"""
+    """Is this drive-relative file one of ReWii's unfinished files that is safe to clean up?"""
     low = rel.name.lower()
     if low.startswith(TEMP_PREFIX) or low.endswith(_OWN_SUFFIXES):
         return True
@@ -426,8 +428,18 @@ def _is_leftover(rel: Path) -> bool:
 
 
 def _walk_temp(root: Path) -> Iterator[Path]:
+    """ReWii's leftover files *and folders* (a leftover folder is reported as one item and
+    not looked into)."""
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in MAC_JUNK_DIRS]
+        keep = []
+        for d in dirnames:
+            if d in MAC_JUNK_DIRS:
+                continue
+            if d.lower().endswith(_OWN_DIR_SUFFIXES) and not os.path.islink(os.path.join(dirpath, d)):
+                yield Path(dirpath) / d
+                continue
+            keep.append(d)
+        dirnames[:] = keep
         for fn in filenames:
             p = Path(dirpath) / fn
             if _is_leftover(p.relative_to(root)):
@@ -435,11 +447,22 @@ def _walk_temp(root: Path) -> Iterator[Path]:
 
 
 def _idle(p: Path, now: Optional[float] = None) -> bool:
-    """Nothing has written to ``p`` for an hour, so no running copy owns it."""
+    """Nothing in ``p`` has changed for an hour, so no running copy owns it."""
+    return fileops.idle_for(p, TEMP_IDLE_SECONDS, now)
+
+
+def _size(p: Path) -> int:
     try:
-        return (now or time.time()) - p.stat().st_mtime > TEMP_IDLE_SECONDS
+        if p.is_dir() and not p.is_symlink():
+            return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+        return p.stat().st_size
     except OSError:
-        return False
+        return 0
+
+
+def _orphaned_original(p: Path) -> bool:
+    """``X.rewii-old`` whose ``X`` is gone: the only copy of something - put back, not deleted."""
+    return p.name.lower().endswith(OLD_SUFFIX) and not p.with_name(p.name[:-len(OLD_SUFFIX)]).exists()
 
 
 def check_temp_files(layout: DriveLayout) -> list[Finding]:
@@ -448,16 +471,20 @@ def check_temp_files(layout: DriveLayout) -> list[Finding]:
     if not found:
         return []
     old = [p for p in found if _idle(p)]
-    size = 0
-    for p in found:
-        try:
-            size += p.stat().st_size
-        except OSError:
-            pass
-    msg = (f"Found {len(found)} unfinished file(s) left behind by an interrupted copy "
-           f"({human_size(size)}). They aren't usable and only take up space.")
-    if old:
-        msg += " ReWii can delete them."
+    rescue = [p for p in old if _orphaned_original(p)]
+    size = sum(_size(p) for p in found if not _orphaned_original(p))
+    junk = len(found) - len(rescue)
+    parts = []
+    if junk:
+        parts.append(f"Found {junk} unfinished file(s) or folder(s) left behind by an interrupted "
+                     f"copy ({human_size(size)}). They aren't usable and only take up space.")
+    if rescue:
+        parts.append(f"{len(rescue)} item(s) were moved aside by an update that didn't finish "
+                     f"({', '.join(p.name[:-len(OLD_SUFFIX)] for p in rescue[:3])}"
+                     f"{'…' if len(rescue) > 3 else ''}); ReWii can put them back.")
+    msg = " ".join(parts)
+    if len(old) > len(rescue):
+        msg += " ReWii can delete the unfinished ones."
     if len(old) < len(found):
         msg += (f" {len(found) - len(old)} of them changed less than an hour ago and may belong to "
                 "a copy that is still running, so those are left alone for now - check again later.")
@@ -468,10 +495,8 @@ def check_temp_files(layout: DriveLayout) -> list[Finding]:
 
 def check_writable(layout: DriveLayout) -> list[Finding]:
     """A drive mounted read-only (lock switch, or the computer found errors on it)."""
-    ro = False
     try:
-        if hasattr(os, "statvfs"):
-            ro = bool(os.statvfs(layout.root).f_flag & getattr(os, "ST_RDONLY", 1))
+        ro = bool(fileops.volume_read_only(layout.root))
         if not ro and layout.root.is_dir():
             ro = not os.access(layout.root, os.W_OK)
     except OSError:
@@ -557,13 +582,13 @@ def _move_game(src: Path, dest: Path, rep: Reporter) -> list[str]:
     return done
 
 
-def _game_dest(layout: DriveLayout, src: Path, info: DiscInfo) -> Path:
+def _game_dest(layout: DriveLayout, src: Path, info: DiscInfo, title: str) -> Path:
     ext = src.suffix.lower()
     if info.is_wii:
         folder = src.parent
         if folder.parent == layout.wbfs and id_from_folder(folder.name) == info.game_id:
             return folder / f"{info.game_id}{ext}"
-        return layout.wii_game_file(info.title, info.game_id, ext)
+        return layout.wii_game_file(title, info.game_id, ext)
     folder = src.parent
     name = ("game" if info.disc_number == 0 else f"disc{info.disc_number + 1}") + ext
     if folder.parent == layout.gc_games and id_from_folder(folder.name) == info.game_id:
@@ -573,15 +598,37 @@ def _game_dest(layout: DriveLayout, src: Path, info: DiscInfo) -> Path:
         for d in _subdirs(layout.gc_games):
             if id_from_folder(d.name) == info.game_id:
                 return d / name
-    return layout.gc_game_file(info.title, info.game_id, info.disc_number, ext)
+    return layout.gc_game_file(title, info.game_id, info.disc_number, ext)
+
+
+@dataclass
+class FixContext:
+    """What a fix may need beyond the finding itself."""
+    #: game ID -> proper title (GameTDB). Without it, games moved into a new folder are
+    #: named after the title stored on the disc, which is often an internal code name.
+    lookup: Optional[Callable[[str], Optional[str]]] = None
+
+    def title(self, game_id: str, disc_title: str) -> str:
+        if self.lookup is not None:
+            try:
+                t = self.lookup(game_id)
+            except Exception:       # a broken title database must not break a fix
+                t = None
+            if t:
+                return t
+        return disc_title
 
 
 def fix(layout: DriveLayout, finding: Finding, progress: Optional[ProgressFn] = None,
-        cancel: Optional[CancelToken] = None) -> list[str]:
+        cancel: Optional[CancelToken] = None, *,
+        lookup: Optional[Callable[[str], Optional[str]]] = None) -> list[str]:
     """Apply the safe fix for ``finding`` and return a log of what was done.
 
+    ``lookup`` (game ID -> title) names new game folders like adding a game does.
+
     Raises :class:`FixError` if the finding has no safe fix or the fix would
-    overwrite something. Never deletes user data except macOS junk files.
+    overwrite something. Never deletes user data: only macOS junk files and ReWii's
+    own unfinished copies (a moved-aside original whose copy never arrived is put back).
     """
     rep = Reporter(progress, cancel)
     fixer = FIXERS.get(finding.fix_id or "")
@@ -594,10 +641,10 @@ def fix(layout: DriveLayout, finding: Finding, progress: Optional[ProgressFn] = 
         raise FixError("That finding belongs to a different drive. Check the drive again.")
     if p is None and finding.fix_id not in _WHOLE_DRIVE_FIXES:
         raise FixError("This finding doesn't say which file to fix.")
-    return fixer(layout, finding, rep)
+    return fixer(layout, finding, rep, FixContext(lookup))
 
 
-def _fix_mac_junk(layout: DriveLayout, finding: Finding, rep: Reporter) -> list[str]:
+def _fix_mac_junk(layout: DriveLayout, finding: Finding, rep: Reporter, ctx: FixContext) -> list[str]:
     paths = [Path(x) for x in finding.data.get("paths", [])] or list(_walk_junk(layout.root))
     rep.set_total(len(paths), "Deleting macOS junk files", unit=UNIT_STEPS)
     deleted: list[str] = []
@@ -617,26 +664,27 @@ def _fix_mac_junk(layout: DriveLayout, finding: Finding, rep: Reporter) -> list[
     return deleted
 
 
-def _fix_temp_files(layout: DriveLayout, finding: Finding, rep: Reporter) -> list[str]:
-    # look again instead of trusting the finding: only ReWii's own temp names, only files,
-    # and only ones nothing has written to for an hour (a running copy is never touched)
-    rep.note("Deleting unfinished files")
-    removed: list[str] = []
-    for tp in _walk_temp(layout.root):
+def _fix_temp_files(layout: DriveLayout, finding: Finding, rep: Reporter, ctx: FixContext) -> list[str]:
+    # look again instead of trusting the finding: only ReWii's own temp names, and only
+    # ones nothing has written to for an hour (a running copy is never touched)
+    rep.note("Cleaning up after interrupted copies")
+    done: list[str] = []
+    for tp in list(_walk_temp(layout.root)):
         rep.check()
-        if tp.is_symlink() or not tp.is_file() or not _idle(tp):
+        if tp.is_symlink() or not _idle(tp):
             continue
         try:
-            tp.unlink()
-            removed.append(f"Deleted {tp}")
+            what = fileops.settle_leftover(tp)
+            if what:
+                done.append(f"{what} ({tp.parent})")
             if _is_game_folder(layout, tp.parent):      # "Title [ID]" with nothing else in it
                 _rmdir_if_empty(tp.parent)
         except OSError as e:
-            removed.append(f"{NOT_FIXED} {tp.name}: {explain_os_error(e, layout.root)}")
-    return removed
+            done.append(f"{NOT_FIXED} {tp.name}: {explain_os_error(e, layout.root)}")
+    return done
 
 
-def _fix_nested_apps(layout: DriveLayout, finding: Finding, rep: Reporter) -> list[str]:
+def _fix_nested_apps(layout: DriveLayout, finding: Finding, rep: Reporter, ctx: FixContext) -> list[str]:
     p = finding.path
     assert p is not None
     rep.note("Moving apps to the right folder")
@@ -651,7 +699,7 @@ def _fix_nested_apps(layout: DriveLayout, finding: Finding, rep: Reporter) -> li
     return done
 
 
-def _fix_app_folder(layout: DriveLayout, finding: Finding, rep: Reporter) -> list[str]:
+def _fix_app_folder(layout: DriveLayout, finding: Finding, rep: Reporter, ctx: FixContext) -> list[str]:
     p = finding.path
     assert p is not None
     rep.note("Moving app up one folder")
@@ -671,18 +719,19 @@ def _fix_app_folder(layout: DriveLayout, finding: Finding, rep: Reporter) -> lis
     return done
 
 
-def _fix_move_game(layout: DriveLayout, finding: Finding, rep: Reporter) -> list[str]:
+def _fix_move_game(layout: DriveLayout, finding: Finding, rep: Reporter, ctx: FixContext) -> list[str]:
     p = finding.path
     assert p is not None
     try:
         info = disc_info(p)
     except (DiscError, OSError) as e:
         raise FixError(f"Couldn't read {p.name}: {e}") from e
-    rep.note(f"Moving {info.title}")
-    return _move_game(p, _game_dest(layout, p, info), rep)
+    title = ctx.title(info.game_id, info.title)
+    rep.note(f"Moving {title}")
+    return _move_game(p, _game_dest(layout, p, info, title), rep)
 
 
-def _fix_split_file(layout: DriveLayout, finding: Finding, rep: Reporter) -> list[str]:
+def _fix_split_file(layout: DriveLayout, finding: Finding, rep: Reporter, ctx: FixContext) -> list[str]:
     p = finding.path
     assert p is not None
     if p.suffix.lower() != ".wbfs":
@@ -692,7 +741,7 @@ def _fix_split_file(layout: DriveLayout, finding: Finding, rep: Reporter) -> lis
 
 
 #: What :func:`fix` runs for each safe fix (the keys are exactly :data:`SAFE_FIXES`).
-FIXERS: dict[str, Callable[[DriveLayout, Finding, Reporter], list[str]]] = {
+FIXERS: dict[str, Callable[[DriveLayout, Finding, Reporter, FixContext], list[str]]] = {
     Fix.DELETE_MAC_JUNK: _fix_mac_junk,
     Fix.DELETE_TEMP_FILES: _fix_temp_files,
     Fix.FLATTEN_NESTED_APPS: _fix_nested_apps,
