@@ -10,6 +10,7 @@ from rewii.core.drives import Drive, Volume
 from rewii.core.fat32 import MAX_SIZE, PART_START_LBA, parse_boot_sector, parse_mbr
 from rewii.core.formatting import (FormatRefused, execute_plan, helper_args, plan_format,
                                    relaunch_elevated_command)
+from rewii.core.fileops import make_sparse
 
 GiB = 1024 ** 3
 
@@ -92,6 +93,7 @@ def test_small_drive_cluster_warning():
 def image_drive(tmp_path, size=256 * 1024 ** 2) -> Drive:
     img = tmp_path / "usb.img"
     with open(img, "wb") as f:
+        make_sparse(f)
         f.truncate(size)
     return Drive(id="image:usb", device=str(img), size=size, removable=True, is_usb=True)
 

@@ -12,8 +12,8 @@ import hashlib
 import struct
 from pathlib import Path
 
-from .disc import (GC_MAGIC, WII_MAGIC, WII_SECTOR, WII_SECTOR_DATA, WII_SL_SIZE,
-                   aes_cbc_encrypt, common_key)
+from .fileops import make_sparse
+from .disc import (GC_MAGIC, WII_MAGIC, WII_SECTOR, WII_SECTOR_DATA, aes_cbc_encrypt, common_key)
 
 PART_OFF = 0x50000
 DATA_REL = 0x20000            # data area offset inside the partition
@@ -80,9 +80,10 @@ GAME_OFF_RETAIL = 0xF800000    # where retail discs put the game partition
 
 def make_wii_iso(path: Path, game_id: str = "RTST01", title: str = "TEST GAME",
                  files: dict[str, bytes] | None = None, update_partition: bool = False,
-                 retail_layout: bool = False, logical_size: int = WII_SL_SIZE) -> Path:
+                 retail_layout: bool = False, logical_size: int | None = None) -> Path:
     """``update_partition``: a tiny empty update partition after the game.
-    ``logical_size``: how long the (sparse) file is - a real single-layer disc by default.
+    ``logical_size``: how long the (sparse) file is. Default: just past the last
+    partition (a trimmed image, a few MB) - pass ``WII_SL_SIZE`` for a full-size disc.
     ``retail_layout``: like a real disc - an update partition WITH files at 0x50000
     (the same 2 MiB WBFS block as the disc header) and the game at 0xF800000."""
     files = files if files is not None else {"opening.bnr": imet_banner(), "data.bin": b"\x5A" * 70000}
@@ -105,7 +106,11 @@ def make_wii_iso(path: Path, game_id: str = "RTST01", title: str = "TEST GAME",
         parts = [(PART_OFF, 0, game_fs, game_n)]
         if update_partition:
             parts.append((PART_OFF + DATA_REL + game_n * WII_SECTOR + 0x8000, 1, bytes(WII_SECTOR_DATA), 1))
+    if logical_size is None:
+        end = max(off + DATA_REL + n * WII_SECTOR for off, _t, _fs, n in parts)
+        logical_size = (end + (2 << 20) - 1) // (2 << 20) * (2 << 20)
     with open(path, "wb") as f:
+        make_sparse(f)
         f.truncate(logical_size)
         f.seek(0)
         f.write(_header(game_id, title, True))
@@ -147,6 +152,7 @@ def make_gc_iso(path: Path, game_id: str = "GTST01", title: str = "GC TEST", dis
     fs[0:0x400] = _header(game_id, title, False, disc)[:0x400]
     with open(path, "wb") as f:
         f.write(fs)
+        make_sparse(f)
         f.truncate(max(size, len(fs)))
     return Path(path)
 
