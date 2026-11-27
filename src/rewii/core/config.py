@@ -58,6 +58,8 @@ class Settings:
     # console profile; only needed for system-level features (NUS, themes, NAND)
     console_type: str = ""          # "" = not set yet; see CONSOLE_TYPES
     console_region: str = ""        # see REGIONS
+    # a Korean console changed to another region: system updates would brick it (Error 003)
+    korean_region_changed: bool = False
     # games
     scrub_games: bool = True        # drop unused sectors + update partition
     # channels (forwarders): "cover" shows the cover art while loading, "black" is a blank screen

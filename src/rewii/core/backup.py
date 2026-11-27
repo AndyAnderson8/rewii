@@ -10,13 +10,12 @@ Nothing on a target drive is deleted unless ``mirror=True`` is passed.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Optional
 from collections.abc import Iterable
 

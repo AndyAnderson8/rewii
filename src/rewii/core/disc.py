@@ -636,7 +636,8 @@ def wii_usage_table(d: DiscReader, include_update: bool = False) -> list[bool]:
         n_clusters = (p.data_size + WII_SECTOR - 1) // WII_SECTOR
         extents: list[tuple[int, int]] = []
 
-        def add(o: int, s: int) -> None:
+        def add(o: int, s: int, n_clusters: int = n_clusters,
+                extents: list[tuple[int, int]] = extents) -> None:
             if s <= 0:
                 return
             c0 = o // WII_SECTOR_DATA

@@ -28,6 +28,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --all-groups
+      - run: uvx ruff check src tests
+      - run: uvx mypy src/rewii
       - run: uv run pytest -q
       - run: uv run pyinstaller packaging/rewii.spec --noconfirm --distpath dist --workpath build/pyi
       - name: Smoke test

@@ -590,7 +590,9 @@ def add_to_library(settings: Settings, src: Path, *, move: bool = False, scrub: 
 def copy_to_library(settings: Settings, game: Game, lookup: TitleLookup | None = None,
                     progress: ProgressFn | None = None, cancel: CancelToken | None = None) -> Game:
     """Back a drive game up into the PC library (joins split files)."""
-    return add_to_library(settings, game.path, move=False, scrub=False, lookup=lookup,
+    # scrubbing here only skips sectors the game doesn't use; without it a plain
+    # ISO on the drive would be written out at its full 4.7 GB
+    return add_to_library(settings, game.path, move=False, scrub=settings.scrub_games, lookup=lookup,
                           progress=progress, cancel=cancel)
 
 
@@ -712,7 +714,7 @@ def migrate_wbfs_partition(source: Path, layout: DriveLayout | None = None,
             title = _title(lookup, pg.game_id, pg.title)
             rep.note(f"[{i}/{len(todo)}] {title}")
             need = pg.size + (2 << 20) + 64 * 1024 * 1024
-            jobs = []
+            jobs: list[tuple[str, Path, Path, Path, int | None]] = []
             if layout is not None and pg.game_id not in on_drive:
                 jobs.append(("drive", layout.root, layout.wii_game_file(title, pg.game_id),
                              layout.wbfs / f"{TMP_PREFIX}{pg.game_id}.wbfs", FAT32_SPLIT))

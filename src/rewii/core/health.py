@@ -190,10 +190,10 @@ def check_apps(layout: DriveLayout) -> list[Finding]:
             continue
         # loader data (covers, banner cache, settings) saved before the app itself is installed
         try:
-            names = {c.name.lower() for c in app.iterdir()}
+            child_names = {c.name.lower() for c in app.iterdir()}
         except OSError:
-            names = set()
-        if names and names <= data_only:
+            child_names = set()
+        if child_names and child_names <= data_only:
             continue
         present.add(app.name.lower())
         inner_apps = _ci_child(app, "apps")
@@ -215,7 +215,7 @@ def check_apps(layout: DriveLayout) -> list[Finding]:
                            f"apps/{app.name} has no boot.dol or boot.elf, so it won't start. "
                            "Reinstall the app.", None, app))
     if nested is not None and nested.is_dir():
-        present.update(s.name.lower() for s in _subdirs(nested))
+        present.update(sub.name.lower() for sub in _subdirs(nested))
     missing = [(k, name, ess) for k, (name, ess) in STARTER_APPS.items() if k not in present]
     if missing:
         essential = any(ess for _k, _n, ess in missing)
