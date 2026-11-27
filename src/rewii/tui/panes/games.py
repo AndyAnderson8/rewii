@@ -319,7 +319,7 @@ class GamesPane(Pane):
         stage = layout is not None and await self.confirm(
             "Channels", f"Make {len(rows)} channel(s)."
             + (f"\nWii games: launch screen '{s.forwarder_style}'." if n_gc < len(rows) else "")
-            + (f"\nGameCube games start straight in Nintendont." if n_gc else "")
+            + ("\nGameCube games start straight in Nintendont." if n_gc else "")
             + "\n\nAlso put them in the drive's wad/ folder so you can install them with YAWMME?",
             yes="Yes", no="Just save on PC")
 

@@ -7,7 +7,8 @@ import sys
 import threading
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Optional
+from collections.abc import Callable, Iterable
 
 from textual import on
 from textual.app import ComposeResult
@@ -231,9 +232,7 @@ class _FilteredTree(DirectoryTree):
             if p.name.startswith("."):
                 continue
             try:
-                if p.is_dir():
-                    out.append(p)
-                elif not self.dirs_only and (not self.exts or p.suffix.lower() in self.exts):
+                if p.is_dir() or not self.dirs_only and (not self.exts or p.suffix.lower() in self.exts):
                     out.append(p)
             except OSError:
                 pass

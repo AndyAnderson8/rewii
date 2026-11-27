@@ -17,7 +17,8 @@ import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Optional
+from collections.abc import Iterator
 
 from .disc import FAT32_SPLIT, DiscError, DiscInfo, NeedsConversion, disc_info, split_parts
 from .drives import EXFAT, FAT16, FAT32, NTFS, UNKNOWN, WBFS, Drive, human_size

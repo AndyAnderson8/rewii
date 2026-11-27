@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Optional
+from collections.abc import Callable
 
 
 class Cancelled(Exception):

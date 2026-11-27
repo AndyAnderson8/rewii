@@ -12,13 +12,14 @@ import struct
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Optional
+from collections.abc import Callable, Iterable
 
 from .config import Settings
-from .disc import (FAT32_SPLIT, WII_SECTOR, WII_SECTOR_DATA, DiscError, DiscInfo, NeedsConversion,
-                   aes_cbc_decrypt, disc_info, open_disc, parse_header, region_of, sniff_format,
+from .disc import (FAT32_SPLIT, WII_SECTOR, DiscError, NeedsConversion,
+                   aes_cbc_decrypt, open_disc, parse_header, region_of, sniff_format,
                    split_parts, used_sectors, wii_partitions)
-from .layout import DriveLayout, game_folder_name, id_from_folder, safe_name
+from .layout import DriveLayout, game_folder_name, id_from_folder
 from .progress import CancelToken, ProgressFn, Reporter
 from .wbfs import WbfsPartition, copy_file, write_iso, write_wbfs
 

@@ -6,7 +6,7 @@ Exploiting/installing the Homebrew Channel is out of scope.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass

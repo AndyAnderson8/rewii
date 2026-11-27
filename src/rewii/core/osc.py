@@ -16,7 +16,8 @@ import shutil
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Optional
+from collections.abc import Iterable, Sequence
 from xml.etree import ElementTree as ET
 
 from . import config, net
@@ -64,7 +65,7 @@ class App:
     downloads: int = 0
 
     @classmethod
-    def from_api(cls, d: dict[str, Any]) -> "App":
+    def from_api(cls, d: dict[str, Any]) -> App:
         assets = d.get("assets") or {}
         archive = assets.get("archive") or {}
         desc = d.get("description") or {}

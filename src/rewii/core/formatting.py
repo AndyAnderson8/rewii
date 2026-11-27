@@ -38,7 +38,8 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Optional
+from collections.abc import Callable, Sequence
 
 from .drives import Drive, human_size, list_drives
 from .fat32 import MAX_SIZE, Fat32Error, FormatResult, format_fat32, normalize_label, plan_fat32

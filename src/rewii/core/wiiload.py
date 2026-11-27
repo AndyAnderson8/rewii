@@ -21,7 +21,8 @@ import struct
 import zipfile
 import zlib
 from pathlib import Path, PurePosixPath
-from typing import Optional, Sequence
+from typing import Optional
+from collections.abc import Sequence
 
 from .progress import CancelToken, ProgressFn, Reporter
 
@@ -121,7 +122,7 @@ def send(host: str, path: Path | str, args: Sequence[str] = (),
                 s.shutdown(socket.SHUT_WR)
             except OSError:
                 pass
-    except socket.timeout as e:
+    except TimeoutError as e:
         raise WiiloadError(f"Timed out talking to {host}:{port}. Is the Homebrew Channel open?") from e
     except OSError as e:
         raise WiiloadError(f"Could not send to {host}:{port}: {e}") from e
