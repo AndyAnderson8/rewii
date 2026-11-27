@@ -30,7 +30,7 @@ An SD card is only needed for BootMii (NAND restore) and the Wii Menu's own Data
 
 ## Getting it
 
-Download the file for your computer from Releases and run it. There's nothing to install.
+Download the file for your computer from the [latest release](https://github.com/AndyAnderson8/rewii/releases) and run it. There's nothing to install. Releases are listed in [CHANGELOG.md](CHANGELOG.md); how branches and releases work is in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 | OS | File |
 |---|---|
