@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import socket
 from pathlib import Path
 
 import pytest
@@ -32,10 +31,8 @@ def _isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(ReWiiApp, "check_update", lambda self: None)
     monkeypatch.setattr(osc, "fetch_index", lambda refresh=False: [])
     monkeypatch.setattr(DR, "list_drives", lambda *a, **k: [])
-
-    def no_net(self, *a, **k):
-        raise OSError("network is blocked in tests")
-    monkeypatch.setattr(socket.socket, "connect", no_net)
+    # the network is blocked for every test in conftest.py (sockets themselves must keep
+    # working: on Windows the event loop needs a loopback socket pair)
 
 
 def make_app(tmp_path: Path, drive: bool = True, **settings) -> ReWiiApp:

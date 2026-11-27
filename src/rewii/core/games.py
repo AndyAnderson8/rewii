@@ -23,7 +23,7 @@ from .disc import (FAT32_SPLIT, GC_DRIVE_EXTS, INCOMPLETE, LIBRARY_EXTS, WII_DRI
                    open_disc, parse_header, region_of, sniff_format, split_parts, used_sectors,
                    wii_partitions, wii_usage_table)
 from .fileops import (TEMP_PREFIX as TMP_PREFIX, DriveNotConnected, explain_os_error, is_temp_name,
-                      remove_quietly, rename_path, same_file)
+                      remove_quietly, rename_path, same_file, same_spelling)
 from .ids import is_disc_id, platform_guess
 from .layout import DriveLayout, game_folder_name, id_from_folder
 from .progress import UNIT_STEPS, CancelToken, ProgressFn, Reporter
@@ -524,7 +524,7 @@ def _is_own_folder(folder: Path, container: Path, game: Game) -> bool:
 
 
 def _rename_folder(folder: Path, new: Path) -> None:
-    if new == folder:
+    if same_spelling(new, folder):
         return
     if new.exists() and not _same_file(folder, new):       # same file = case-only rename
         raise GameError("a folder with that name already exists")
@@ -871,7 +871,7 @@ def rename_library_game(settings: Settings, game: Game, new_title: str) -> Game:
     files = game.files or [game.path]
     if game.is_wii:
         path = game.path.with_name(f"{game_folder_name(new_title, game.game_id)}{game.path.suffix}")
-        if path != game.path:
+        if not same_spelling(path, game.path):
             _move_files(files, path)
     else:
         folder = game.path.parent

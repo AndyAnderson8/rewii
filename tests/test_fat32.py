@@ -131,7 +131,8 @@ def test_format_image_parses_back(tmp_path, size):
     res = format_fat32(img, size, label="ReWii", progress=events.append,
                        volume_id=0x12345678, disk_signature=0xCAFEBABE)
     assert img.stat().st_size == size
-    assert img.stat().st_blocks * 512 < 64 * MiB      # stayed sparse
+    if hasattr(img.stat(), "st_blocks"):
+        assert img.stat().st_blocks * 512 < 64 * MiB      # stayed sparse
     parts, info, fat, rest = read_back(img)
     assert parts == [(0x0C, PART_START_LBA, res.geometry.partition_sectors)]
     assert info.filesystem == "FAT32"

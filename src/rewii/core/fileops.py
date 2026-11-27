@@ -112,6 +112,14 @@ def same_file(a: Path, b: Path) -> bool:
         return False
 
 
+def same_spelling(a: Path, b: Path) -> bool:
+    """True if two paths are written identically, upper/lower case included.
+
+    ``Path("a.ISO") == Path("a.iso")`` is True on Windows, so ``==`` can't be used to
+    decide whether a rename is needed."""
+    return str(a) == str(b)
+
+
 def rename_path(src: Path, dst: Path) -> None:
     """Rename/move a file or folder to ``dst``, never replacing something else.
 
@@ -122,12 +130,12 @@ def rename_path(src: Path, dst: Path) -> None:
     * Otherwise a plain move (also across filesystems).
     """
     src, dst = Path(src), Path(dst)
-    if src == dst:
+    if same_spelling(src, dst):
         return
     if dst.exists() and not same_file(src, dst):
         raise FileExistsError(errno.EEXIST, "already exists", str(dst))
     if src.name != dst.name and src.name.casefold() == dst.name.casefold() \
-            and (src.parent == dst.parent or same_file(src.parent, dst.parent)):
+            and (same_spelling(src.parent, dst.parent) or same_file(src.parent, dst.parent)):
         # not a temp name: if the computer dies between the two renames, the game/folder is
         # still listed (as misplaced) under this name instead of being hidden or cleaned up
         tmp = src.with_name(f"{src.stem}.rewii-mv{src.suffix}")
