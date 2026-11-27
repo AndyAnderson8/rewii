@@ -72,6 +72,7 @@ class SettingsPane(Pane):
                              prompt="Not set", id="region")
             with Horizontal(classes="toolbar"):
                 yield Button("Save", id="save", variant="primary")
+                yield Button("USB Loader GX settings on the drive…", id="gx")
 
     @work(exclusive=True, group="settings")
     async def _browse(self) -> None:
@@ -82,6 +83,32 @@ class SettingsPane(Pane):
     @on(Button.Pressed, "#browse")
     def _b(self) -> None:
         self._browse()
+
+    @on(Button.Pressed, "#gx")
+    def _gx(self) -> None:
+        self._gx_edit()
+
+    @work(exclusive=True, group="settings")
+    async def _gx_edit(self) -> None:
+        if not self.need_drive():
+            return
+        from ...core import online
+        from ..widgets import ChoiceForm
+        cur = online.read_gx_config(self.layout_)
+        fields = []
+        for key, opt in online.GX_OPTIONS.items():
+            if not opt.choices or key == "PrivateServer":
+                continue
+            fields.append((key, opt.label, [(t, v) for v, t in opt.choices.items()], cur.get(key, opt.default)))
+        res = await self.app.push_screen_wait(ChoiceForm(
+            "USB Loader GX settings", "Saved into apps/usbloader_gx/GXGlobal.cfg on the drive. "
+            "Everything else can be changed in USB Loader GX itself.", fields))
+        if res:
+            try:
+                online.write_gx_config(self.layout_, res)
+                self.app.notify("USB Loader GX settings saved")
+            except Exception as e:
+                self.app.notify(f"Couldn't save: {e}", severity="error")
 
     @on(Button.Pressed, "#save")
     def _save(self) -> None:

@@ -167,6 +167,36 @@ https://wiilink.ca.
 GameCube discs can't be ripped on a Wii mini, Family Edition or Wii U.
 """, prepare="cleanrip", link="https://wii.hacks.guide/dump-games"),
     Guide(
+        "update-hbc", "Update the Homebrew Channel / BootMii",
+        "Reinstall or update the Homebrew Channel, or install BootMii.",
+        """\
+The Homebrew Channel and BootMii are installed by the **HackMii installer**.
+
+**Prepare:** ReWii downloads the official HackMii installer (from bootmii.org) to
+apps/hackmii_installer on the drive.
+
+On the Wii:
+1. Homebrew Channel → **HackMii Installer**. Wait for the scam warning, then press 1.
+2. Choose **Install the Homebrew Channel** to update it (it keeps your apps), then Yes.
+3. Optional: **BootMii** → *Install BootMii as IOS* (as boot2 if offered). BootMii itself runs
+   from an **SD card** - copy the `bootmii` folder from your NAND backup's rescue kit to one.
+4. Choose **Exit**.
+""", prepare="hackmii", link="https://wii.hacks.guide/hackmii"),
+    Guide(
+        "priiloader-hacks", "Priiloader hacks (patches)",
+        "Keep Priiloader's hack list current, or add a patch such as the Wii U clock fix.",
+        """\
+Priiloader's *System Menu Hacks* come from **hacks_hash.ini** in apps/priiloader on the drive.
+
+- **Update hack list:** System → *Priiloader hacks* → *Update* downloads the newest official list
+  (patches you added are kept).
+- **Add a patch:** paste the text from a patch generator - for example the Wii U (vWii) clock fix
+  from https://garyodernichts.github.io/priiloader-patch-gen - and ReWii checks and adds it.
+
+Then on the Wii: hold RESET while turning it on → Priiloader → **System Menu Hacks** → turn the
+hack on → **Save settings**.
+""", prepare="priiloader-hacks", link="https://wii.hacks.guide/priiloader"),
+    Guide(
         "recovery", "If something goes wrong",
         "What to do if the Wii won't start normally.",
         """\

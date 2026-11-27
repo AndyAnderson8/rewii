@@ -201,6 +201,17 @@ The decisions from the second review were applied: **build everything** (no MVP 
 
 **Added after the first build:** GameCube game channels. Each one embeds Nintendont with an injected autoboot config, gets AHB access and IOS58 through its TMD, and uses a banner built from USB Loader GX's GameCube template.
 
+**Added in the third round:**
+- GPL-3.0-or-later license
+- Cheat picker (writes `codes/<ID>.gct`; GameCube channels use it)
+- Rename for drive and library games
+- HackMii installer staging to update the Homebrew Channel and BootMii
+- Priiloader hack list updates and custom patches
+- `bootmii.ini` editor
+- USB Loader GX settings editor
+- Wii mini d2xl cIOS installer
+- ReWii update check (dormant until a GitHub repo is set in `sysfiles.UPDATE_REPO`)
+
 **Untested on real hardware:**
 - GameCube channels on an actual Wii.
 - The launch-screen styles on an actual Wii. Cover and black are DOL patches; classic is byte-identical to the old make_wad.py output.

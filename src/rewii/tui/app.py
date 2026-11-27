@@ -82,6 +82,7 @@ class ReWiiApp(App):
     def on_mount(self) -> None:
         self._update_subtitle()
         self.load_titles()
+        self.check_update()
         self.query_one("#home").reload()
         if not self.settings.first_run_done:
             self.call_after_refresh(self.query_one("#home").first_run)  # type: ignore[attr-defined]
@@ -129,6 +130,16 @@ class ReWiiApp(App):
             db = None
         with self._titles_lock:
             self._titles = db
+
+    @work(thread=True, exclusive=True, group="update")
+    def check_update(self) -> None:
+        try:
+            from ..core.sysfiles import check_for_update
+            info = check_for_update(__version__)
+        except Exception:
+            return
+        if info and info.newer:
+            self.call_from_thread(self.notify, f"ReWii {info.latest} is available: {info.url}", timeout=15)
 
     def title_lookup(self, game_id: str) -> Optional[str]:
         db = self._titles

@@ -522,3 +522,28 @@ def migrate_wbfs_partition(source: Path, layout: DriveLayout | None = None,
     finally:
         part.close()
     return out
+
+
+def rename_library_game(settings: Settings, game: Game, new_title: str) -> Game:
+    """Rename a library game's file (Wii) or folder (GameCube)."""
+    if game.location != "library":
+        raise GameError("not a library game")
+    if game.is_wii:
+        new = game.path.with_name(f"{game_folder_name(new_title, game.game_id)}{game.path.suffix}")
+        if new != game.path:
+            if new.exists():
+                raise GameError("a file with that name already exists")
+            game.path.rename(new)
+        path = new
+    else:
+        folder = game.path.parent
+        new = folder.with_name(game_folder_name(new_title, game.game_id))
+        if new != folder:
+            if new.exists():
+                raise GameError("a folder with that name already exists")
+            folder.rename(new)
+        path = new / game.path.name
+    g = identify(path, None, "library")
+    assert g
+    g.title = new_title
+    return g

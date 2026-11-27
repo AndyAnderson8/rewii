@@ -3,6 +3,8 @@ name = "rewii"
 version = "0.1.0"
 description = "All-in-one toolkit for softmodded Wiis: games, channels, homebrew, saves, backups."
 readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE", "NOTICE.md"]
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.1",

@@ -87,7 +87,8 @@ def get_nintendont_dol(drive_root: Path | None = None, allow_download: bool = Tr
                             "Nintendont on the drive from the Homebrew section")
 
 
-def build_nin_cfg(game_path: str, game_id: str, base: bytes | None = None) -> bytes:
+def build_nin_cfg(game_path: str, game_id: str, base: bytes | None = None,
+                  cheat_path: str | None = None) -> bytes:
     """NIN_CFG for autobooting ``game_path`` (path on the USB drive without 'usb:',
     e.g. '/games/Title [GKYE01]/game.iso'). Settings are inherited from ``base``
     (the drive's nincfg.bin) when given."""
@@ -101,6 +102,11 @@ def build_nin_cfg(game_path: str, game_id: str, base: bytes | None = None) -> by
         mcblocks, vscale, voffset = base[540], base[541], base[542]
         config &= ~(CFG_CHEATS | CFG_CHEAT_PATH)      # cheat path is per game; not carried over
     config |= CFG_AUTO_BOOT | CFG_USB
+    if cheat_path:
+        if len(cheat_path.encode()) >= 255:
+            raise ForwarderError("cheat path is too long for Nintendont")
+        config |= CFG_CHEATS | CFG_CHEAT_PATH
+        cfg[275:275 + len(cheat_path.encode())] = cheat_path.encode()
     struct.pack_into(">IIIII", cfg, 0, NIN_MAGIC, NIN_CFG_VERSION, config, video, lang)
     p = game_path.encode()
     cfg[20:20 + len(p)] = p
@@ -110,8 +116,9 @@ def build_nin_cfg(game_path: str, game_id: str, base: bytes | None = None) -> by
     return bytes(cfg)
 
 
-def build_gc_dol(nintendont: bytes, game_path: str, game_id: str, base_cfg: bytes | None = None) -> bytes:
-    cfg = build_nin_cfg(game_path, game_id, base_cfg)
+def build_gc_dol(nintendont: bytes, game_path: str, game_id: str, base_cfg: bytes | None = None,
+                 cheat_path: str | None = None) -> bytes:
+    cfg = build_nin_cfg(game_path, game_id, base_cfg, cheat_path)
     return add_argv(nintendont, [NIN_APP_DIR.encode(), cfg])
 
 
@@ -419,7 +426,8 @@ def make_gc_channel(game_path: Path, drive_root: Path, out_dir: Path, *, title: 
     if p.is_file():
         base_cfg = p.read_bytes()
     nin = nintendont or get_nintendont_dol(drive_root)
-    dol = build_gc_dol(nin, rel, gid, base_cfg)
+    gct = drive_root / "codes" / f"{gid}.gct"
+    dol = build_gc_dol(nin, rel, gid, base_cfg, f"/codes/{gid}.gct" if gct.is_file() else None)
     banner = build_gc_banner(title, gb, publisher=publisher, year=year, game_id=gid, synopsis=synopsis,
                              cover_png=cover_png)
     wad = build_gc_wad(banner, dol, gid)
