@@ -62,3 +62,17 @@ def local_patch():
     mp = pytest.MonkeyPatch()
     yield mp
     mp.undo()
+
+
+@pytest.fixture(autouse=True)
+def _disk_guard(tmp_path, request):
+    """Stop the run with a clear message if one test eats the disk (a non-sparse image
+    on a small CI disk), instead of letting the machine die without a log."""
+    import shutil as _sh
+    before = _sh.disk_usage(tmp_path).free
+    yield
+    after = _sh.disk_usage(tmp_path).free
+    used = before - after
+    if used > 3 * 1024 ** 3 or after < 2 * 1024 ** 3:
+        pytest.exit(f"{request.node.nodeid} used {used / 1e9:.1f} GB of temp space "
+                    f"({after / 1e9:.1f} GB left) - a test file is not sparse here", returncode=3)
