@@ -493,3 +493,50 @@ async def test_every_button_survives_having_no_drive(tmp_path, monkeypatch):
             await _dismiss_all(app)
             assert len(app.screen_stack) == 1 and app.is_running, key
     assert app.return_code in (None, 0)
+
+
+# --------------------------------------------------------------------------- found on a real FAT32 drive
+async def test_a_vanished_drive_is_never_recreated_by_the_app(tmp_path, monkeypatch):
+    """After the drive is unplugged, "Set up" used to re-create its folder on the
+    computer's own disk, install the apps there and report success."""
+    import shutil
+    calls: list[str] = []
+    monkeypatch.setattr(osc, "install_starter_kit", lambda *a, **k: calls.append("kit"))
+    monkeypatch.setattr(BK, "create_snapshot", lambda *a, **k: calls.append("snapshot"))
+    app = make_app(tmp_path)
+    async with app.run_test(size=SIZE, notifications=True) as pilot:
+        app.action_section("drive")
+        await settle(pilot)
+        shutil.rmtree(tmp_path / "drive")                    # unplugged
+        app.pane("drive").query_one("#setup", Button).press()
+        await settle(pilot, 10)
+        assert len(app.screen_stack) == 1                    # no "Set up the drive?" dialog at all
+        app.action_section("backups")
+        await settle(pilot)
+        app.pane("backups").query_one("#snap", Button).press()
+        await settle(pilot, 10)
+        assert len(app.screen_stack) == 1
+        notes = [n.message for n in app._notifications]
+        assert sum("isn't connected" in m for m in notes) >= 2
+        assert app.pane("games").live_layout is None and app.pane("games").need_drive() is None
+    assert calls == [] and not (tmp_path / "drive").exists()
+
+
+async def test_backups_list_newest_first_and_errors_are_plain(tmp_path):
+    import errno
+    from datetime import datetime
+    app = make_app(tmp_path)
+    (tmp_path / "drive" / "apps").mkdir()
+    (tmp_path / "drive" / "apps" / "a.txt").write_text("a")
+    for day in (1, 3, 2):
+        BK.create_snapshot(tmp_path / "drive", app.settings, "usb", now=datetime(2026, 1, day, 12, 0))
+    async with app.run_test(size=SIZE) as pilot:
+        app.action_section("backups")
+        pane = app.pane("backups")
+        await until(pilot, lambda: len(pane.snaps) == 3, "snapshots listed")
+        assert [s.created[:10] for s in pane.snaps] == ["2026-01-03", "2026-01-02", "2026-01-01"]
+        assert pane._snap().created.startswith("2026-01-03")     # the highlighted one is the newest
+        full = OSError(errno.ENOSPC, "No space left on device",
+                       str(tmp_path / "drive" / "wad" / "x.wad.rewii-part"))
+        msg = pane.explain(Wd.JobFailed(full, ""))
+        assert msg.startswith("The drive is full") and "Errno" not in msg and "rewii-part" not in msg

@@ -23,6 +23,7 @@ from xml.etree import ElementTree as ET
 
 from . import archive, config, net
 from .archive import MAX_UNCOMPRESSED
+from .fileops import explain_os_error
 from .layout import DriveLayout
 from .progress import CancelToken, ProgressEvent, ProgressFn
 
@@ -299,6 +300,7 @@ def _load_records(layout: DriveLayout) -> dict[str, dict[str, str]]:
 
 
 def _save_records(layout: DriveLayout, rec: dict[str, dict[str, str]]) -> None:
+    layout.require_root()
     layout.rewii.mkdir(parents=True, exist_ok=True)
     p = layout.rewii / RECORD_NAME
     tmp = p.with_suffix(".tmp")
@@ -536,17 +538,38 @@ def install_app(layout: DriveLayout, app: App, progress: Optional[ProgressFn] = 
     if not _plain_name(app.folder):
         raise OSCError(f"{app.name}: invalid app folder name {app.folder!r}")
     skipped: list[str] = []
-    files = extract_archive(zpath, layout.root, app.folder,
-                            _phase(progress, 0.5, 0.5, f"Installing {app.name}"), cancel,
-                            allowed=app.allowed_dirs, skipped=skipped)
-    if not any(f.name.lower() in ("boot.dol", "boot.elf") for f in files):
-        raise OSCError(f"{app.name}: the download has no boot.dol/boot.elf for apps/{app.folder}")
+    layout.require_root()
+    # folders this install creates: if it fails they must not stay behind empty
+    # (an empty apps/<name> shows up as a broken app)
+    fresh = [d for d in (layout.apps / f for f in app.app_folders) if not d.exists()]
+    try:
+        files = extract_archive(zpath, layout.root, app.folder,
+                                _phase(progress, 0.5, 0.5, f"Installing {app.name}"), cancel,
+                                allowed=app.allowed_dirs, skipped=skipped)
+        if not any(f.name.lower() in ("boot.dol", "boot.elf") for f in files):
+            raise OSCError(f"{app.name}: the download has no boot.dol/boot.elf for apps/{app.folder}")
+    except BaseException:
+        for d in fresh:
+            _prune_empty(d)
+        raise
     rec = _load_records(layout)
     for folder in app.app_folders:
         rec[folder.lower()] = {"slug": app.slug, "version": app.version,
                                "hash": app.archive_hash, "folder": folder}
     _save_records(layout, rec)
     return InstallResult(app, files, skipped)
+
+
+def _prune_empty(folder: Path) -> None:
+    """Remove ``folder`` if it holds nothing but empty folders (never any file)."""
+    try:
+        if not folder.is_dir() or any(p.is_file() or p.is_symlink() for p in folder.rglob("*")):
+            return
+        for d in sorted((p for p in folder.rglob("*") if p.is_dir()), key=lambda x: -len(x.parts)):
+            d.rmdir()
+        folder.rmdir()
+    except OSError:
+        pass
 
 
 def remove_app(layout: DriveLayout, folder: str) -> bool:
@@ -665,7 +688,21 @@ def starter_kit(platform: str = "", which: str | Iterable[str] = "essential"
     else:
         wanted = {s.lower() for s in which}
         items = [i for i in STARTER_KIT if i.slug.lower() in wanted]
-    return [i for i in items if not p or p in i.platforms]
+    if not p:
+        # console type not set: leave out what only suits one console (the cIOS
+        # installers) rather than putting both on the drive
+        return [i for i in items if i.platforms == PLATFORMS]
+    return [i for i in items if p in i.platforms]
+
+
+def console_specific_items(which: str | Iterable[str] = "essential") -> list[StarterItem]:
+    """Kit items that depend on the console type (left out until it is known)."""
+    if isinstance(which, str):
+        pool = [i for i in STARTER_KIT if which == "all" or i.essential == (which == "essential")]
+    else:
+        wanted = {s.lower() for s in which}
+        pool = [i for i in STARTER_KIT if i.slug.lower() in wanted]
+    return [i for i in pool if i.platforms != PLATFORMS]
 
 
 @dataclass
@@ -674,6 +711,7 @@ class StarterKitReport:
     unsupported: list[str] = field(default_factory=list)   # not for this console
     not_found: list[str] = field(default_factory=list)     # no longer on OSC
     failed: dict[str, str] = field(default_factory=dict)
+    needs_console: list[str] = field(default_factory=list)  # left out: console type not set
 
 
 def install_starter_kit(layout: DriveLayout, platform: str = "",
@@ -685,8 +723,11 @@ def install_starter_kit(layout: DriveLayout, platform: str = "",
     """Install the starter kit. Apps already installed at the latest version are
     skipped when ``skip_current``. One failing app doesn't stop the rest
     (cancellation does). Progress runs 0..1000 over the whole kit."""
+    layout.require_root()
     apps = list(apps) if apps is not None else fetch_index()
     report = StarterKitReport()
+    if not PLATFORM_BY_CONSOLE.get(platform, platform):
+        report.needs_console = [i.slug for i in console_specific_items(which)]
     todo: list[App] = []
     p = PLATFORM_BY_CONSOLE.get(platform, platform)
     for item in starter_kit(platform, which):
@@ -712,7 +753,9 @@ def install_starter_kit(layout: DriveLayout, platform: str = "",
                                           f"[{i + 1}/{n}] {a.name}"), cancel)
             report.installed.append(a.slug)
         except (net.NetError, OSCError, OSError) as e:
-            report.failed[a.slug] = str(e)
+            report.failed[a.slug] = explain_os_error(e, layout.root)
+            if not layout.connected():        # every other app would fail the same way
+                break
     if progress is not None:
         progress(ProgressEvent(1000, 1000, "Starter kit done"))
     return report

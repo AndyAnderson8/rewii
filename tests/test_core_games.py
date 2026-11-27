@@ -27,6 +27,7 @@ def wii(tmp_path):
 @pytest.fixture
 def lay(tmp_path):
     l = DriveLayout(tmp_path / "drive")
+    l.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     l.ensure_dirs()
     return l
 

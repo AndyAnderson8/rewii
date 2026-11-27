@@ -33,7 +33,7 @@ from typing import Optional
 
 from .config import Settings
 from .layout import DriveLayout
-from .fileops import copy_atomic, sha1_file
+from .fileops import copy_atomic, require_drive, sha1_file
 from .progress import CancelToken, ProgressFn, Reporter
 
 KEYS_SIZE = 0x400
@@ -588,21 +588,30 @@ def build_rescue_kit(archive: ArchivedNand, target: Path, *,
     probs = verify_archive(archive, progress, cancel)
     if probs:
         raise NandError("the archived backup failed verification: " + "; ".join(probs))
-    target = Path(target)
-    target.mkdir(parents=True, exist_ok=True)
+    target = require_drive(target)          # the card must be there; never create it
     plan = [(archive.nand, target / "nand.bin"), (archive.keys, target / "keys.bin")]
     plan += [(p, target / "bootmii" / p.name) for p in sorted(bm.iterdir())
              if p.is_file() and p.suffix.lower() in (".bin", ".elf", ".ini")]
+    todo = []
     for src, dst in plan:
-        if dst.exists() and not overwrite and _sha1(dst) != _sha1(src):
-            raise NandError(f"{dst} already exists and is different; refusing to replace it")
-    rep = Reporter(progress, cancel, total=sum(s.stat().st_size for s, _ in plan),
+        if dst.is_file():
+            if dst.stat().st_size == src.stat().st_size and _sha1(dst) == _sha1(src):
+                continue                    # already on the card, identical: nothing to write
+            if not overwrite:
+                raise NandError(f"{dst} already exists and is different; refusing to replace it")
+        todo.append((src, dst))
+    # each file is written next to the one it replaces, so count every file in full
+    need = sum(s.stat().st_size for s, _ in todo) + (1 << 20 if todo else 0)
+    free = shutil.disk_usage(target).free
+    if need > free:
+        raise NandError(f"Not enough free space on the SD card: the rescue kit needs "
+                        f"{need / 1e6:.0f} MB but only {free / 1e6:.0f} MB is free.")
+    rep = Reporter(progress, cancel, total=sum(s.stat().st_size for s, _ in todo),
                    message="Writing rescue kit")
-    files = []
-    for src, dst in plan:
+    for src, dst in todo:
         dst.parent.mkdir(parents=True, exist_ok=True)
         _copy(src, dst, rep)
-        files.append(dst)
+    files = [dst for _, dst in plan]
     readme = target / "REWII-RESCUE-README.txt"
     readme.write_text(RESCUE_README.format(console=archive.console_id, created=archive.created,
                                            sha1=archive.files.get("nand.bin", "?")), "utf-8")

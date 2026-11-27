@@ -74,41 +74,53 @@ def _build_fs(game_id: str, title: str, files: dict[str, bytes], shift: int) -> 
     return bytes(img)
 
 
+GAME_OFF_RETAIL = 0xF800000    # where retail discs put the game partition
+
+
 def make_wii_iso(path: Path, game_id: str = "RTST01", title: str = "TEST GAME",
-                 files: dict[str, bytes] | None = None, update_partition: bool = False) -> Path:
+                 files: dict[str, bytes] | None = None, update_partition: bool = False,
+                 retail_layout: bool = False) -> Path:
+    """``update_partition``: a tiny empty update partition after the game.
+    ``retail_layout``: like a real disc - an update partition WITH files at 0x50000
+    (the same 2 MiB WBFS block as the disc header) and the game at 0xF800000."""
     files = files if files is not None else {"opening.bnr": imet_banner(), "data.bin": b"\x5A" * 70000}
-    fs = _build_fs(game_id, title, files, 2)
     ck = common_key(0)
     title_key = bytes(range(16))
     tid = b"\x00\x01\x00\x00" + game_id[:4].encode()
     tik = bytearray(0x2A4)
     tik[0x1BF:0x1CF] = aes_cbc_encrypt(ck, tid + bytes(8), title_key)
     tik[0x1DC:0x1E4] = tid
-    nclusters = (len(fs) + WII_SECTOR_DATA - 1) // WII_SECTOR_DATA
-    fs += bytes(nclusters * WII_SECTOR_DATA - len(fs))
+
+    def clusters(fs: bytes) -> tuple[bytes, int]:
+        n = (len(fs) + WII_SECTOR_DATA - 1) // WII_SECTOR_DATA
+        return fs + bytes(n * WII_SECTOR_DATA - len(fs)), n
+
+    game_fs, game_n = clusters(_build_fs(game_id, title, files, 2))
+    if retail_layout:
+        upd_fs, upd_n = clusters(_build_fs("RUPD01", "UPDATE", {"sys.wad": b"\xA5" * (6 << 20)}, 2))
+        parts = [(PART_OFF, 1, upd_fs, upd_n), (GAME_OFF_RETAIL, 0, game_fs, game_n)]
+    else:
+        parts = [(PART_OFF, 0, game_fs, game_n)]
+        if update_partition:
+            parts.append((PART_OFF + DATA_REL + game_n * WII_SECTOR + 0x8000, 1, bytes(WII_SECTOR_DATA), 1))
     with open(path, "wb") as f:
         f.truncate(WII_SL_SIZE)
         f.seek(0)
         f.write(_header(game_id, title, True))
-        # partition table: group 0 has 1 (or 2) partitions at 0x40020
-        parts = [(PART_OFF, 0)]
-        if update_partition:
-            parts.append((PART_OFF + DATA_REL + nclusters * WII_SECTOR + 0x8000, 1))
         f.seek(0x40000)
         f.write(struct.pack(">II", len(parts), 0x40020 >> 2))
         f.seek(0x40020)
-        for off, typ in parts:
+        for off, typ, _fs, _n in parts:
             f.write(struct.pack(">II", off >> 2, typ))
-        for off, typ in parts:
+        for off, _typ, fs, n in parts:
             hdr = bytearray(tik)
             hdr += bytes(0x2C0 - len(hdr))
-            n = nclusters if typ == 0 else 1
             struct.pack_into(">II", hdr, 0x2A4, 0, 0)
             struct.pack_into(">II", hdr, 0x2B8, DATA_REL >> 2, (n * WII_SECTOR) >> 2)
             f.seek(off)
             f.write(hdr)
             for c in range(n):
-                chunk = fs[c * WII_SECTOR_DATA:(c + 1) * WII_SECTOR_DATA] if typ == 0 else bytes(WII_SECTOR_DATA)
+                chunk = fs[c * WII_SECTOR_DATA:(c + 1) * WII_SECTOR_DATA]
                 h0 = b"".join(hashlib.sha1(chunk[i * 0x400:(i + 1) * 0x400]).digest() for i in range(31))
                 hashes = bytearray(0x400)
                 hashes[:len(h0)] = h0

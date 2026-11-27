@@ -140,6 +140,7 @@ def test_archive_verify_and_rescue_kit(tmp_path: Path, settings: Settings) -> No
     assert [x.dir for x in N.list_archives(settings)] == [a.dir]
 
     sd = tmp_path / "sd"
+    sd.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     (tmp_path / "mykeys.bin").write_bytes(make_keys(0x0408CAFA))
     kit = N.build_rescue_kit(a, sd, target_keys=tmp_path / "mykeys.bin")
     assert (sd / "nand.bin").read_bytes() == make_nand(0x0408CAFA)
@@ -167,6 +168,7 @@ def test_rescue_kit_requires_bootmii(tmp_path: Path, settings: Settings) -> None
     with pytest.raises(N.NandError, match="BootMii files"):
         N.build_rescue_kit(a, tmp_path / "sd")
     bm = make_bootmii(tmp_path / "user")
+    (tmp_path / "sd").mkdir()                 # the card is in the reader
     kit = N.build_rescue_kit(a, tmp_path / "sd", bootmii_dir=bm)
     assert (tmp_path / "sd" / "bootmii" / "ppcboot.elf").is_file()
     assert any("No keys.bin" in w for w in kit.warnings)
@@ -207,3 +209,36 @@ def test_fetch_bootmii_rejects_bad_download(tmp_path: Path) -> None:
         assert not (tmp_path / "bootmii_sd_files.zip").exists()
     finally:
         net.set_client(None)
+
+
+def test_rescue_kit_skips_identical_files_and_checks_free_space(tmp_path: Path, settings: Settings,
+                                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    import collections
+    import shutil
+
+    from rewii.core.fileops import DriveNotConnected
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    (drive / "nand.bin").write_bytes(make_nand(0x5))
+    a, _ = N.archive_dump(N.find_nand_dumps(drive)[0], settings)
+    bm = make_bootmii(tmp_path / "user")
+    sd = tmp_path / "sd"
+    with pytest.raises(DriveNotConnected):                   # a card that isn't there is never created
+        N.build_rescue_kit(a, sd, bootmii_dir=bm)
+    assert not sd.exists()
+    sd.mkdir()
+    N.build_rescue_kit(a, sd, bootmii_dir=bm)
+    copied: list[str] = []
+    real = N._copy
+    monkeypatch.setattr(N, "_copy", lambda s, d, r: (copied.append(d.name), real(s, d, r))[1])
+    kit = N.build_rescue_kit(a, sd, bootmii_dir=bm)
+    assert copied == [] and (sd / "nand.bin") in kit.files   # all identical: nothing rewritten
+    (sd / "keys.bin").write_bytes(b"\0" * 1024)
+    N.build_rescue_kit(a, sd, bootmii_dir=bm, overwrite=True)
+    assert copied == ["keys.bin"]
+    (sd / "nand.bin").unlink()
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: usage(10 ** 9, 10 ** 9 - 1000, 1000))
+    with pytest.raises(N.NandError, match="Not enough free space on the SD card"):
+        N.build_rescue_kit(a, sd, bootmii_dir=bm)
+    assert not (sd / "nand.bin").exists() and not list(sd.glob("*.rewii-part"))

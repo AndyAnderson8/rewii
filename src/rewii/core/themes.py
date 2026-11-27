@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .fileops import require_drive
+
 U8_MAGIC = 0x55AA382D
 THEMES_DIR = "themes"
 
@@ -254,7 +256,7 @@ def stage_theme(theme: Path, drive_root: Path, *, console_type: str, region: str
     if info.platform == "" or info.major is None:
         warnings.append("The theme's menu version couldn't be confirmed; it must be a 4.3 theme.")
     warnings.append("Install Priiloader and make a NAND backup before installing themes.")
-    dest_dir = Path(drive_root) / THEMES_DIR
+    dest_dir = require_drive(drive_root) / THEMES_DIR
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / theme.name
     if dest.exists():

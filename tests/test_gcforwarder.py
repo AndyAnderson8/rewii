@@ -26,6 +26,7 @@ def nin():
 @pytest.fixture
 def drive(tmp_path):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     lay.ensure_dirs()
     game = lay.gc_game_file("GC TEST", "GTST01")
     game.parent.mkdir(parents=True)

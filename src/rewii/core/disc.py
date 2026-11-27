@@ -39,7 +39,7 @@ MAX_FST_SIZE = 64 * 1024 * 1024
 MAX_FST_ENTRIES = 0x80000
 MAX_DISC_FILE_READ = 64 * 1024 * 1024
 _BAD_DATA = (struct.error, ValueError, OverflowError, ZeroDivisionError, IndexError, MemoryError)
-_GAME_ID = re.compile(rb"[A-Z0-9]{6}")
+_GAME_ID = re.compile(rb"[A-Za-z0-9]{6}")    # a few unlicensed discs use lowercase
 
 REGION_BY_CHAR = {
     "E": "NTSC-U", "N": "NTSC-U",

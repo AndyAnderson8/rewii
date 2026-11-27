@@ -28,14 +28,18 @@ from typing import Optional
 
 from . import archive
 from .config import Settings
+from .fileops import require_drive
 from .layout import DriveLayout, safe_name
 
 RECORD = "riivolution.json"
 JUNK = {"__macosx", ".ds_store", "thumbs.db", "desktop.ini"}
 MAX_MOD_BYTES = 8 * 1024 ** 3          # largest unpacked mod ReWii accepts
-PROTECTED_TOPS = {"rewii", "apps", "bootmii", "private", "wad"}
-"""Top-level drive folders a mod's XML may not point into: ReWii's own records,
-homebrew apps, BootMii/NAND backups, Wii saves and staged WADs."""
+PROTECTED_TOPS = {"rewii", "bootmii", "wad"}
+PROTECTED_PREFIXES = (("private", "wii", "title"),)
+"""Drive folders a mod's XML may not point into: ReWii's own records, BootMii/NAND
+backups, staged WADs and Wii saves. (``apps/`` and the rest of ``private/`` are
+allowed - mod packs legitimately ship there - but a mod can never replace a
+different file that already exists.)"""
 
 
 class ModError(Exception):
@@ -204,7 +208,8 @@ def _check_drive_path(drive_path: str) -> None:
             raise archive.ArchiveError("empty")
     except archive.ArchiveError:
         raise ModError(f"the mod refers to an unsafe path: {drive_path!r}") from None
-    if parts and parts[0].lower() in PROTECTED_TOPS:
+    low = tuple(x.lower() for x in parts)
+    if parts and (low[0] in PROTECTED_TOPS or any(low[:len(pre)] == pre for pre in PROTECTED_PREFIXES)):
         raise ModError(f"the mod wants to write into /{parts[0]}, which ReWii doesn't allow "
                        f"({drive_path})")
 
@@ -352,7 +357,7 @@ def install_mod(source: Path, drive_root: Path, settings: Settings | None = None
     ``overwrite``) or points into a protected folder (``rewii/``, ``apps/``,
     ``bootmii/``, ``private/``, ``wad/``); a copy that fails midway is rolled back.
     """
-    source, drive_root = Path(source), Path(drive_root)
+    source, drive_root = Path(source), require_drive(drive_root)
     name = safe_name(name or source.stem)
     with tempfile.TemporaryDirectory(prefix="rewii-mod-") as td:
         if source.is_file():
@@ -416,9 +421,20 @@ def install_mod(source: Path, drive_root: Path, settings: Settings | None = None
         uniq: dict[str, tuple[Path, Path]] = {}
         for f, target in plan:
             uniq.setdefault(str(target).lower(), (f, target))
+        rec = _load_record(drive_root)
+        # Files another installed mod put there are never replaced, not even with
+        # ``overwrite``: that mod would stay listed but be broken (and removing this
+        # one later would take the shared file with it). FAT32 ignores case, so
+        # "MODA.XML" is another mod's "ModA.xml".
+        owners = {q.casefold(): n for n, d in rec.items() if n != name for q in _record_paths(d)}
+        for f, target in uniq.values():
+            owner = owners.get(target.relative_to(drive_root).as_posix().casefold())
+            if owner and target.exists() and not (target.is_file() and filecmp.cmp(f, target, shallow=False)):
+                raise ModError(f"{target.relative_to(drive_root).as_posix()} belongs to the installed "
+                               f"mod \"{owner}\" and is different in this one. Remove \"{owner}\" "
+                               "first if you want this mod instead.")
         placed = _copy_plan(list(uniq.values()), overwrite, drive_root)
         # record what is on the drive before anything else can fail
-        rec = _load_record(drive_root)
         rec[name] = {"xmls": [p.name for p in xml_files], "paths": sorted(set(placed)),
                      "games": sorted({g for x in xmls for g in x.game_ids}),
                      "source": str(source)}
@@ -473,11 +489,13 @@ def remove_mod(drive_root: Path, name: str) -> list[str]:
     rec = _load_record(drive_root)
     if name not in rec:
         raise ModError(f"{name} wasn't installed by ReWii")
-    others = {p for n, d in rec.items() if n != name for p in _record_paths(d)}
+    # compared without regard to case, as FAT32 does: "modshared/FILES/A.BIN" recorded
+    # by another mod is this mod's "ModShared/files/a.bin"
+    others = {p.casefold() for n, d in rec.items() if n != name for p in _record_paths(d)}
     removed = []
     dirs: set[Path] = set()
     for rel in _record_paths(rec[name]):
-        if rel in others:
+        if rel.casefold() in others:
             continue
         # the record lives on the drive, so it is untrusted: only ever delete
         # plain relative paths that stay inside the drive

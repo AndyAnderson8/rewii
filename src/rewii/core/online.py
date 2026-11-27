@@ -109,6 +109,7 @@ def write_gx_config(layout: DriveLayout, updates: Mapping[str, Value]) -> dict[s
     is added if missing so the loader doesn't ignore the file. Returns the new
     key/value mapping. Values must not contain line breaks.
     """
+    layout.require_root()
     path = layout.gx_config
     # surrogateescape keeps bytes that aren't UTF-8 (in lines ReWii doesn't touch)
     # exactly as they were when the file is written back

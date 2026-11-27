@@ -132,6 +132,7 @@ def test_plan_archive_layouts():
 
 def test_install_update_remove(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     serve()
     apps = osc.fetch_index()
     gx = osc.find_app(apps, "usbloader_gx")
@@ -163,6 +164,7 @@ def test_install_update_remove(tmp_path, cache):
 
 def test_version_compare_without_record(tmp_path):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     d = lay.apps / "wiixplorer"
     d.mkdir(parents=True)
     (d / "boot.dol").write_bytes(b"x")
@@ -179,6 +181,7 @@ def test_version_compare_without_record(tmp_path):
 
 def test_nested_detection(tmp_path):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     for p in ("apps/apps/foo", "apps/bar/apps/baz", "rootapp"):
         d = lay.root / p
         d.mkdir(parents=True)
@@ -195,6 +198,7 @@ def test_nested_detection(tmp_path):
 
 def test_bad_hash_rejected(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     serve(zips={"usbloader_gx": b"PK tampered"})
     gx = App.from_api(INDEX[0])
     with pytest.raises(osc.OSCError):
@@ -204,6 +208,7 @@ def test_bad_hash_rejected(tmp_path, cache):
 
 def test_starter_kit(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     serve()
     apps = osc.fetch_index()
     assert {i.slug for i in osc.starter_kit("vwii")} >= {"d2x-cios-installer-vwii"}
@@ -247,6 +252,7 @@ def _repacked(slug, zipdata, subdirs):
 
 def test_fallback_accepts_only_the_apps_own_boot_file(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     # honest repack: the app's own boot.dol matches -> installs
     app = _repacked("myapp", make_zip({"apps/myapp/boot.dol": GOOD_DOL,
                                        "apps/myapp/meta.xml": b"<app/>"}), ["/apps/myapp"])
@@ -260,6 +266,7 @@ def test_fallback_accepts_only_the_apps_own_boot_file(tmp_path, cache):
         {"apps/myapp/boot.dol": GOOD_DOL, "apps/myapp/../../evil": b"x"},       # unsafe archive
     ]):
         lay2 = DriveLayout(tmp_path / f"usb{i}")
+        lay2.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
         app = _repacked("myapp", make_zip(files), ["/apps/myapp"])
         with pytest.raises(OSCError, match="checksum"):
             osc.install_app(lay2, app, refresh=True)
@@ -298,6 +305,7 @@ def test_extraction_is_confined_to_declared_folders(tmp_path, cache):
     e2 = api_entry("myapp", "myapp", "1.0", z2, ["/apps/myapp"])
     serve(zips={"myapp": z2})
     with pytest.raises(OSCError, match="boot"):
+        (tmp_path / "usb2").mkdir()
         osc.install_app(DriveLayout(tmp_path / "usb2"), App.from_api(e2), refresh=True)
 
 
@@ -317,6 +325,7 @@ def test_allowed_dirs_and_bad_index_values():
 
 def test_install_refuses_bad_folder_and_non_https(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     z = make_zip({"boot.dol": GOOD_DOL})
     e = api_entry("..", "evil", "1.0", z, [])
     e["assets"]["archive"]["url"] = "https://hbb1.oscwii.org/api/contents/myapp/myapp.zip"
@@ -327,7 +336,7 @@ def test_install_refuses_bad_folder_and_non_https(tmp_path, cache):
     e["assets"]["archive"]["url"] = "http://hbb1.oscwii.org/api/contents/myapp/myapp.zip"
     with pytest.raises(OSCError, match="https"):
         osc.install_app(lay, App.from_api(e))
-    assert not lay.root.exists()
+    assert not any(lay.root.iterdir())
 
 
 def test_index_error_document_is_not_cached(cache):
@@ -345,6 +354,7 @@ def test_index_error_document_is_not_cached(cache):
 
 def test_meta_xml_with_unknown_encoding_does_not_break_the_list(tmp_path):
     lay = DriveLayout(tmp_path / "usb")
+    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     for name, meta in (("a", b'<?xml version="1.0" encoding="shift_jisx"?><app><name>Odd</name></app>'),
                        ("b", b"<app><name>Fine</name></app>")):
         d = lay.apps / name

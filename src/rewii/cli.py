@@ -9,7 +9,6 @@ Mistakes a user can make (wrong path, not a game, drive missing...) print one
 from __future__ import annotations
 
 import argparse
-import shutil
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -17,6 +16,7 @@ from collections.abc import Callable
 
 from . import __version__
 from .core.config import Settings
+from .core.fileops import copy_atomic
 from .core.layout import DriveLayout
 from .core.progress import ProgressEvent
 
@@ -54,16 +54,21 @@ def is_user_error(e: BaseException) -> bool:
     return isinstance(e, OSError) or type(e).__module__.startswith("rewii.core.")
 
 
-def _say(e: BaseException) -> str:
-    if isinstance(e, FileNotFoundError) and e.filename:
+def _say(e: BaseException, drive: Any = None) -> str:
+    """One plain line for an error (``drive``: the DriveLayout or root it happened on)."""
+    from .core.fileops import DriveNotConnected, explain_os_error
+    root = getattr(drive, "root", drive)
+    if isinstance(e, DriveNotConnected):
+        return str(e)
+    if isinstance(e, FileNotFoundError) and e.filename and (root is None or Path(root).is_dir()):
         return f"{e.filename}: no such file or folder"
     if isinstance(e, PermissionError) and e.filename:
         return f"{e.filename}: permission denied (a drive read directly needs admin rights)"
-    return str(e) or type(e).__name__
+    return explain_os_error(e, root)
 
 
-def _fail(what: object, e: BaseException) -> None:
-    print(f"{what}: {_say(e)}", file=sys.stderr)
+def _fail(what: object, e: BaseException, drive: Any = None) -> None:
+    print(f"{what}: {_say(e, drive)}", file=sys.stderr)
 
 
 def _drive_at(path: str) -> DriveLayout:
@@ -141,7 +146,7 @@ def cmd_games_add(a: Any) -> int:
             bar.done()
             if not is_user_error(e):
                 raise
-            _fail(p, e)
+            _fail(p, e, lay)
             rc = 1
     return rc
 
@@ -174,7 +179,7 @@ def cmd_games_remove(a: Any) -> int:
             except Exception as e:  # noqa: BLE001
                 if not is_user_error(e):
                     raise
-                _fail(g.title, e)
+                _fail(g.title, e, lay)
                 rc = 1
     return rc
 
@@ -223,24 +228,27 @@ def cmd_channel(a: Any) -> int:
                     out.mkdir(parents=True, exist_ok=True)
                     dest = out / ci.path.name
                     if dest.resolve() != ci.path.resolve():
-                        # --out is often the USB drive: move() also works across filesystems
-                        dest.unlink(missing_ok=True)
-                        shutil.move(str(ci.path), str(dest))
+                        # --out is often the USB drive: copy under a temp name and swap it in, so
+                        # a full or unplugged drive never leaves a cut-off WAD (or loses the old one)
+                        copy_atomic(ci.path, dest, fsync=True)
+                        ci.path.unlink(missing_ok=True)
                         ci.path = dest
             print(f"{ci.path}  ({ci.channel_id}, {ci.style})")
         except Exception as e:  # noqa: BLE001
             if not is_user_error(e):
                 raise
-            _fail(p, e)
+            _fail(p, e, out or drive_root)
             rc = 1
     return rc
 
 
 def cmd_normalize(a: Any) -> int:
     from .core.games import normalize_drive
-    for m in normalize_drive(_drive(a)):
+    # the same titles "games add" uses (GameTDB when available), so folder names agree
+    msgs = normalize_drive(_drive(a), _titles(Settings.load()))
+    for m in msgs:
         print(m)
-    return 0
+    return 1 if any(m.startswith("skipped") for m in msgs) else 0
 
 
 def cmd_migrate(a: Any) -> int:
@@ -266,6 +274,9 @@ def cmd_migrate(a: Any) -> int:
     finally:
         bar.done()
     print("\n".join(res) if res else "Nothing new to copy.")
+    if res.problems:
+        print(f"{res.skipped} skipped, {res.damaged} copied but damaged - see above.", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -290,21 +301,28 @@ def cmd_health(a: Any) -> int:
         print(f"[{f.severity:5}] {f.message}" + (f"  (fix: {f.fix_id})" if f.fix_id else ""))
     if not findings:
         print("Everything looks good.")
+    failed = 0
     if a.fix and any(f.auto_fixable for f in findings):
         for f in findings:
             if not f.auto_fixable:
                 continue
             try:
                 for line in health.fix(lay, f):
-                    print("  fixed:", line)
+                    if line.startswith(health.NOT_FIXED):
+                        failed += 1
+                        print(" ", line, file=sys.stderr)
+                    else:
+                        print("  fixed:", line)
             except Exception as e:  # noqa: BLE001
                 if not is_user_error(e):
                     raise
-                print(f"  couldn't fix: {_say(e)}", file=sys.stderr)
+                failed += 1
+                print(f"  {health.NOT_FIXED} {_say(e, lay)}", file=sys.stderr)
         findings = health.check(lay, drv)      # the exit code describes the drive as it is now
         left = [f for f in findings if f.severity == "error"]
-        print(f"After fixing: {len(findings)} finding(s) left, {len(left)} of them errors.")
-    return 1 if any(f.severity == "error" for f in findings) else 0
+        print(f"After fixing: {len(findings)} finding(s) left, {len(left)} of them errors."
+              + (f" {failed} fix(es) failed." if failed else ""))
+    return 1 if failed or any(f.severity == "error" for f in findings) else 0
 
 
 def cmd_format_drive(a: Any) -> int:
@@ -415,5 +433,5 @@ def main(argv: list[str]) -> int:
     except Exception as e:  # noqa: BLE001 - user errors become one line; bugs still show a traceback
         if not is_user_error(e):
             raise
-        print(f"error: {_say(e)}", file=sys.stderr)
+        print(f"error: {_say(e, getattr(a, 'drive', None) or None)}", file=sys.stderr)
         return 1

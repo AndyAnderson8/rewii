@@ -285,7 +285,10 @@ def parse_lsblk(data: str | dict) -> list[Drive]:
         serial = (node.get("serial") or "").strip()
         rm = _as_bool(node.get("rm"))
         is_usb = tran == "usb"
-        system = any(_is_system_mount(m) for m in mounts)
+        # "/", /boot, swap... always mean a system disk; the wider prefix rule (/home/x,
+        # /var/mnt...) only applies to internal disks, since people do mount USB drives there
+        system = bool(mounts & _SYSTEM_MOUNTS) or (
+            not is_usb and not rm and any(_is_system_mount(m) for m in mounts))
         if not is_usb and not rm and (set(_lsblk_fstypes(node)) & _MEMBER_FS):
             system = True      # internal disk in an LVM/ZFS/RAID/LUKS/btrfs set, mounted or not
         drives.append(Drive(

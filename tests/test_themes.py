@@ -93,6 +93,7 @@ def test_stage_theme(tmp_path: Path) -> None:
     p = tmp_path / "dark.csm"
     p.write_bytes(theme())
     drive = tmp_path / "drive"
+    drive.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     st = T.stage_theme(p, drive, console_type="wii", region="NTSC-U")
     assert st.dest == drive / "themes" / "dark.csm" and st.dest.read_bytes() == p.read_bytes()
     with pytest.raises(T.ThemeError, match="brick"):
@@ -116,6 +117,7 @@ def test_content_ids() -> None:
 
 def test_only_43_themes_and_no_region_from_file_name(tmp_path: Path) -> None:
     drive = tmp_path / "drive"
+    drive.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     for minor in (1, 2):
         p = tmp_path / f"old4{minor}.csm"
         p.write_bytes(theme(build=f"D:\\4_{minor}\\ipl\\bin\\RVL\\Final_U\\main.elf".encode()))

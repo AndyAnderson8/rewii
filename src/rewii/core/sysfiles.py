@@ -14,7 +14,6 @@ from __future__ import annotations
 import hashlib
 import io
 import re
-import shutil
 import time
 import zipfile
 from dataclasses import dataclass
@@ -23,6 +22,7 @@ from typing import Optional
 
 from . import net
 from .config import cache_dir
+from .fileops import copy_atomic, is_temp_name
 from .layout import DriveLayout
 from .progress import CancelToken, ProgressFn
 
@@ -70,6 +70,7 @@ def stage_hackmii(layout: DriveLayout, progress: ProgressFn | None = None,
                   cancel: CancelToken | None = None) -> Path:
     """Put the HackMii installer in apps/hackmii_installer/ (runs from the Homebrew Channel)."""
     data = _fetch_pinned(HACKMII_URL, HACKMII_SHA256, "hackmii_installer_v1.2.zip", progress, cancel)
+    layout.require_root()
     dest = layout.app_dir("hackmii_installer")
     dest.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
@@ -84,7 +85,7 @@ def stage_d2xl_mini(layout: DriveLayout, progress: ProgressFn | None = None,
                     cancel: CancelToken | None = None) -> Path:
     """Put the Wii mini d2xl cIOS installer in apps/ (from wii.hacks.guide)."""
     data = _fetch_pinned(D2XL_MINI_URL, D2XL_MINI_SHA256, "d2xl-cios-installer-mini.zip", progress, cancel)
-    root = layout.root.resolve()
+    root = layout.require_root().resolve()
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         for info in zf.infolist():
             if info.is_dir():
@@ -138,17 +139,47 @@ def validate_hack_block(text: str) -> list[str]:
     return errs
 
 
-def _write_lf(p: Path, text: str) -> None:
-    """Write text with plain LF line endings on every OS (the Wii reads these files)."""
-    p.write_bytes(text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8"))
+def _lf(text: str) -> bytes:
+    """Text with plain LF line endings on every OS (the Wii reads these files)."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
 
 
-def _backup(p: Path) -> Optional[Path]:
-    if p.is_file():
-        b = p.with_name(p.name + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
-        shutil.copy2(p, b)
-        return b
-    return None
+def _save_with_backup(p: Path, data: bytes) -> Optional[Path]:
+    """Replace ``p`` with ``data``, keeping the previous version as ``<name>.bak-<time>``.
+
+    * Nothing is written (and no backup made) when the content doesn't change.
+    * The new file is written under a temporary name first, so a full or
+      unplugged drive leaves the old file - and no empty backup - behind.
+    * Only the newest backup of a file is kept.
+
+    Returns the backup made, or None."""
+    try:
+        if p.is_file() and p.read_bytes() == data:
+            return None
+    except OSError:
+        pass
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".part")
+    bak: Optional[Path] = None
+    try:
+        tmp.write_bytes(data)
+        if p.is_file():
+            bak = p.with_name(p.name + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
+            copy_atomic(p, bak)
+        tmp.replace(p)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        if bak is not None:
+            bak.unlink(missing_ok=True)
+        raise
+    if bak is not None:
+        for old in p.parent.glob(p.name + ".bak-*"):
+            if old != bak and not is_temp_name(old.name):
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+    return bak
 
 
 def update_priiloader_hacks(layout: DriveLayout, progress: ProgressFn | None = None,
@@ -164,6 +195,7 @@ def update_priiloader_hacks(layout: DriveLayout, progress: ProgressFn | None = N
     text = data.decode("utf-8", "replace")
     if not hack_names(text):
         raise SysFileError("downloaded hack list looks empty")
+    layout.require_root()
     p = hacks_path(layout)
     custom = ""
     if keep_custom and p.is_file():
@@ -171,9 +203,7 @@ def update_priiloader_hacks(layout: DriveLayout, progress: ProgressFn | None = N
         i = old.find(CUSTOM_MARK)
         if i >= 0:
             custom = old[i:]
-    _backup(p)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    _write_lf(p, text.rstrip("\r\n") + "\n" + (("\n" + custom) if custom else ""))
+    _save_with_backup(p, _lf(text.rstrip("\r\n") + "\n" + (("\n" + custom) if custom else "")))
     return p, str(rel.get("tag_name", ""))
 
 
@@ -189,10 +219,9 @@ def add_custom_hack(layout: DriveLayout, snippet: str) -> Path:
     if not p.is_file():
         raise SysFileError("No hacks_hash.ini on the drive yet - install Priiloader or update the hack list first")
     text = p.read_text("utf-8", "replace").replace("\r\n", "\n")
-    _backup(p)
     if CUSTOM_MARK not in text:
         text = text.rstrip("\r\n") + "\n\n" + CUSTOM_MARK + "\n"
-    _write_lf(p, text.rstrip("\r\n") + "\n" + snippet.strip() + "\n")
+    _save_with_backup(p, _lf(text.rstrip("\r\n") + "\n" + snippet.strip() + "\n"))
     return p
 
 
@@ -232,8 +261,7 @@ def write_bootmii_ini(sd_root: Path, values: dict[str, str]) -> Path:
                 lines[i] = f"{k}={values[k]}"
                 done.add(k)
     lines += [f"{k}={v}" for k, v in values.items() if k not in done]
-    _backup(p)
-    p.write_bytes(("\r\n".join(lines) + "\r\n").encode("latin-1", "replace"))
+    _save_with_backup(p, ("\r\n".join(lines) + "\r\n").encode("latin-1", "replace"))
     return p
 
 

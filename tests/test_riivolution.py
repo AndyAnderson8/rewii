@@ -102,6 +102,7 @@ def test_install_from_folder_without_wrapper(tmp_path: Path) -> None:
         '<patch id="p"><folder external="files" disc="/"/></patch></wiidisc>')
     (src / "simple" / "files" / "a.arc").write_bytes(b"a")
     drive = tmp_path / "drive"
+    drive.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     res = R.install_mod(src, drive)
     assert (drive / "riivolution" / "simple.xml").is_file()
     assert (drive / "riivolution" / "simple" / "files" / "a.arc").is_file()
@@ -115,6 +116,7 @@ def test_remove_never_deletes_outside_the_drive(tmp_path: Path) -> None:
     victim.parent.mkdir()
     victim.write_text("precious")
     drive = tmp_path / "drive"
+    drive.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     R.install_mod(make_mod_zip(tmp_path / "MyMod.zip"), drive)
     rec_p = drive / "rewii" / R.RECORD
     rec = json.loads(rec_p.read_text())
@@ -131,7 +133,7 @@ def test_remove_never_deletes_outside_the_drive(tmp_path: Path) -> None:
 
 
 def test_mod_cannot_plant_rewii_records_or_touch_protected_folders(tmp_path: Path) -> None:
-    for top in ("rewii", "apps", "bootmii", "private", "wad", "ReWii"):
+    for top in ("rewii", "bootmii", "wad", "ReWii"):
         mod = tmp_path / f"evil-{top}"
         (mod / "riivolution").mkdir(parents=True)
         (mod / top).mkdir()
@@ -148,7 +150,8 @@ def test_mod_cannot_plant_rewii_records_or_touch_protected_folders(tmp_path: Pat
 
 
 def test_zip_with_drive_letter_component_is_refused(tmp_path: Path) -> None:
-    for bad_name in ("foo/D:/evil.txt", "riivolution/NUL", "a/b/../../../x"):
+    (tmp_path / "drive").mkdir()
+    for bad_name in ("foo/D:/evil.txt", "a/b/../../../x"):
         bad = tmp_path / "bad.zip"
         with zipfile.ZipFile(bad, "w") as z:
             z.writestr("riivolution/m.xml", XML)
@@ -165,7 +168,7 @@ def test_zip_with_drive_letter_component_is_refused(tmp_path: Path) -> None:
             R.install_mod(big, tmp_path / "drive")
     finally:
         R.MAX_MOD_BYTES = old
-    assert not (tmp_path / "drive").exists()
+    assert not any((tmp_path / "drive").iterdir())
 
 
 def test_reinstall_from_library_copy_keeps_it(tmp_path: Path) -> None:
@@ -227,6 +230,7 @@ def test_case_insensitive_sources_and_odd_xml(tmp_path: Path) -> None:
     (src / "MYMODEXTRA").mkdir()
     (src / "MYMODEXTRA" / "MENU.SZS").write_bytes(b"m")
     drive = tmp_path / "drive"
+    drive.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     res = R.install_mod(src, drive)
     assert not any("aren't in the mod" in w for w in res.warnings)
     assert (drive / "MyMod" / "course" / "a.szs").read_bytes() == b"a"
