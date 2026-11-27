@@ -21,24 +21,23 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import shutil
 import struct
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from collections.abc import Iterable
 
 from Crypto.Cipher import AES
 
-from . import archive
+from . import archive, fileops
 from .config import Settings
-from .fileops import require_drive
+from .fileops import sha1_file
 from .ids import valid_id4
 from .layout import DriveLayout, safe_name
 from .progress import CancelToken, ProgressFn, Reporter
+from .errors import ReWiiError
 
 # --------------------------------------------------------------------------- constants
 SD_KEY = bytes.fromhex("ab01b9d8e1622b08afbad84dbfc2a55d")
@@ -51,7 +50,6 @@ BK_LISTED_SIZE = 0x70
 BK_MAGIC = 0x426B0001
 FILE_HDR_SIZE = 0x80
 FILE_HDR_MAGIC = 0x03ADF17E
-CERTS_SIZE = 0x3C0
 BANNER_MAGIC = b"WIBN"
 BANNER_BASE_SIZE = 0x60A0
 ICON_SIZE = 0x1200
@@ -80,7 +78,7 @@ APP_GCMM = "gcmm"
 TARGET_APPS = (APP_SGM, APP_DATA_MGMT, APP_NINTENDONT, APP_GCMM)
 
 
-class SaveError(Exception):
+class SaveError(ReWiiError):
     """A save file is malformed or an operation on it is impossible."""
 
 
@@ -117,20 +115,6 @@ def _printable_id(b: bytes) -> str:
     return b.hex().upper()
 
 
-def sha1_file(path: Path, rep: Reporter | None = None) -> str:
-    """SHA-1 hex digest of a file, advancing ``rep`` by bytes read."""
-    h = hashlib.sha1()
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(1024 * 1024)
-            if not b:
-                break
-            h.update(b)
-            if rep is not None:
-                rep.advance(len(b))
-    return h.hexdigest()
-
-
 def sha1_tree(root: Path) -> str:
     """Deterministic SHA-1 over a directory tree (relative names + contents)."""
     h = hashlib.sha1()
@@ -165,24 +149,9 @@ def _copy_path(src: Path, dest: Path) -> None:
     """Copy a file or directory tree, preserving mtimes."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if src.is_dir():
-        shutil.copytree(src, dest, dirs_exist_ok=False, copy_function=_copy_file)
+        shutil.copytree(src, dest, dirs_exist_ok=False, copy_function=fileops.copy_plain)
     else:
-        tmp = dest.with_name(dest.name + ".rewii-part")
-        try:
-            _copy_file(src, tmp)
-            os.replace(tmp, dest)
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            raise
-
-
-def _copy_file(src: Path | str, dest: Path | str) -> None:
-    """Copy contents, then times/modes where the file system allows (FAT32 may not)."""
-    shutil.copyfile(src, dest)
-    try:
-        shutil.copystat(src, dest)
-    except OSError:
-        pass
+        fileops.copy_atomic(src, dest)
 
 
 def _timestamp(now: datetime | None = None) -> str:
@@ -268,13 +237,6 @@ def decrypt_header(enc: bytes) -> bytes:
     if len(enc) != HEADER_SIZE:
         raise SaveError("data.bin header must be 0xF0C0 bytes")
     return AES.new(SD_KEY, AES.MODE_CBC, SD_IV).decrypt(enc)
-
-
-def encrypt_header(plain: bytes) -> bytes:
-    """Re-encrypt a decrypted header (used to round-trip-verify copies)."""
-    if len(plain) != HEADER_SIZE:
-        raise SaveError("data.bin header must be 0xF0C0 bytes")
-    return AES.new(SD_KEY, AES.MODE_CBC, SD_IV).encrypt(plain)
 
 
 def header_md5(plain: bytes) -> bytes:
@@ -381,13 +343,6 @@ def extract_databin(path: Path, dest: Path) -> list[Path]:
             out.append(target)
             off += _align(size, 0x40)
     return out
-
-
-def verify_databin_roundtrip(path: Path) -> bool:
-    """True if decrypting then re-encrypting the header reproduces the file bytes."""
-    with open(path, "rb") as f:
-        enc = f.read(HEADER_SIZE)
-    return len(enc) == HEADER_SIZE and encrypt_header(decrypt_header(enc)) == enc
 
 
 # --------------------------------------------------------------------------- GameCube
@@ -713,7 +668,7 @@ def _classify_extracted(path: Path, app: str) -> Optional[DriveSave]:
                      files=files, note=banner.subtitle)
 
 
-def discover_saves(root: Path, progress: ProgressFn | None = None,
+def discover_saves(layout: DriveLayout | Path, progress: ProgressFn | None = None,
                    cancel: CancelToken | None = None) -> list[DriveSave]:
     """Find every save on a drive (USB or SD root).
 
@@ -721,7 +676,7 @@ def discover_saves(root: Path, progress: ProgressFn | None = None,
     *and* old SaveGame Manager ``.bin`` files - told apart by content),
     ``private/wii/title/*/data.bin`` (Data Management) and ``MCBACKUP/`` (GCMM).
     """
-    lay = DriveLayout(Path(root))
+    lay = DriveLayout.of(layout)
     rep = Reporter(progress, cancel, message="Looking for saves")
     found: list[DriveSave] = []
     seen: set[Path] = set()
@@ -777,15 +732,6 @@ def discover_saves(root: Path, progress: ProgressFn | None = None,
     return found
 
 
-def catalog_by_game(saves: Iterable[DriveSave]) -> dict[str, list[tuple[DriveSave, SaveGame]]]:
-    """Group saves by game id (a memory card contributes one row per game on it)."""
-    out: dict[str, list[tuple[DriveSave, SaveGame]]] = {}
-    for s in saves:
-        for g in (s.games or [SaveGame(s.game_id, s.title, s.size, s.modified)]):
-            out.setdefault(g.game_id, []).append((s, g))
-    return dict(sorted(out.items()))
-
-
 # --------------------------------------------------------------------------- library
 @dataclass
 class SaveVersion:
@@ -801,10 +747,6 @@ class SaveVersion:
     created: str
     size: int
     title_id: str = ""
-
-    @property
-    def game_folder(self) -> Path:
-        return self.dir.parent
 
 
 def _game_folder_name(game_id: str, title: str) -> str:
@@ -902,21 +844,7 @@ def backup_save(save: DriveSave, settings: Settings, *, now: datetime | None = N
     return BackupResult(got, True)
 
 
-def backup_all(saves: Iterable[DriveSave], settings: Settings, *,
-               progress: ProgressFn | None = None,
-               cancel: CancelToken | None = None) -> list[BackupResult]:
-    """Back up many saves; cancellable between saves."""
-    saves = list(saves)
-    rep = Reporter(progress, cancel, total=len(saves), message="Backing up saves")
-    out = []
-    for s in saves:
-        rep.check()
-        out.append(backup_save(s, settings))
-        rep.advance(1, s.title)
-    return out
-
-
-def restore_destination(version: SaveVersion, drive_root: Path, target_app: str) -> Path:
+def restore_destination(version: SaveVersion, layout: DriveLayout | Path, target_app: str) -> Path:
     """Where ``version`` goes on the drive for ``target_app`` (one of TARGET_APPS).
 
     * Wii data.bin -> ``private/wii/title/<ID4>/data.bin`` (Data Management on SD;
@@ -925,7 +853,7 @@ def restore_destination(version: SaveVersion, drive_root: Path, target_app: str)
     * GC memory card -> ``saves/<name>.raw`` (Nintendont) or ``MCBACKUP/<name>`` (GCMM).
     * GC .gci -> ``MCBACKUP/<name>.gci`` (GCMM only).
     """
-    lay = DriveLayout(Path(drive_root))
+    lay = DriveLayout.of(layout)
     if target_app not in TARGET_APPS:
         raise SaveError(f"unknown target app {target_app!r}")
     k = version.kind
@@ -977,7 +905,7 @@ class RestoreResult:
     previous_backup: Optional[SaveVersion] = None   # backup of the replaced drive save
 
 
-def restore_save(version: SaveVersion, drive_root: Path, target_app: str, settings: Settings, *,
+def restore_save(version: SaveVersion, layout: DriveLayout | Path, target_app: str, settings: Settings, *,
                  progress: ProgressFn | None = None,
                  cancel: CancelToken | None = None) -> RestoreResult:
     """Restore a library version to the drive for ``target_app``.
@@ -986,8 +914,9 @@ def restore_save(version: SaveVersion, drive_root: Path, target_app: str, settin
     first (and the restore aborts if that backup fails).
     """
     rep = Reporter(progress, cancel, message=f"Restoring {version.title}")
-    require_drive(drive_root)
-    dest = restore_destination(version, drive_root, target_app)
+    layout = DriveLayout.of(layout)
+    layout.require_root()
+    dest = restore_destination(version, layout, target_app)
     rep.check()
     # 1. the library copy must be there and intact before anything on the drive changes
     if not _version_intact(version):
@@ -1010,8 +939,8 @@ def restore_save(version: SaveVersion, drive_root: Path, target_app: str, settin
         rep.check()
     # 3. copy next to the destination, verify, and only then swap it in
     dest.parent.mkdir(parents=True, exist_ok=True)
-    new = dest.with_name(dest.name + ".rewii-new")
-    old = dest.with_name(dest.name + ".rewii-old")
+    new = dest.with_name(dest.name + fileops.NEW_SUFFIX)
+    old = dest.with_name(dest.name + fileops.OLD_SUFFIX)
     for junk in (new, old):
         _remove_path(junk)
     try:
@@ -1045,12 +974,3 @@ def _remove_path(p: Path) -> None:
     except OSError:
         pass
 
-
-def save_to_dict(s: DriveSave) -> dict:
-    """JSON-friendly representation of a :class:`DriveSave`."""
-    d = asdict(s)
-    d["path"] = str(s.path)
-    for g in d["games"]:
-        if g["modified"] is not None:
-            g["modified"] = g["modified"].isoformat()
-    return d

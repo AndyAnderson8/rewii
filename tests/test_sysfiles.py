@@ -14,8 +14,6 @@ from rewii.core.layout import DriveLayout
 @pytest.fixture
 def lay(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "cache_dir", lambda: tmp_path / "cache")
-    monkeypatch.setattr(S, "cache_dir", lambda: tmp_path / "cache")
-    monkeypatch.setattr(net, "cache_dir", lambda: tmp_path / "cache")
     (tmp_path / "usb").mkdir()                 # the drive is plugged in
     yield DriveLayout(tmp_path / "usb")
     net.set_client(None)

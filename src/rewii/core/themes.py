@@ -21,39 +21,31 @@ The 4.3 main-archive content ids below were read from the NUS TMDs
 from __future__ import annotations
 
 import re
-import shutil
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .fileops import require_drive
+from . import console
+from .fileops import copy_atomic
+from .layout import DriveLayout
+from .errors import ReWiiError
 
 U8_MAGIC = 0x55AA382D
-THEMES_DIR = "themes"
 
 # System Menu 4.3 main archive content id -> (platform, region letter, title version)
 MENU_43_CONTENT: dict[int, tuple[str, str, int]] = {
-    0x94: ("wii", "J", 512), 0x97: ("wii", "U", 513),
-    0x9A: ("wii", "E", 514), 0x9D: ("wii", "K", 518),
-    0x1C: ("vwii", "J", 608), 0x1F: ("vwii", "U", 609), 0x22: ("vwii", "E", 610),
-}
-# older menus (for identifying original .app dumps by name)
-MENU_OLDER_CONTENT: dict[int, tuple[str, str, str]] = {
-    0x84: ("wii", "J", "4.2"), 0x87: ("wii", "U", "4.2"), 0x8A: ("wii", "E", "4.2"),
-    0x8D: ("wii", "K", "4.2"), 0x78: ("wii", "J", "4.1"), 0x7B: ("wii", "U", "4.1"),
-    0x7E: ("wii", "E", "4.1"), 0x81: ("wii", "K", "4.1"),
-}
+    m.content_id: (m.platform, m.letter, m.version) for m in console.SYSMENU_43.values()}
 REGION_DIRS = {"U": "US2", "E": "EU2", "J": "JP2", "K": "KR2"}
-REGION_NAMES = {"U": "NTSC-U", "E": "PAL", "J": "NTSC-J", "K": "NTSC-K"}
-LETTER_FOR_REGION = {v: k for k, v in REGION_NAMES.items()}
-PLATFORM_FOR_CONSOLE = {"wii": "wii", "vwii": "vwii", "mini": "mini", "family": "wii"}
+REGION_NAMES = console.REGION_BY_LETTER
+LETTER_FOR_REGION = console.REGION_LETTER
+PLATFORM_FOR_CONSOLE = console.PLATFORM_OF
 REQUIRED_FILES = ("/www.arc", "/layout/common/health.ash", "/sound/IplSound.brsar")
 SIGNATURES = ((0x100, b"Wii_Themer"), (0xF0, b"ModMii_________\xa9______XFlak"),
               (0xF0, b"wiithemer"))
 
 
-class ThemeError(Exception):
+class ThemeError(ReWiiError):
     """A theme file is invalid or doesn't fit the console."""
 
 
@@ -184,16 +176,6 @@ def identify_theme(path: Path) -> ThemeInfo:
     return info
 
 
-def content_for(console_type: str, region: str) -> Optional[int]:
-    """The 4.3 main archive content id for a console profile (config terms), if known."""
-    plat = PLATFORM_FOR_CONSOLE.get(console_type, "")
-    letter = LETTER_FOR_REGION.get(region, "")
-    for cid, (p, r, _v) in MENU_43_CONTENT.items():
-        if p == plat and r == letter:
-            return cid
-    return None
-
-
 # --------------------------------------------------------------------------- stage
 @dataclass
 class StagedTheme:
@@ -237,7 +219,7 @@ def check_theme(info: ThemeInfo, console_type: str, region: str) -> list[str]:
     return errs
 
 
-def stage_theme(theme: Path, drive_root: Path, *, console_type: str, region: str,
+def stage_theme(theme: Path, layout: DriveLayout | Path, *, console_type: str, region: str,
                 overwrite: bool = False) -> StagedTheme:
     """Copy a checked theme to ``<drive>/themes/`` for csm-installer.
 
@@ -256,7 +238,9 @@ def stage_theme(theme: Path, drive_root: Path, *, console_type: str, region: str
     if info.platform == "" or info.major is None:
         warnings.append("The theme's menu version couldn't be confirmed; it must be a 4.3 theme.")
     warnings.append("Install Priiloader and make a NAND backup before installing themes.")
-    dest_dir = require_drive(drive_root) / THEMES_DIR
+    layout = DriveLayout.of(layout)
+    layout.require_root()
+    dest_dir = layout.themes
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / theme.name
     if dest.exists():
@@ -264,19 +248,13 @@ def stage_theme(theme: Path, drive_root: Path, *, console_type: str, region: str
             return StagedTheme(dest, info, warnings)        # already staged
         if not overwrite and dest.read_bytes() != theme.read_bytes():
             raise ThemeError(f"{dest.name} already exists in themes/ and is different")
-    tmp = dest.with_name(dest.name + ".part")
-    try:
-        shutil.copyfile(theme, tmp)
-        tmp.replace(dest)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    copy_atomic(theme, dest, keep_times=False)
     return StagedTheme(dest, info, warnings)
 
 
-def list_staged_themes(drive_root: Path) -> list[ThemeInfo]:
+def list_staged_themes(layout: DriveLayout | Path) -> list[ThemeInfo]:
     """Themes waiting in ``<drive>/themes/`` (backup sub-folders excluded)."""
-    d = Path(drive_root) / THEMES_DIR
+    d = DriveLayout.of(layout).themes
     if not d.is_dir():
         return []
     return [identify_theme(p) for p in sorted(d.iterdir())

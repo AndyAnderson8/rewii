@@ -21,25 +21,25 @@ from typing import Any, Optional
 from collections.abc import Iterable, Sequence
 from xml.etree import ElementTree as ET
 
-from . import archive, config, net
+from . import archive, config, console, fileops, net
 from .archive import MAX_UNCOMPRESSED
 from .fileops import explain_os_error
-from .layout import DriveLayout
-from .progress import CancelToken, ProgressEvent, ProgressFn
+from .layout import APPS_DIR, REWII_DIR, DriveLayout
+from .progress import UNIT_STEPS, CancelToken, ProgressEvent, ProgressFn
+from .errors import ReWiiError
 
 OSC_API = "https://hbb1.oscwii.org/api/v4/contents"
 INDEX_MAX_AGE = 86400
 RECORD_NAME = "osc_installed.json"
 MAX_INDEX_BYTES = 32 * 1024 ** 2
 MAX_ARCHIVE_BYTES = 2 * 1024 ** 3     # largest app zip ReWii will download
-CATEGORIES = ("utilities", "games", "emulators", "media", "demos")
 PLATFORMS = ("wii", "vwii", "wii_mini")
 # Settings.console_type -> OSC platform name
-PLATFORM_BY_CONSOLE = {"wii": "wii", "vwii": "vwii", "mini": "wii_mini", "family": "wii",
+PLATFORM_BY_CONSOLE = {**{ct: console.osc_platform(ct) for ct in console.CONSOLE_TYPES},
                        "wii_mini": "wii_mini", "": ""}
 
 
-class OSCError(Exception):
+class OSCError(ReWiiError):
     """Bad archive or install problem."""
 
 
@@ -115,7 +115,7 @@ class App:
         out: list[str] = []
         for s in self.subdirectories:
             parts = [p for p in s.replace("\\", "/").split("/") if p]
-            if (len(parts) >= 2 and parts[0].lower() == "apps" and parts[1] not in out
+            if (len(parts) >= 2 and parts[0].lower() == APPS_DIR and parts[1] not in out
                     and _plain_name(parts[1])):
                 out.append(parts[1])
         return out or [self.slug]
@@ -125,13 +125,13 @@ class App:
         """Drive-relative folders (lower-case POSIX) this app may write into: every
         ``apps/<folder>`` it owns plus the ``subdirectories`` the index declares.
         ReWii's own ``rewii/`` folder is never included."""
-        out = [f"apps/{f.lower()}" for f in self.app_folders if _plain_name(f)]
+        out = [f"{APPS_DIR}/{f.lower()}" for f in self.app_folders if _plain_name(f)]
         for s in self.subdirectories:
             parts = [p for p in s.replace("\\", "/").split("/") if p]
             if not parts or not all(_plain_name(p) for p in parts):
                 continue
             d = "/".join(parts).lower()
-            if d == "apps" or parts[0].lower() == RESERVED_TOP or d in out:
+            if d == APPS_DIR or parts[0].lower() == RESERVED_TOP or d in out:
                 continue
             out.append(d)
         return out
@@ -145,9 +145,6 @@ class App:
     def writes_to_nand(self) -> bool:
         return "WRITES_TO_NAND" in self.flags
 
-    @property
-    def deprecated(self) -> bool:
-        return "DEPRECATED" in self.flags
 
     def supports(self, platform: str) -> bool:
         p = PLATFORM_BY_CONSOLE.get(platform, platform)
@@ -162,7 +159,7 @@ def _plain_name(part: str) -> bool:
         return False
 
 
-RESERVED_TOP = "rewii"     # ReWii's own records; no app may write there
+RESERVED_TOP = REWII_DIR     # ReWii's own records; no app may write there
 
 
 def _index_ok(p: Path) -> bool:
@@ -302,10 +299,7 @@ def _load_records(layout: DriveLayout) -> dict[str, dict[str, str]]:
 def _save_records(layout: DriveLayout, rec: dict[str, dict[str, str]]) -> None:
     layout.require_root()
     layout.rewii.mkdir(parents=True, exist_ok=True)
-    p = layout.rewii / RECORD_NAME
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(rec, indent=2, sort_keys=True), "utf-8")
-    tmp.replace(p)
+    fileops.write_atomic(layout.rewii / RECORD_NAME, json.dumps(rec, indent=2, sort_keys=True))
 
 
 def _scan(folder: Path, nested: bool, records: dict[str, dict[str, str]]) -> InstalledApp:
@@ -328,31 +322,17 @@ def installed_apps(layout: DriveLayout) -> list[InstalledApp]:
     for d in sorted(layout.apps.iterdir(), key=lambda p: p.name.lower()):
         if not d.is_dir():
             continue
-        if d.name.lower() == "apps":
+        if d.name.lower() == APPS_DIR:
             for sub in sorted(d.iterdir(), key=lambda p: p.name.lower()):
                 if sub.is_dir():
                     out.append(_scan(sub, True, records))
             continue
         out.append(_scan(d, False, records))
-        inner = d / "apps"
+        inner = d / APPS_DIR
         if inner.is_dir() and _boot_file(d) is None:
             for sub in sorted(inner.iterdir(), key=lambda p: p.name.lower()):
                 if sub.is_dir():
                     out.append(_scan(sub, True, records))
-    return out
-
-
-def misplaced_apps(layout: DriveLayout) -> list[Path]:
-    """Folders holding a boot.dol/elf that the Homebrew Channel won't see: nested
-    ``apps/apps/<x>`` style folders and app folders at the drive root."""
-    out = [a.path for a in installed_apps(layout) if a.nested and a.boot_file]
-    try:
-        roots = [p for p in layout.root.iterdir() if p.is_dir()]
-    except OSError:
-        roots = []
-    for p in roots:
-        if p.name.lower() != "apps" and _boot_file(p) and (p / "meta.xml").is_file():
-            out.append(p)
     return out
 
 
@@ -385,20 +365,20 @@ def plan_archive(names: Sequence[str], default_folder: str) -> dict[str, str]:
         return {}
     tops = {p[0].lower() for _, p in entries}
     # strip a wrapper folder (e.g. "MyApp-1.0/apps/MyApp/boot.dol")
-    if len(tops) == 1 and "apps" not in tops and all(len(p) > 1 for _, p in entries):
-        if any(p[1].lower() == "apps" for _, p in entries):
+    if len(tops) == 1 and APPS_DIR not in tops and all(len(p) > 1 for _, p in entries):
+        if any(p[1].lower() == APPS_DIR for _, p in entries):
             entries = [(n, p[1:]) for n, p in entries]
             tops = {p[0].lower() for _, p in entries}
-    if "apps" not in tops:
+    if APPS_DIR not in tops:
         boots = [p for _, p in entries if p[-1].lower() in ("boot.dol", "boot.elf")]
         if any(len(p) == 1 for p in boots):
-            entries = [(n, ["apps", default_folder, *p]) for n, p in entries]
+            entries = [(n, [APPS_DIR, default_folder, *p]) for n, p in entries]
         elif boots and len(tops) == 1 and all(len(p) == 2 for p in boots):
-            entries = [(n, ["apps", *p]) for n, p in entries]
+            entries = [(n, [APPS_DIR, *p]) for n, p in entries]
     plan: dict[str, str] = {}
     for n, p in entries:
-        if p[0].lower() == "apps":
-            p = ["apps", *p[1:]]
+        if p[0].lower() == APPS_DIR:
+            p = [APPS_DIR, *p[1:]]
         plan[n] = "/".join(p)
     return plan
 
@@ -486,11 +466,11 @@ def _archive_ok(app: App, zip_path: Path) -> bool:
     """
     if not app.archive_hash:
         return True
-    if _md5(zip_path) == app.archive_hash.lower():
+    if fileops.hash_file(zip_path, "md5") == app.archive_hash.lower():
         return True
     if not app.binary_hash or not _plain_name(app.folder):
         return False
-    base = f"apps/{app.folder.lower()}/"
+    base = f"{APPS_DIR}/{app.folder.lower()}/"
     try:
         with zipfile.ZipFile(zip_path) as zf:
             plan = archive.plan_zip(zf, lambda names: plan_archive(names, app.folder))
@@ -507,14 +487,6 @@ def _archive_ok(app: App, zip_path: Path) -> bool:
         return False
 
 
-def _md5(path: Path) -> str:
-    h = hashlib.md5()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def _phase(progress: Optional[ProgressFn], start: float, span: float, label: str
            ) -> Optional[ProgressFn]:
     """Map a sub-operation's progress into [start, start+span] of 1000 units."""
@@ -523,7 +495,7 @@ def _phase(progress: Optional[ProgressFn], start: float, span: float, label: str
 
     def fn(ev: ProgressEvent) -> None:
         progress(ProgressEvent(int((start + span * ev.fraction) * 1000), 1000,
-                               f"{label}: {ev.message}" if ev.message else label))
+                               f"{label}: {ev.message}" if ev.message else label, UNIT_STEPS))
     return fn
 
 
@@ -639,21 +611,37 @@ class StarterItem:
     essential: bool
     why: str
     platforms: tuple[str, ...] = PLATFORMS     # restrict beyond OSC's own list
+    name: str = ""                             # display name ("" = the slug)
+    required: bool = False                     # the drive can't play games without it
+
+    @property
+    def title(self) -> str:
+        return self.name or self.slug
+
+    @property
+    def folder(self) -> str:
+        """Its folder under ``apps/`` (the shop installs each app as ``apps/<slug>``)."""
+        return self.slug
 
 
+#: THE list of apps ReWii sets a drive up with. "Set up" installs the essential ones,
+#: the drive health check looks for them (``health.check_apps``), and the guides'
+#: "prepare" buttons install theirs from here.
 STARTER_KIT: tuple[StarterItem, ...] = (
-    StarterItem("usbloader_gx", True, "Game loader (Wii + GameCube via Nintendont)"),
-    StarterItem("Nintendont", True, "Plays GameCube games from USB"),
-    StarterItem("yawmME", True, "Installs WADs/channels from the wad/ folder"),
-    StarterItem("SaveGame_Manager_GX", True, "Backs up and restores Wii saves on USB"),
-    StarterItem("wiixplorer", True, "File manager on the Wii"),
+    StarterItem("usbloader_gx", True, "Game loader (Wii + GameCube via Nintendont)",
+                name="USB Loader GX", required=True),
+    StarterItem("Nintendont", True, "Plays GameCube games from USB", required=True),
+    StarterItem("yawmME", True, "Installs WADs/channels from the wad/ folder", name="YAWMME"),
+    StarterItem("SaveGame_Manager_GX", True, "Backs up and restores Wii saves on USB",
+                name="SaveGame Manager GX"),
+    StarterItem("wiixplorer", True, "File manager on the Wii", name="WiiXplorer"),
     StarterItem("d2x-cios-installer", True, "Installs d2x cIOS needed by USB loaders",
-                ("wii",)),
+                ("wii",), name="d2x cIOS Installer"),
     StarterItem("d2x-cios-installer-vwii", True, "Installs d2x cIOS on a Wii U (vWii)",
-                ("vwii",)),
-    StarterItem("priiloader", True, "Brick protection; also patches the System Menu"),
-    StarterItem("nanddumper_ios", True, "Backs up the console's NAND to USB"),
-    StarterItem("SysCheckME", True, "Reports installed IOS/cIOS for health checks"),
+                ("vwii",), name="d2x cIOS Installer (vWii)"),
+    StarterItem("priiloader", True, "Brick protection; also patches the System Menu", name="Priiloader"),
+    StarterItem("nanddumper_ios", True, "Backs up the console's NAND to USB", name="NAND Dumper"),
+    StarterItem("SysCheckME", True, "Reports installed IOS/cIOS for health checks", name="SysCheck ME"),
     StarterItem("LoadPriiloader", False, "Opens Priiloader from the Homebrew Channel"),
     StarterItem("CleanRip", False, "Dumps your own Wii/GameCube discs to USB"),
     StarterItem("sntp", False, "Sets the Wii clock from the internet"),
@@ -684,7 +672,7 @@ def starter_kit(platform: str = "", which: str | Iterable[str] = "essential"
         elif which == "all":
             items = list(STARTER_KIT)
         else:
-            raise ValueError(f"unknown starter kit selection: {which!r}")
+            raise OSCError(f"unknown starter kit selection: {which!r}")
     else:
         wanted = {s.lower() for s in which}
         items = [i for i in STARTER_KIT if i.slug.lower() in wanted]
@@ -712,6 +700,30 @@ class StarterKitReport:
     not_found: list[str] = field(default_factory=list)     # no longer on OSC
     failed: dict[str, str] = field(default_factory=dict)
     needs_console: list[str] = field(default_factory=list)  # left out: console type not set
+
+
+def kit_lines(rep: StarterKitReport) -> tuple[list[str], bool]:
+    """Plain-language lines for an ``osc.StarterKitReport`` and whether anything went wrong."""
+    failed = dict(rep.failed)
+    lines = []
+    if rep.installed:
+        lines.append("Installed: " + ", ".join(rep.installed))
+    elif not (failed or rep.not_found or rep.unsupported):
+        lines.append("Everything was already installed and up to date.")
+    else:
+        lines.append("Nothing was installed.")
+    if failed:
+        lines.append("Failed:\n" + "\n".join(f"  {k}: {v}" for k, v in failed.items()))
+    if rep.not_found:
+        lines.append("Not on the Open Shop Channel any more: " + ", ".join(rep.not_found))
+    if rep.unsupported:
+        lines.append("Not for this console type (skipped): " + ", ".join(rep.unsupported))
+    if rep.needs_console:
+        lines.append("Left out because the console type isn't set yet: " + ", ".join(rep.needs_console)
+                     + ".\nThe cIOS installer depends on the console (Wii, Wii U or Wii mini). Set the "
+                     "console in Settings, then use System & Guides \u2192 cIOS \u2192 \"Prepare files "
+                     "for this guide\" to put the right one on the drive.")
+    return lines, bool(failed or rep.not_found)
 
 
 def install_starter_kit(layout: DriveLayout, platform: str = "",
@@ -757,5 +769,5 @@ def install_starter_kit(layout: DriveLayout, platform: str = "",
             if not layout.connected():        # every other app would fail the same way
                 break
     if progress is not None:
-        progress(ProgressEvent(1000, 1000, "Starter kit done"))
+        progress(ProgressEvent(1000, 1000, "Starter kit done", UNIT_STEPS))
     return report

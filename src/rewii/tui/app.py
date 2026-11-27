@@ -12,7 +12,8 @@ from textual.containers import Horizontal
 from textual.widgets import ContentSwitcher, Footer, Header, ListItem, ListView, Label
 
 from .. import __version__
-from ..core.config import Settings, config_dir
+from ..core import config
+from ..core.config import Settings
 from ..core.layout import DriveLayout
 
 if TYPE_CHECKING:
@@ -97,7 +98,10 @@ class ReWiiApp(App):
     def on_mount(self) -> None:
         self._update_subtitle()
         self.load_titles()
-        self.check_update()
+        self.purge_stale_temp()
+        from ..core import sysfiles
+        if sysfiles.UPDATE_REPO:              # no repository configured: nothing to check, no thread
+            self.check_update()
         self.pane("home").reload()
         for msg in self.startup_problems:
             self.notify(msg, severity="error", timeout=30)
@@ -179,6 +183,18 @@ class ReWiiApp(App):
         except Exception:  # noqa: BLE001 - pane not mounted yet
             pass
 
+    @work(thread=True, exclusive=True, group="cleanup")
+    def purge_stale_temp(self) -> None:
+        """Once per start: remove what an interrupted copy/conversion left behind
+        (listing games no longer does this as a side effect)."""
+        try:
+            from ..core.games import purge_stale_temp
+            removed = purge_stale_temp(self.settings, self.drive_layout)
+            if removed:
+                log.info("removed %d leftover temporary file(s): %s", len(removed), ", ".join(map(str, removed)))
+        except Exception as e:  # noqa: BLE001 - housekeeping must never stop the app
+            log.info("cleanup of temporary files failed: %s", e)
+
     @work(thread=True, exclusive=True, group="update")
     def check_update(self) -> None:
         try:
@@ -215,7 +231,7 @@ class ReWiiApp(App):
 
 
 def setup_logging() -> Path:
-    p = config_dir() / "rewii.log"
+    p = config.config_dir() / "rewii.log"
     logging.basicConfig(filename=p, level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     return p

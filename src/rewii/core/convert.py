@@ -16,7 +16,6 @@ GameCube results stay ISO.
 """
 from __future__ import annotations
 
-import hashlib
 import os
 import platform as _platform
 import shutil
@@ -29,10 +28,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from . import net
-from .config import cache_dir
+from . import fileops, net
+from . import config
 from .disc import NEEDS_CONVERSION, CisoReader, DiscError, WbfsFileReader, sniff_format
 from .progress import Cancelled, CancelToken, ProgressFn, Reporter
+from .errors import ReWiiError
 
 #: Pinned nodtool release and the SHA-256 digests GitHub reports for its assets
 #: (api.github.com/repos/encounter/nod/releases, ``assets[].digest``).
@@ -67,7 +67,7 @@ INPUT_FORMATS = TOOL_FORMATS | {"CISO", "WBFS", "ISO"}
 POLL = 0.25
 
 
-class ConvertError(Exception):
+class ConvertError(ReWiiError):
     """Conversion failed; the message is plain language."""
 
 
@@ -94,7 +94,7 @@ def host_platform() -> tuple[str, str]:
 
 
 def tools_dir() -> Path:
-    p = cache_dir() / "tools"
+    p = config.cache_dir() / "tools"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -149,7 +149,7 @@ def _cached_tool_ok(tool: Path) -> bool:
         except (OSError, ValueError):
             pass
         try:
-            _verified[key] = _sha256(tool) in want
+            _verified[key] = fileops.hash_file(tool, "sha256") in want
         except OSError:
             return False
     return _verified[key]
@@ -181,14 +181,6 @@ def tool_available() -> bool:
     """True if nodtool is cached or on PATH (never downloads)."""
     c = cached_tool_path()
     return (c.is_file() and _cached_tool_ok(c)) or _which("nodtool") is not None
-
-
-def _sha256(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for b in iter(lambda: f.read(1 << 20), b""):
-            h.update(b)
-    return h.hexdigest()
 
 
 def _asset_for_host(latest: bool) -> tuple[str, str, str]:
@@ -240,11 +232,11 @@ def ensure_tool(progress: ProgressFn | None = None, cancel: CancelToken | None =
     tmp = tmp_dir / dest.name
     try:
         try:
-            net.download(url, tmp, progress=progress, cancel=cancel)
+            net.download(url, tmp, sha256=digest, progress=progress, cancel=cancel)
+        except net.ChecksumMismatch:
+            raise ConvertError("The downloaded converter failed its checksum and was deleted.") from None
         except net.NetError as e:
             raise ConvertError(f"Could not download the disc converter (nodtool): {e}") from e
-        if _sha256(tmp) != digest.lower():
-            raise ConvertError("The downloaded converter failed its checksum and was deleted.")
         if os.name != "nt":
             tmp.chmod(0o755)
         _digest_file(dest).write_text(digest.lower(), "ascii")
@@ -328,13 +320,6 @@ def _run(cmd: list[str], out: Path, expected: int, rep: Reporter) -> None:
             raise ConvertError("The converter failed: " + (" / ".join(tail) or f"exit code {rc}"))
 
 
-def _copy(src: Path, out: Path, rep: Reporter) -> None:
-    with open(src, "rb") as fi, open(out, "wb") as fo:
-        for b in iter(lambda: fi.read(4 << 20), b""):
-            fo.write(b)
-            rep.advance(len(b))
-
-
 def _is_nkit_iso(path: Path) -> bool:
     try:
         with open(path, "rb") as f:
@@ -379,12 +364,12 @@ def to_iso(src: Path | str, dest: Path | str, progress: ProgressFn | None = None
     expected = expected_iso_size(src, fmt)
     dest.parent.mkdir(parents=True, exist_ok=True)
     # ReWii's own staging name (tools pick the output format from the ".iso" ending)
-    work = dest.with_name(f".rewii-tmp-{dest.stem}.iso")
+    work = dest.with_name(f"{fileops.TEMP_PREFIX}{dest.stem}.iso")
     work.unlink(missing_ok=True)
     try:
         if fmt == "ISO":
             rep.set_total(expected, f"Copying {src.name}")
-            _copy(src, work, rep)
+            fileops.copy_into(src, work, rep)
         elif fmt in ("CISO", "WBFS"):
             from .wbfs import write_iso
             reader = CisoReader(src) if fmt == "CISO" else WbfsFileReader(src)

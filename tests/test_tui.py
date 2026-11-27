@@ -27,8 +27,6 @@ SIZE = (160, 50)
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
     """Settings/cache in the temp dir, no background downloads, no sockets, no real drives."""
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setattr(Settings, "path", classmethod(lambda cls: tmp_path / "cfg" / "settings.json"))
     monkeypatch.setattr(ReWiiApp, "load_titles", lambda self: None)
     monkeypatch.setattr(ReWiiApp, "check_update", lambda self: None)
@@ -156,10 +154,7 @@ def test_duplicate_copies_get_their_own_rows():
 
 
 def test_channel_id_collision_warning():
-    from rewii.core import channels as CH
     from rewii.tui.panes._channels import collision_warning
-    if not hasattr(CH, "channel_id_collisions"):
-        pytest.skip("core has no channel_id_collisions yet")
     a, b, c = (_game("RMCE01", "/d/a", "drive", "Kart"), _game("SMCE01", "/d/b", "drive", "Other"),
                _game("RZZE01", "/d/c", "drive", "Lonely"))
     w = collision_warning([a], [a, b, c])
@@ -389,6 +384,61 @@ async def test_settings_rejects_empty_and_relative_library(tmp_path):
         pane.query_one("#save", Button).press()
         await settle(pilot)
         assert app.settings.library_dir == str(new) and (new / "Games" / "Wii").is_dir()
+
+
+async def test_settings_shows_and_clears_the_korean_region_flag(tmp_path):
+    from textual.widgets import Switch
+    app = make_app(tmp_path, console_type="wii", console_region="NTSC-U", korean_region_changed=True)
+    async with app.run_test(size=SIZE) as pilot:
+        app.action_section("settings")
+        await settle(pilot)
+        pane = app.pane("settings")
+        sw = pane.query_one("#korean", Switch)
+        assert sw.value is True
+        sw.value = False
+        pane.query_one("#save", Button).press()
+        await settle(pilot)
+        assert app.settings.korean_region_changed is False and Settings.load().korean_region_changed is False
+
+
+async def test_system_lists_and_removes_riivolution_mods_and_lists_themes(tmp_path, monkeypatch):
+    import zipfile
+    from rewii.core import riivolution as RV
+    from rewii.core import themes as TH
+    app = make_app(tmp_path)
+    drive = tmp_path / "drive"
+    z = tmp_path / "MyMod.zip"
+    with zipfile.ZipFile(z, "w") as zf:
+        zf.writestr("riivolution/mymod.xml", '<wiidisc version="1"><id game="RMC"/><options/></wiidisc>')
+        zf.writestr("MyMod/file.szs", b"data")
+    RV.install_mod(z, drive, app.settings)
+    assert [m.name for m in RV.list_installed_mods(drive)] == ["MyMod"]
+    (drive / "themes").mkdir()
+    (drive / "themes" / "dark.csm").write_bytes(b"x")
+    monkeypatch.setattr(TH, "list_staged_themes", lambda lay: [
+        TH.ThemeInfo(path=drive / "themes" / "dark.csm", is_u8=True, is_theme=True, regions=["U"], major=4, minor=3)])
+    async with app.run_test(size=SIZE) as pilot:
+        app.action_section("system")
+        await settle(pilot)
+        pane = app.pane("system")
+        pane.query_one("#themes", Button).press()
+        dlg = await dialog(pilot, Wd.Choice)
+        assert "dark.csm" in dlg.body and "4.3U" in dlg.body and "NTSC-U" in dlg.body
+        dlg.query_one("#b", Button).press()                      # Done
+        await closed(pilot)
+        pane.query_one("#riivo", Button).press()
+        dlg = await dialog(pilot, Wd.Choice)
+        assert "MyMod" in dlg.body and "RMC" in dlg.body
+        dlg.query_one("#b", Button).press()                      # Remove a mod…
+        (await dialog(pilot, Wd.ChoiceForm)).query_one("#yes", Button).press()
+        dlg = await dialog(pilot, Wd.Confirm)
+        assert "MyMod" in dlg.body
+        dlg.query_one("#yes", Button).press()
+        msg = await dialog(pilot, Wd.Message)
+        assert "MyMod" in msg.body and "removed" in msg.body
+        await pilot.press("escape")
+        await closed(pilot)
+    assert RV.list_installed_mods(drive) == [] and not (drive / "MyMod" / "file.szs").exists()
 
 
 # --------------------------------------------------------------------------- file picker

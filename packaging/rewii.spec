@@ -1,8 +1,9 @@
 # PyInstaller spec: builds a single-file `rewii` executable for the current OS.
 #   uv run pyinstaller packaging/rewii.spec --noconfirm
-from PyInstaller.utils.hooks import collect_all, collect_data_files
+from PyInstaller.utils.hooks import collect_all, collect_data_files, copy_metadata
 
 datas = collect_data_files("rewii", includes=["assets/**/*"])
+datas += copy_metadata("rewii")          # rewii.__version__ reads the version from the package metadata
 binaries = []
 hidden = ["rewii.tui.panes." + m for m in
           ("home", "drive", "games", "channels", "homebrew", "saves", "backups", "system", "settings")]

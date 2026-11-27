@@ -61,8 +61,9 @@ def layout(tmp_path) -> DriveLayout:
     lay = DriveLayout(tmp_path / "usb")
     lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     lay.ensure_dirs()
-    for name in ("usbloader_gx", "nintendont", "yawmme", "savegame_manager_gx", "wiixplorer"):
-        app(lay, name)
+    from rewii.core import osc
+    for item in osc.starter_kit("", "essential"):      # what "Set up" installs
+        app(lay, item.folder.lower())
     return lay
 
 
@@ -151,7 +152,14 @@ def test_missing_starter_apps(tmp_path):
     assert f.fix_id == "install_starter_apps" and not f.auto_fixable
     app(lay, "Nintendont")                        # case-insensitive
     f = next(f for f in check(lay) if f.id == "missing_apps")
-    assert f.severity == INFO
+    assert f.severity == INFO                     # can play games; the rest of the kit is advice
+    # the check looks for exactly what "Set up" installs (one list: osc.STARTER_KIT)
+    from rewii.core import osc
+    assert set(f.data["missing"]) == {i.slug.lower() for i in osc.starter_kit("", "essential")} - {
+        "usbloader_gx", "nintendont"}
+    for item in osc.starter_kit("", "essential"):
+        app(lay, item.folder)
+    assert not [f for f in check(lay) if f.id == "missing_apps"]
 
 
 # --------------------------------------------------------------------------- Wii games
@@ -283,7 +291,7 @@ def test_split_file(tmp_path):
     assert [x.name for x in parts] == ["RMCE01.wbfs", "RMCE01.wbf1", "RMCE01.wbf2"]
     assert [x.stat().st_size for x in parts] == [2048, 2048, 904]
     assert b"".join(x.read_bytes() for x in parts) == data
-    with pytest.raises(ValueError):
+    with pytest.raises(FixError):
         split_file(tmp_path / "x.iso")
 
 

@@ -10,7 +10,7 @@ from textual.containers import Horizontal
 from textual.widgets import Button, DataTable, Input, Label, Select, Static
 
 from ...core import osc
-from ...core.progress import Cancelled, Reporter
+from ...core.progress import UNIT_STEPS, Cancelled, Reporter
 from ..base import FAILED, Pane, kit_lines, titles
 from ..widgets import MarkTable, human_size
 
@@ -257,7 +257,7 @@ class HomebrewPane(Pane):
             return
 
         def run(progress: Any, cancel: Any) -> list[str]:
-            rep = Reporter(progress, cancel, total=len(targets))
+            rep = Reporter(progress, cancel, total=len(targets), unit=UNIT_STEPS)
             errs = []
             for i in targets:
                 rep.note(f"Removing {i.display_name}")

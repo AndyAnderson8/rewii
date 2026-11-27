@@ -8,32 +8,36 @@ user's console (:func:`classify_risk`), and copies chosen WADs into the drive's
 """
 from __future__ import annotations
 
+import dataclasses
+import functools
 import hashlib
-import os
-import re
 import string
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from libWiiPy.archive.u8 import IMETHeader
 from libWiiPy.title import Title
 from libWiiPy.title.crypto import decrypt_content
 
+from . import console, fileops
 from .config import Settings
+from .console import PLATFORM_MINI, PLATFORM_VWII, PLATFORM_WII, REGIONS, ConsoleProfile
 from .disc import REGION_BY_CHAR
-from .layout import DriveLayout
-from .progress import CancelToken, ProgressFn, Reporter
+from .findings import Severity
+from .layout import DriveLayout, safe_name
+from .progress import UNIT_STEPS, CancelToken, ProgressFn, Reporter
+from .errors import ReWiiError
 
 COPY_CHUNK = 4 * 1024 * 1024
 
 
-class WadError(Exception):
+class WadError(ReWiiError):
     """The file is not a readable WAD."""
 
 
-class Refused(Exception):
+class Refused(WadError):
     """ReWii refuses an action because it could damage (brick) the console.
 
     The message is plain language and safe to show to the user as-is.
@@ -79,26 +83,17 @@ T_UNKNOWN = "Unknown"
 
 SYSTEM_LEVEL_TYPES = {T_BOOT2, T_SYSTEM_MENU, T_IOS, T_BC, T_MIOS, T_SYSTEM}
 
-#: TMD region field -> ReWii region name (config.REGIONS)
-TMD_REGIONS = {0: "NTSC-J", 1: "NTSC-U", 2: "PAL", 3: "Region free", 4: "NTSC-K"}
+#: TMD region field -> ReWii region name (see :mod:`rewii.core.console`)
+TMD_REGIONS = console.TMD_REGIONS
 
-#: System Menu version (v512 = 4.3J ...) -> region, from version & 0x1F.
-#: Wii: 4.3J v512, 4.3U v513, 4.3E v514, 4.3K v518; vWii: v608/609/610 etc.
-_SM_REGION_BY_LOW = {0: "NTSC-J", 1: "NTSC-U", 2: "PAL", 6: "NTSC-K"}
-
-COMMON_KEY_NAMES = {0: "Normal", 1: "Korean", 2: "vWii"}
 
 #: IOS slots a System Menu runs on (3.2: 30, 3.3K: 40, 3.4: 50, 3.5K: 52, 4.0/4.1: 60,
 #: 4.2: 70, 4.3 and vWii: 80). A broken or stubbed copy of the one in use is an instant brick.
 MENU_IOS_SLOTS = frozenset({30, 40, 50, 52, 60, 70, 80})
-#: Title IDs of those IOS (lower-case hex; vWii WADs carry the same 00000001 IDs).
-SYSTEM_MENU_IOS = frozenset(f"{HIGH_SYSTEM}{n:08x}" for n in MENU_IOS_SLOTS)
 
-#: The only System Menu ReWii lets through: 4.3 for the console's platform and region.
-SYSTEM_MENU_43 = {
-    ("wii", "NTSC-J"): 512, ("wii", "NTSC-U"): 513, ("wii", "PAL"): 514, ("wii", "NTSC-K"): 518,
-    ("vwii", "NTSC-J"): 608, ("vwii", "NTSC-U"): 609, ("vwii", "PAL"): 610,
-}
+#: The only System Menu ReWii lets through: 4.3 for the console's platform and region
+#: ``{(platform, region): title version}`` - a view of :data:`console.SYSMENU_43`.
+SYSTEM_MENU_43 = {key: m.version for key, m in console.SYSMENU_43.items()}
 
 
 def is_menu_ios(title_id: str) -> bool:
@@ -121,7 +116,7 @@ def is_stub_ios_version(version: int) -> bool:
 
 def system_menu_region(version: int) -> str | None:
     """Region of a System Menu title version (e.g. 513 -> "NTSC-U")."""
-    return _SM_REGION_BY_LOW.get(version & 0x1F)
+    return console.sysmenu_region(version)
 
 
 def title_ascii(title_id: str) -> str:
@@ -220,9 +215,6 @@ class WadInfo:
     def pretty_id(self) -> str:
         return pretty_title_id(self.title_id)
 
-    @property
-    def common_key_name(self) -> str:
-        return COMMON_KEY_NAMES.get(self.common_key_index, f"Unknown ({self.common_key_index})")
 
     @property
     def is_system(self) -> bool:
@@ -232,6 +224,17 @@ class WadInfo:
     def ios_slot(self) -> Optional[int]:
         """IOS number when this WAD is an IOS (e.g. 58)."""
         return int(self.title_id[8:], 16) if self.title_type == T_IOS else None
+
+    @functools.cached_property
+    def forwarder_game_id(self) -> Optional[str]:
+        """The game this WAD boots if it is a ReWii/CRAP game channel, else None.
+
+        Worked out on first use (and remembered): only the WAD's small loader
+        content is read and decrypted, never the whole file."""
+        if self.path is None or self.is_system or self.num_contents < 2:
+            return None
+        from .forwarder import channel_game_id
+        return channel_game_id(self.path)
 
 
 def _channel_name(title: Title) -> str:
@@ -389,18 +392,24 @@ def inspect_wad(path: Path | str, *, verify_hashes: bool = True,
 class Risk:
     """One finding about installing a WAD. ``level`` is "error" (blocked), "warning" or "info"."""
 
-    level: str
+    level: Severity
     code: str
     message: str
 
+    def __post_init__(self) -> None:
+        self.level = Severity(self.level)
+
+    @property
+    def severity(self) -> Severity:
+        """Same as ``level`` (the name :class:`rewii.core.findings.Finding` uses)."""
+        return self.level
+
     @property
     def blocks(self) -> bool:
-        return self.level == "error"
+        return self.level is Severity.ERROR
 
 
-def _console_label(ct: str) -> str:
-    return {"wii": "Wii", "vwii": "Wii U (vWii)", "mini": "Wii mini",
-            "family": "Wii Family Edition"}.get(ct, ct or "unknown console")
+_AddRisk = Callable[[str, str, str], None]
 
 
 def classify_risk(info: WadInfo, settings: Settings) -> list[Risk]:
@@ -411,102 +420,25 @@ def classify_risk(info: WadInfo, settings: Settings) -> list[Risk]:
     titles on a Wii. Warnings explain what could go wrong; infos are notes.
     """
     risks: list[Risk] = []
-    ct = settings.console_type
-    reg = settings.console_region
-    wii_like = ct in ("wii", "family")
-    label = _console_label(ct)
+    profile = settings.profile
 
     def add(level: str, code: str, msg: str) -> None:
-        risks.append(Risk(level, code, msg))
+        risks.append(Risk(Severity(level), code, msg))
 
     if info.hashes_ok is False:
         add("error", "corrupt", "This WAD is damaged (its contents don't match their checksums). "
             "Installing it could break the title or the console. Download it again.")
 
-    t = info.title_type
-    if t == T_BOOT2 or info.wad_type == "ib":
+    if info.title_type == T_BOOT2 or info.wad_type == "ib":
         add("error", "boot2", "This WAD contains boot2, the Wii's lowest-level boot code. "
             "Installing it is extremely dangerous and ReWii will never do it.")
         return risks
 
     if info.is_system:
-        what = {"System Menu": "the Wii Menu (System Menu)", "IOS": f"system software ({info.name})"}.get(
-            t, "a core system title")
-        if not ct or not reg:
-            add("error", "profile_unset", f"This WAD replaces {what}. Tell ReWii your console type and "
-                "region first (Settings) so it can check it is the right one.")
+        if not _system_risks(info, profile, add):
             return risks
-        if ct == "mini" and t in (T_SYSTEM_MENU, T_IOS, T_BC, T_MIOS, T_SYSTEM):
-            add("error", "mini_system", f"This WAD replaces {what}. The Wii mini needs its own special "
-                "versions; installing this one will likely brick it.")
-        elif info.platform == "vwii" and wii_like:
-            add("error", "platform_mismatch", f"This WAD is {what} for the Wii U's vWii mode. "
-                f"Installing it on a {label} will brick it.")
-        elif info.platform == "wii" and ct == "vwii":
-            add("error", "platform_mismatch", f"This WAD is {what} for an original Wii. "
-                "Installing it on a Wii U's vWii mode will brick it.")
-        if t == T_SYSTEM_MENU and settings.korean_region_changed:
-            add("error", "korean_region_changed", "This Wii was made for Korea and later changed to another "
-                "region. Installing a Wii Menu 4.2 or newer on it causes Error 003 (a brick).")
-        if t == T_SYSTEM_MENU:
-            sm_reg = system_menu_region(info.version)
-            if sm_reg is None:
-                add("error", "region_unknown", "ReWii can't tell which region this Wii Menu is for, "
-                    "so it won't install it.")
-            elif sm_reg != reg:
-                add("error", "region_mismatch", f"This Wii Menu is for {sm_reg} consoles but yours is "
-                    f"{reg}. Installing it will brick your console.")
-            else:
-                plat = "vwii" if ct == "vwii" else "wii"
-                want = SYSTEM_MENU_43.get((plat, reg))
-                if want is None or info.version != want:
-                    add("error", "menu_version", "ReWii only installs Wii Menu 4.3 for your console "
-                        f"({'v' + str(want) if want else 'not available for this region'}); this "
-                        f"WAD is version v{info.version}. Installing an older or different Wii Menu "
-                        "can brick the console.")
-            if not info.signed:
-                add("error", "modified_menu", "This Wii Menu is modified or not signed by Nintendo. "
-                    "Installing a changed Wii Menu can brick the console; use themes "
-                    "(csm-installer) to change its look instead.")
-            add("warning", "system_menu", "Replacing the Wii Menu is risky. Make sure Priiloader "
-                "(and BootMii, on a Wii) is installed before you continue.")
-        if t == T_IOS:
-            if is_menu_ios(info.title_id):
-                if is_stub_ios_version(info.version):
-                    add("error", "stub_menu_ios", f"{info.name} v{info.version} is an empty placeholder "
-                        "(a \"stub\"). If your Wii Menu runs on this IOS, installing it bricks the "
-                        "console.")
-                elif not info.signed:
-                    add("error", "modified_menu_ios", f"{info.name} is the IOS your Wii Menu runs on, "
-                        "and this copy is modified or not properly signed. Installing it can brick "
-                        "the console.")
-            add("warning", "ios", f"This WAD replaces {info.name}, part of the console's system "
-                "software. Only install IOS from Nintendo's servers or the guide.")
-        if t in (T_BC, T_MIOS, T_SYSTEM):
-            add("warning", "system_title", "This is a core system title. Only install it if a guide "
-                "tells you to.")
     else:
-        if info.common_key_index == 2 and ct and ct != "vwii":
-            add("error", "vwii_key", f"This WAD is encrypted for the Wii U's vWii mode and can't be "
-                f"installed on a {label}.")
-        elif info.platform == "vwii" and ct and ct != "vwii":
-            add("error", "platform_mismatch", f"This is a vWii (Wii U) title. It can't be installed on "
-                f"a {label}.")
-        if t == T_SYSTEM_CHANNEL and ct == "vwii" and info.platform == "wii":
-            add("warning", "wii_system_channel_on_vwii", "This is an original-Wii system channel. vWii "
-                "has its own versions; this one may not work or may cause problems.")
-        if t == T_HIDDEN:
-            add("warning", "hidden", "This is a hidden system title. Only install it if a guide tells "
-                "you to.")
-        if t == T_SYSTEM_CHANNEL and ct and ct != "vwii":
-            add("info", "system_channel", "This is a system channel (for example the Shop or Photo "
-                "channel). Make sure it matches your console region.")
-        if reg and info.region in ("NTSC-U", "PAL", "NTSC-J", "NTSC-K") and info.region != reg:
-            add("warning", "region_mismatch", f"This title is for {info.region} consoles and yours is "
-                f"{reg}. It may not appear or may not start.")
-        if info.common_key_index == 1 and reg and reg != "NTSC-K":
-            add("warning", "korean_key", "This WAD uses the Korean encryption key; it may fail to "
-                "install on non-Korean consoles.")
+        _channel_risks(info, profile, add)
 
     if not info.signed:
         if info.fakesigned:
@@ -518,18 +450,117 @@ def classify_risk(info: WadInfo, settings: Settings) -> list[Risk]:
     return risks
 
 
+def _system_risks(info: WadInfo, profile: ConsoleProfile, add: _AddRisk) -> bool:
+    """Risks of a system-level title (Wii Menu, IOS, BC, MIOS...). False when the
+    console profile isn't set: nothing more can be judged then."""
+    t = info.title_type
+    what = {"System Menu": "the Wii Menu (System Menu)", "IOS": f"system software ({info.name})"}.get(
+        t, "a core system title")
+    if not profile.is_set:
+        add("error", "profile_unset", f"This WAD replaces {what}. Tell ReWii your console type and "
+            "region first (Settings) so it can check it is the right one.")
+        return False
+    if profile.platform == PLATFORM_MINI and t in (T_SYSTEM_MENU, T_IOS, T_BC, T_MIOS, T_SYSTEM):
+        add("error", "mini_system", f"This WAD replaces {what}. The Wii mini needs its own special "
+            "versions; installing this one will likely brick it.")
+    elif info.platform == PLATFORM_VWII and profile.wii_like:
+        add("error", "platform_mismatch", f"This WAD is {what} for the Wii U's vWii mode. "
+            f"Installing it on a {profile.label} will brick it.")
+    elif info.platform == PLATFORM_WII and profile.platform == PLATFORM_VWII:
+        add("error", "platform_mismatch", f"This WAD is {what} for an original Wii. "
+            "Installing it on a Wii U's vWii mode will brick it.")
+    if t == T_SYSTEM_MENU:
+        _system_menu_risks(info, profile, add)
+    if t == T_IOS:
+        if is_menu_ios(info.title_id):
+            if is_stub_ios_version(info.version):
+                add("error", "stub_menu_ios", f"{info.name} v{info.version} is an empty placeholder "
+                    "(a \"stub\"). If your Wii Menu runs on this IOS, installing it bricks the "
+                    "console.")
+            elif not info.signed:
+                add("error", "modified_menu_ios", f"{info.name} is the IOS your Wii Menu runs on, "
+                    "and this copy is modified or not properly signed. Installing it can brick "
+                    "the console.")
+        add("warning", "ios", f"This WAD replaces {info.name}, part of the console's system "
+            "software. Only install IOS from Nintendo's servers or the guide.")
+    if t in (T_BC, T_MIOS, T_SYSTEM):
+        add("warning", "system_title", "This is a core system title. Only install it if a guide "
+            "tells you to.")
+    return True
+
+
+def _system_menu_risks(info: WadInfo, profile: ConsoleProfile, add: _AddRisk) -> None:
+    """A Wii Menu WAD: only 4.3 for exactly this console's platform and region gets through."""
+    reg = profile.region
+    if profile.korean_region_changed:
+        add("error", "korean_region_changed", "This Wii was made for Korea and later changed to another "
+            "region. Installing a Wii Menu 4.2 or newer on it causes Error 003 (a brick).")
+    sm_reg = system_menu_region(info.version)
+    if sm_reg is None:
+        add("error", "region_unknown", "ReWii can't tell which region this Wii Menu is for, "
+            "so it won't install it.")
+    elif sm_reg != reg:
+        add("error", "region_mismatch", f"This Wii Menu is for {sm_reg} consoles but yours is "
+            f"{reg}. Installing it will brick your console.")
+    else:
+        # a Wii mini was already refused above; its menu is judged like an original Wii's
+        plat = PLATFORM_VWII if profile.platform == PLATFORM_VWII else PLATFORM_WII
+        want = SYSTEM_MENU_43.get((plat, reg))
+        if want is None or info.version != want:
+            add("error", "menu_version", "ReWii only installs Wii Menu 4.3 for your console "
+                f"({'v' + str(want) if want else 'not available for this region'}); this "
+                f"WAD is version v{info.version}. Installing an older or different Wii Menu "
+                "can brick the console.")
+    if not info.signed:
+        add("error", "modified_menu", "This Wii Menu is modified or not signed by Nintendo. "
+            "Installing a changed Wii Menu can brick the console; use themes "
+            "(csm-installer) to change its look instead.")
+    add("warning", "system_menu", "Replacing the Wii Menu is risky. Make sure Priiloader "
+        "(and BootMii, on a Wii) is installed before you continue.")
+
+
+def _channel_risks(info: WadInfo, profile: ConsoleProfile, add: _AddRisk) -> None:
+    """Risks of everything that isn't system-level: channels, WiiWare, VC, DLC..."""
+    t = info.title_type
+    ct, reg = profile.console_type, profile.region
+    on_vwii = profile.platform == PLATFORM_VWII
+    if info.common_key_index == 2 and ct and not on_vwii:
+        add("error", "vwii_key", f"This WAD is encrypted for the Wii U's vWii mode and can't be "
+            f"installed on a {profile.label}.")
+    elif info.platform == PLATFORM_VWII and ct and not on_vwii:
+        add("error", "platform_mismatch", f"This is a vWii (Wii U) title. It can't be installed on "
+            f"a {profile.label}.")
+    if t == T_SYSTEM_CHANNEL and on_vwii and info.platform == PLATFORM_WII:
+        add("warning", "wii_system_channel_on_vwii", "This is an original-Wii system channel. vWii "
+            "has its own versions; this one may not work or may cause problems.")
+    if t == T_HIDDEN:
+        add("warning", "hidden", "This is a hidden system title. Only install it if a guide tells "
+            "you to.")
+    if t == T_SYSTEM_CHANNEL and ct and not on_vwii:
+        add("info", "system_channel", "This is a system channel (for example the Shop or Photo "
+            "channel). Make sure it matches your console region.")
+    if reg and info.region in REGIONS and info.region != reg:
+        add("warning", "region_mismatch", f"This title is for {info.region} consoles and yours is "
+            f"{reg}. It may not appear or may not start.")
+    if info.common_key_index == 1 and reg and reg != "NTSC-K":
+        add("warning", "korean_key", "This WAD uses the Korean encryption key; it may fail to "
+            "install on non-Korean consoles.")
+
+
 def is_blocked(risks: Iterable[Risk]) -> bool:
     """True if any risk is an error."""
     return any(r.blocks for r in risks)
 
 
-def ensure_allowed(info: WadInfo, settings: Settings) -> list[Risk]:
-    """Raise :class:`Refused` with the first blocking reason, else return the risks.
+def ensure_allowed(info: WadInfo, settings: Settings) -> tuple[WadInfo, list[Risk]]:
+    """Raise :class:`Refused` with the first blocking reason, else return
+    ``(verified info, risks)``.
 
     A WAD whose contents haven't been checked yet (``info.hashes_ok is None``,
-    e.g. from a quick :func:`scan_wads`) is verified here first - its file is read
-    again and ``info`` is updated in place. If there is no file to check, it is
-    refused: nothing unverified gets through.
+    e.g. from a quick :func:`scan_wads`) is verified here first: its file is read
+    again and a new, fully checked :class:`WadInfo` is returned - ``info`` itself
+    is never changed. If there is no file to check, it is refused: nothing
+    unverified gets through.
     """
     if info.hashes_ok is None:
         if info.path is None:
@@ -540,15 +571,15 @@ def ensure_allowed(info: WadInfo, settings: Settings) -> list[Risk]:
             raise Refused(str(e)) from e
         if full.title_id != info.title_id or full.version != info.version:
             raise Refused("This WAD changed while ReWii was checking it. Try again.")
-        info.hashes_ok, info.bad_contents = full.hashes_ok, full.bad_contents
-        info.signed = full.signed
-        info.tmd_fakesigned, info.ticket_fakesigned = full.tmd_fakesigned, full.ticket_fakesigned
-        info.wad_type, info.platform = full.wad_type, full.platform
+        info = dataclasses.replace(
+            info, hashes_ok=full.hashes_ok, bad_contents=list(full.bad_contents), signed=full.signed,
+            tmd_fakesigned=full.tmd_fakesigned, ticket_fakesigned=full.ticket_fakesigned,
+            wad_type=full.wad_type, platform=full.platform)
     risks = classify_risk(info, settings)
     for r in risks:
         if r.blocks:
             raise Refused(r.message)
-    return risks
+    return info, risks
 
 
 # --------------------------------------------------------------------------- library
@@ -578,36 +609,18 @@ def scan_wads(folder: Path | str, *, recursive: bool = True, verify_hashes: bool
     return res
 
 
-_FAT_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-
-
 def staged_name(path: Path) -> str:
     """A FAT32-safe file name for a WAD in ``wad/``."""
-    stem = _FAT_BAD.sub("", Path(path).stem).strip().rstrip(".") or "title"
-    stem = re.sub(r"\s+", " ", stem)[:80].rstrip(" .") or "title"
-    if re.fullmatch(r"(?i)(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?", stem):
-        stem = "_" + stem           # Windows device names can't be file names
-    return f"{stem}.wad"
-
-
-def _same_file(a: Path, b: Path) -> bool:
-    if a.stat().st_size != b.stat().st_size:
-        return False
-    with open(a, "rb") as fa, open(b, "rb") as fb:
-        while True:
-            x, y = fa.read(COPY_CHUNK), fb.read(COPY_CHUNK)
-            if x != y:
-                return False
-            if not x:
-                return True
+    return safe_name(Path(path).stem, maxlen=80, default="title") + ".wad"
 
 
 def stage_wads(layout: DriveLayout, paths: Iterable[Path | str], progress: ProgressFn | None = None,
-               cancel: CancelToken | None = None, *, settings: Settings | None = None) -> list[Path]:
+               cancel: CancelToken | None = None, *, settings: Settings) -> list[Path]:
     """Copy WADs into the drive's ``wad/`` folder (YAWMME opens it automatically).
 
-    If ``settings`` is given every WAD is checked with :func:`classify_risk`
-    first and :class:`Refused` is raised (nothing copied) if any is blocked.
+    Every WAD is checked with :func:`classify_risk` against the console in
+    ``settings`` first and :class:`Refused` is raised (nothing copied) if any is
+    blocked. ``settings`` is required: nothing reaches ``wad/`` unchecked.
     Identical files already staged are skipped; name clashes get " (2)" etc.
     Returns the staged paths in input order.
     """
@@ -616,12 +629,11 @@ def stage_wads(layout: DriveLayout, paths: Iterable[Path | str], progress: Progr
     for s in srcs:
         if not s.is_file():
             raise WadError(f"{s.name} not found")
-        if settings is not None:
-            info = inspect_wad(s, verify_hashes=True)
-            try:
-                ensure_allowed(info, settings)
-            except Refused as e:
-                raise Refused(f"{s.name}: {e}") from e
+        info = inspect_wad(s, verify_hashes=True)
+        try:
+            ensure_allowed(info, settings)
+        except Refused as e:
+            raise Refused(f"{s.name}: {e}") from e
     rep = Reporter(progress, cancel)
     rep.set_total(sum(s.stat().st_size for s in srcs), "Copying WADs")
     layout.wad.mkdir(parents=True, exist_ok=True)
@@ -632,7 +644,7 @@ def stage_wads(layout: DriveLayout, paths: Iterable[Path | str], progress: Progr
         dest = layout.wad / name
         n = 2
         while dest.exists():
-            if _same_file(s, dest):
+            if fileops.same_content(s, dest):
                 break
             dest = layout.wad / f"{Path(name).stem} ({n}).wad"
             n += 1
@@ -640,23 +652,34 @@ def stage_wads(layout: DriveLayout, paths: Iterable[Path | str], progress: Progr
             rep.advance(s.stat().st_size, f"{s.name} already staged")
             out.append(dest)
             continue
-        tmp = dest.with_name(dest.name + ".part")
-        try:
-            with open(s, "rb") as fi, open(tmp, "wb") as fo:
-                while True:
-                    b = fi.read(COPY_CHUNK)
-                    if not b:
-                        break
-                    fo.write(b)
-                    rep.advance(len(b), f"Copying {s.name}")
-                fo.flush()
-                os.fsync(fo.fileno())
-            os.replace(tmp, dest)
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            raise
+        fileops.copy_atomic(s, dest, rep, fsync=True, keep_times=False, message=f"Copying {s.name}")
         out.append(dest)
     return out
+
+
+def import_wads(settings: Settings, paths: Iterable[Path | str], progress: ProgressFn | None = None,
+                cancel: CancelToken | None = None) -> tuple[list[Path], list[str]]:
+    """Copy WAD files into the library (``settings.wads_dir``).
+
+    Returns ``(imported, skipped)``: the new library paths, and one plain-language
+    line per file left out because a WAD with that name is already there. Nothing
+    is checked here - a WAD is inspected and risk-checked when it is staged."""
+    srcs = [Path(p) for p in paths]
+    dest_dir = settings.wads_dir
+    rep = Reporter(progress, cancel, total=len(srcs), unit=UNIT_STEPS)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    imported: list[Path] = []
+    skipped: list[str] = []
+    for p in srcs:
+        rep.note(f"Copying {p.name}")
+        dst = dest_dir / p.name
+        if dst.exists():
+            skipped.append(f"{p.name}: a WAD with this name is already in the library")
+        else:
+            fileops.copy_atomic(p, dst)
+            imported.append(dst)
+        rep.advance(1)
+    return imported, skipped
 
 
 def list_staged(layout: DriveLayout) -> ScanResult:
@@ -677,7 +700,7 @@ def unstage(layout: DriveLayout, items: Iterable[Path | str]) -> list[Path]:
             p = layout.wad / p
         rp = p.resolve()
         if rp.parent != base or rp.suffix.lower() != ".wad":
-            raise ValueError(f"{p} is not a staged WAD")
+            raise WadError(f"{p} is not a staged WAD")
         if rp.exists():
             rp.unlink()
             removed.append(rp)
@@ -685,77 +708,4 @@ def unstage(layout: DriveLayout, items: Iterable[Path | str]) -> list[Path]:
 
 
 # --------------------------------------------------------------------------- pack / unpack
-def unpack_wad(wad_path: Path | str, out_dir: Path | str, *, skip_hash: bool = False) -> Path:
-    """Unpack a WAD into ``out_dir``.
-
-    Writes ``<tid>.tik``, ``<tid>.tmd``, ``<tid>.cert``, ``<tid>.footer`` (only
-    if the WAD has one) and one decrypted ``<content id, 8 hex>.app`` per content.
-    """
-    wad_path, out = Path(wad_path), Path(out_dir)
-    title = load_title(wad_path.read_bytes())
-    out.mkdir(parents=True, exist_ok=True)
-    tid = title.tmd.title_id.lower()
-    (out / f"{tid}.tik").write_bytes(title.wad.get_ticket_data())
-    (out / f"{tid}.tmd").write_bytes(title.wad.get_tmd_data())
-    (out / f"{tid}.cert").write_bytes(title.wad.get_cert_data())
-    meta = title.wad.get_meta_data()
-    if meta:
-        (out / f"{tid}.footer").write_bytes(meta)
-    for i, rec in enumerate(title.content.content_records):
-        dec = _decrypt(title, i)
-        if not skip_hash and hashlib.sha1(dec).hexdigest() != rec.content_hash.decode().lower():
-            raise WadError(f"Content {rec.content_id:08x} is damaged (checksum mismatch)")
-        (out / f"{rec.content_id:08x}.app").write_bytes(dec)
-    return out
-
-
-def _one(folder: Path, suffix: str) -> Path:
-    found = [p for p in folder.iterdir() if p.suffix.lower() == suffix]
-    if len(found) != 1:
-        raise WadError(f"Expected exactly one {suffix} file in {folder.name}, found {len(found)}")
-    return found[0]
-
-
-def pack_wad(folder: Path | str, dest: Path | str, *, fakesign: Optional[bool] = None) -> Path:
-    """Pack an unpacked WAD folder (see :func:`unpack_wad`) back into a WAD.
-
-    Changed ``.app`` files are re-encrypted and their size/hash updated in the
-    TMD. ``fakesign``: None = only if something changed, True = always, False = never.
-    """
-    folder, dest = Path(folder), Path(dest)
-    title = Title()
-    title.load_tmd(_one(folder, ".tmd").read_bytes())
-    title.load_ticket(_one(folder, ".tik").read_bytes())
-    from libWiiPy.title.cert import CertificateChain
-    chain = CertificateChain()
-    try:
-        chain.load(_one(folder, ".cert").read_bytes())
-    except WadError:
-        raise
-    except Exception as e:
-        raise WadError(f"Certificate chain is invalid ({e})") from e
-    title.cert_chain = chain
-    title.load_content_records()
-    files = {p.name.lower(): p for p in folder.iterdir() if p.suffix.lower() == ".app"}
-    changed = False
-    for i, rec in enumerate(list(title.content.content_records)):
-        p = files.get(f"{rec.content_id:08x}.app")
-        if p is None:
-            raise WadError(f"Missing content {rec.content_id:08x}.app")
-        dec = p.read_bytes()
-        if hashlib.sha1(dec).hexdigest() == rec.content_hash.decode().lower():
-            title.content.load_content(dec, i, title.ticket.get_title_key())
-        else:
-            title.set_content(dec, i)
-            changed = True
-    footers = [p for p in folder.iterdir() if p.suffix.lower() == ".footer"]
-    if footers:
-        title.wad.set_meta_data(footers[0].read_bytes())
-    if fakesign or (fakesign is None and changed):
-        title.fakesign()
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(dest.name + ".part")
-    tmp.write_bytes(title.dump_wad())
-    os.replace(tmp, dest)
-    return dest
 

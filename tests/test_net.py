@@ -7,14 +7,14 @@ import time
 import httpx
 import pytest
 
-from rewii.core import net
+from rewii.core import config, net
 
 
 @pytest.fixture
 def cache(tmp_path, monkeypatch):
     d = tmp_path / "cache"
     d.mkdir()
-    monkeypatch.setattr(net, "cache_dir", lambda: d)
+    monkeypatch.setattr(config, "cache_dir", lambda: d)
     yield d
     net.set_client(None)
 

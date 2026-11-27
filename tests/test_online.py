@@ -24,7 +24,6 @@ def test_create_new_file_has_valid_header(tmp_path):
     assert text.splitlines()[0] == O.GX_HEADER
     assert O._has_valid_header(text.splitlines())
     assert O.read_gx_config(layout) == {"PrivateServer": "2"}
-    assert O.get_loader_private_server(layout) == "wiimmfi"
 
 
 def test_edit_preserves_other_lines(tmp_path):
@@ -39,7 +38,7 @@ def test_edit_preserves_other_lines(tmp_path):
     assert cfg["godmode"] == "1" and cfg["GameCubePath"] == "usb1:/games/"
     assert sum(1 for line in lines if line.startswith("PrivateServer")) == 1
     O.set_loader_private_server(layout, "")
-    assert O.get_loader_private_server(layout) == "off"
+    assert O.read_gx_config(layout)["PrivateServer"] == "0"
 
 
 def test_write_add_remove_and_old_header(tmp_path):

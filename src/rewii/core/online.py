@@ -19,11 +19,12 @@ WiiLink WFC is *not* offered by the loader; the guide uses the separate
 """
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Optional, Union
 from collections.abc import Mapping
 
+from .errors import ReWiiError
+from .fileops import write_atomic
 from .layout import DriveLayout
 
 #: Header written when ReWii creates GXGlobal.cfg (rev must be >= 1031; current release is 1283).
@@ -31,10 +32,13 @@ GX_HEADER = "# USB Loader GX R1283 - Main settings file"
 GX_MIN_REV = 1031
 
 PRIVATE_SERVERS: dict[str, int] = {"off": 0, "nossl": 1, "wiimmfi": 2, "altwfc": 3, "custom": 4}
-PRIVATE_SERVER_NAMES = {v: k for k, v in PRIVATE_SERVERS.items()}
 
 
-class UnsupportedServer(ValueError):
+class OnlineError(ReWiiError, ValueError):
+    """A USB Loader GX setting or online server that can't be written."""
+
+
+class UnsupportedServer(OnlineError):
     """The requested online service can't be set through the loader."""
 
 
@@ -121,9 +125,9 @@ def write_gx_config(layout: DriveLayout, updates: Mapping[str, Value]) -> dict[s
     pending = {}
     for k, v in updates.items():
         if "=" in k or "\n" in k or "\r" in k or k.startswith("#") or not k.strip():
-            raise ValueError(f"Invalid setting name {k!r}")
+            raise OnlineError(f"Invalid setting name {k!r}")
         if v is not None and ("\n" in str(v) or "\r" in str(v)):
-            raise ValueError(f"Invalid value for {k}")
+            raise OnlineError(f"Invalid value for {k}")
         pending[k] = None if v is None else str(v)
     out: list[str] = []
     done: set[str] = set()
@@ -142,14 +146,7 @@ def write_gx_config(layout: DriveLayout, updates: Mapping[str, Value]) -> dict[s
             out.append(f"{k} = {v}")
     if not _has_valid_header(out):
         out.insert(0, GX_HEADER)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    try:
-        tmp.write_bytes(("\n".join(out) + "\n").encode("utf-8", errors="surrogateescape"))
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    write_atomic(path, ("\n".join(out) + "\n").encode("utf-8", errors="surrogateescape"))
     return read_gx_config(layout)
 
 
@@ -169,20 +166,12 @@ def set_loader_private_server(layout: DriveLayout, server: str, custom_address: 
         raise UnsupportedServer("USB Loader GX can't connect games to WiiLink WFC by itself. Install the "
                                 "\"WiiLink WFC Patcher\" app from the Open Shop Channel, or choose Wiimmfi.")
     if s not in PRIVATE_SERVERS:
-        raise ValueError(f"Unknown server {server!r}")
+        raise OnlineError(f"Unknown server {server!r}")
     updates: dict[str, Value] = {"PrivateServer": PRIVATE_SERVERS[s]}
     if s == "custom":
         if not custom_address or len(custom_address.strip()) <= 3 or any(c.isspace() for c in custom_address.strip()):
-            raise ValueError("Enter the custom server's domain name (for example example.com)")
+            raise OnlineError("Enter the custom server's domain name (for example example.com)")
         updates["CustomAddress"] = custom_address.strip()
     write_gx_config(layout, updates)
     return PRIVATE_SERVERS[s]
 
-
-def get_loader_private_server(layout: DriveLayout) -> str:
-    """Current "Private Server" setting as a name ("off" if unset or unknown)."""
-    v = read_gx_config(layout).get("PrivateServer", "0")
-    try:
-        return PRIVATE_SERVER_NAMES.get(int(v), "off")
-    except ValueError:
-        return "off"

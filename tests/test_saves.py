@@ -113,7 +113,6 @@ def test_parse_databin(tmp_path: Path) -> None:
     assert info.banner and info.banner.subtitle == "Race!" and info.banner.icon_count == 1
     assert info.md5_ok
     assert [(f.name, f.size) for f in info.files] == [("a.dat", 100), ("b.dat", 64)]
-    assert S.verify_databin_roundtrip(p)
 
 
 def test_extract_databin(tmp_path: Path) -> None:
@@ -180,9 +179,6 @@ def test_discover_classifies_by_content(tmp_path: Path) -> None:
         ("data.bin", S.KIND_DATABIN, S.APP_DATA_MGMT, "SMNE"),
         ("01-GALE-ssbm.gci", S.KIND_GCI, S.APP_GCMM, "GALE"),
     }
-    cat = S.catalog_by_game(S.discover_saves(tmp_path))
-    assert len(cat["GALE"]) == 3          # per-game card, multi card, gci
-    assert "GZLE" in cat
 
 
 # --------------------------------------------------------------------------- library

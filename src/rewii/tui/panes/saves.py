@@ -59,7 +59,7 @@ class SavesPane(Pane):
     def _scan(self) -> None:
         try:
             lay = self.layout_
-            ds = SV.discover_saves(lay.root) if lay and lay.root.exists() else []
+            ds = SV.discover_saves(lay) if lay and lay.root.exists() else []
             vs = SV.list_backups(self.settings)
         except Exception as e:  # noqa: BLE001 - an unreadable folder must not close the app
             self.scan_failed("Reading the saves", e)

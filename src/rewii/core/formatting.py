@@ -37,23 +37,23 @@ import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Optional
 from collections.abc import Callable, Sequence
 
 from .drives import Drive, human_size, list_drives
 from .fat32 import MAX_SIZE, Fat32Error, FormatResult, format_fat32, normalize_label, plan_fat32
 from .progress import CancelToken, ProgressFn
+from .errors import ReWiiError
 
 DEFAULT_LABEL = "REWII"
 DEFAULT_CLUSTER = 32768
 
 
-class FormatRefused(Exception):
+class FormatRefused(ReWiiError):
     """Formatting this drive is not allowed (system disk, not removable, bad token...)."""
 
 
-class FormatFailed(Exception):
+class FormatFailed(ReWiiError):
     """An OS step failed while formatting; the message is user-presentable."""
 
 
@@ -459,13 +459,3 @@ def _execute_windows(plan: FormatPlan, progress: Optional[ProgressFn],
                 pass
     return result
 
-
-def format_image(path: str | os.PathLike[str], size_bytes: int, label: str = DEFAULT_LABEL,
-                 cluster_size: int = DEFAULT_CLUSTER, progress: Optional[ProgressFn] = None,
-                 cancel: Optional[CancelToken] = None) -> FormatResult:
-    """Create/format a disk image file (no admin, no OS steps). Convenience for tests/dev."""
-    p = Path(path)
-    if p.exists() and not p.is_file():
-        raise FormatRefused(f"{p} is not a regular file.")
-    return format_fat32(p, size_bytes, label, cluster_size, partition=True,
-                        progress=progress, cancel=cancel)

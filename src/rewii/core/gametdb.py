@@ -19,6 +19,8 @@ from xml.etree import ElementTree as ET
 
 from . import config, net
 from .config import Settings
+from .errors import ReWiiError
+from .fileops import write_atomic
 
 GAMETDB_URL = ("https://www.gametdb.com/wiitdb.zip?LANG={lang}"
                "&FALLBACK=TRUE&WIIWARE=TRUE&GAMECUBE=TRUE")
@@ -29,9 +31,12 @@ MAX_ZIP_BYTES = 128 * 1024 ** 2        # download cap (the real file is ~10 MB)
 MAX_XML_BYTES = 1024 ** 3              # cap on the unpacked wiitdb.xml
 INDEX_VERSION = 1
 SYNOPSIS_LEN = 400
-LANGS = ("EN", "JA", "FR", "DE", "ES", "IT", "NL", "PT", "ZHTW", "ZHCN", "KO", "RU")
 
 _TYPE_NAMES = {"": "Wii", "CUSTOM": "Custom"}
+
+
+class TitleDBError(ReWiiError, ValueError):
+    """The downloaded GameTDB database can't be used."""
 
 
 @dataclass(frozen=True)
@@ -59,9 +64,6 @@ class GameInfo:
     def is_gamecube(self) -> bool:
         return self.type == "GameCube"
 
-    @property
-    def is_wii_disc(self) -> bool:
-        return self.type in ("Wii", "Custom")
 
     @property
     def is_virtual_console(self) -> bool:
@@ -191,9 +193,9 @@ def parse_wiitdb_zip(path: Path, lang: str = "EN") -> dict[str, GameInfo]:
     with zipfile.ZipFile(path) as z:
         info = next((i for i in z.infolist() if i.filename.lower().endswith(".xml")), None)
         if info is None:
-            raise ValueError(f"{path.name} has no XML file")
+            raise TitleDBError(f"{path.name} has no XML file")
         if info.file_size > MAX_XML_BYTES:
-            raise ValueError(f"{path.name} is unreasonably large")
+            raise TitleDBError(f"{path.name} is unreasonably large")
         with z.open(info) as f:
             return parse_wiitdb(f, lang)
 
@@ -260,9 +262,6 @@ class TitleDB:
                 pass
         return db if db is not None else cls(lang=lang)
 
-    @classmethod
-    def from_games(cls, games: Iterable[GameInfo], lang: str = "EN") -> TitleDB:
-        return cls({g.id: g for g in games}, "", lang)
 
     @classmethod
     def _read_index(cls, path: Path, lang: str) -> Optional[TitleDB]:
@@ -277,12 +276,9 @@ class TitleDB:
 
     def _write_index(self, path: Path) -> None:
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".tmp")
             data = {"format": INDEX_VERSION, "version": self.version, "lang": self.lang,
                     "games": {k: g.to_dict() for k, g in self.games.items()}}
-            tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), "utf-8")
-            tmp.replace(path)
+            write_atomic(path, json.dumps(data, ensure_ascii=False, separators=(",", ":")))
         except OSError:
             pass
 

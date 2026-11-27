@@ -10,7 +10,9 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Button, Label, ListItem, ListView, Markdown
 
 from ...core import guides as GD
-from ..base import FAILED, Pane, kit_lines
+from ...core.findings import Fix
+from ...core.layout import DriveLayout
+from ..base import FAILED, Pane, kit_lines, severity_icon
 
 # guide.prepare -> OSC slugs to install
 PREPARE_APPS = {
@@ -19,9 +21,13 @@ PREPARE_APPS = {
     "syscheck": ["SysCheckME"],
     "cleanrip": ["CleanRip"],
 }
-SYSCHECK_FIX_GUIDE = {"install_priiloader": "priiloader", "install_d2x_cios": "cios",
-                      "update_43": "recovery", "restore_ios": "recovery", "update_hbc": "update-hbc",
-                      "install_hbc": "update-hbc", "install_bootmii": "update-hbc"}
+#: guide.prepare -> the SystemPane method that prepares it (instead of an app list)
+PREPARE_ACTIONS = {"cios": "_cios", "hackmii": "_hackmii", "priiloader-hacks": "_hacks"}
+#: SysCheck fix -> the guide that explains it
+SYSCHECK_FIX_GUIDE: dict[str, str] = {
+    Fix.INSTALL_PRIILOADER: "priiloader", Fix.INSTALL_D2X_CIOS: "cios",
+    Fix.UPDATE_43: "recovery", Fix.RESTORE_IOS: "recovery", Fix.UPDATE_HBC: "update-hbc",
+    Fix.INSTALL_HBC: "update-hbc", Fix.INSTALL_BOOTMII: "update-hbc"}
 
 
 class SystemPane(Pane):
@@ -106,14 +112,8 @@ class SystemPane(Pane):
         g = self.current
         if not g.prepare or self.need_drive() is None:
             return
-        if g.prepare == "cios":
-            await self._cios()
-            return
-        if g.prepare == "hackmii":
-            await self._hackmii()
-            return
-        if g.prepare == "priiloader-hacks":
-            await self._hacks()
+        if g.prepare in PREPARE_ACTIONS:
+            await getattr(self, PREPARE_ACTIONS[g.prepare])()
             return
         slugs = PREPARE_APPS.get(g.prepare)
         if slugs and await self._install_slugs(slugs):
@@ -243,8 +243,8 @@ class SystemPane(Pane):
         picked = await self.pick("Choose the SD card (with the bootmii folder)", folder=True)
         if not picked:
             return
-        sd = picked[0]
-        if not (sd / "bootmii").is_dir():
+        sd = DriveLayout(picked[0])
+        if not sd.bootmii.is_dir():
             await self.message("No BootMii here", "That card has no bootmii folder. Make one with Backups → "
                                "Make SD rescue kit, or the HackMii installer.", error=True)
             return
@@ -270,7 +270,7 @@ class SystemPane(Pane):
     async def action_syscheck(self) -> None:
         from ...core import syscheck as SC
         lay = self.layout_
-        path = SC.find_syscheck(lay.root) if lay else None
+        path = SC.find_syscheck(lay) if lay else None
         if path is None:
             picked = await self.pick("Find syscheck.csv", exts={".csv", ".txt"})
             if not picked:
@@ -287,10 +287,9 @@ class SystemPane(Pane):
         if cios:
             lines.append("cIOS: " + ", ".join(f"{i.slot}[{i.base}] {i.info}".strip() for i in cios))
         lines.append("")
-        lines += [f"{'✖' if f.severity == 'error' else '!' if f.severity in ('warning', 'warn') else 'i'} {f.message}"
-                  for f in r.findings] or ["✔ Everything needed is installed."]
-        ct, rg = SC.profile_from_syscheck(r)
+        lines += [f"{severity_icon(f.severity)} {f.message}" for f in r.findings] or ["✔ Everything needed is installed."]
         s = self.settings
+        ct, rg = SC.profile_from_syscheck(r, s.console_type)
         changed = bool(ct and rg and (ct != s.console_type or rg != s.console_region))
         if changed:
             lines.append(f"\nSettings will be updated: console {ct}, region {rg}.")
@@ -303,6 +302,28 @@ class SystemPane(Pane):
         if fixes:
             self.show_guide(SYSCHECK_FIX_GUIDE[fixes[0]])
 
+    async def _remove_mod(self, lay: DriveLayout, mods: list[Any]) -> None:
+        """Pick one of the mods ReWii installed and take its files off the drive."""
+        from ...core import riivolution as RV
+        from ..widgets import ChoiceForm
+        if not mods:
+            await self.message("Nothing to remove", "None of the mods on the drive were installed by ReWii, so "
+                               "ReWii doesn't know which files belong to them. Remove those by hand "
+                               "(riivolution/ on the drive).")
+            return
+        res = await self.app.push_screen_wait(ChoiceForm(
+            "Remove a mod", "Only the mod's own files are removed; files other mods use stay.",
+            [("mod", "Mod", [(m.name, m.name) for m in mods], mods[0].name)]))
+        if not res or not res.get("mod"):
+            return
+        name = res["mod"]
+        if not await self.confirm("Remove mod", f"Remove {name} from the drive?\n\nThe copy in your library "
+                                  "(Mods) is kept.", danger=True, yes="Remove"):
+            return
+        removed = await self.bg("Removing the mod", lambda: RV.remove_mod(lay, name))
+        if removed is not FAILED:
+            await self.message("Mod removed", f"{name}: {len(removed)} file(s) removed from the drive.")
+
     # ------------------------------------------------------------------ themes / mods
     @work(exclusive=True, group="sys")
     async def action_themes(self) -> None:
@@ -310,12 +331,25 @@ class SystemPane(Pane):
         if lay is None:
             return
         from ...core import themes as TH
+        staged = await self.bg("Reading the themes folder", lambda: TH.list_staged_themes(lay))
+        if staged is FAILED:
+            return
+        if staged:
+            # what is already waiting on the drive for csm-installer
+            rows = "\n".join(
+                f"  {t.path.name}" + (f"   ({', '.join(x for x in (t.version_label, t.region_name) if x)})"
+                                      if t.version_label or t.region_name else "")
+                for t in staged)
+            ch = await self.choose("Themes", f"Themes on the drive (in themes/), ready for csm-installer:\n{rows}",
+                                   a="Add a theme…", b="Done")
+            if ch != "a":
+                return
         picked = await self.pick("Choose a .csm theme", exts={".csm", ".app"})
         if not picked:
             return
         src, s = picked[0], self.settings
         st = await self.bg("Checking the theme", lambda: TH.stage_theme(
-            src, lay.root, console_type=s.console_type, region=s.console_region))
+            src, lay, console_type=s.console_type, region=s.console_region))
         if st is FAILED:
             return
         notes = "".join(f"\n• {w}" for w in st.warnings)
@@ -329,11 +363,24 @@ class SystemPane(Pane):
         if lay is None:
             return
         from ...core import riivolution as RV
+        mods = await self.bg("Reading the mods on the drive", lambda: RV.list_installed_mods(lay))
+        if mods is FAILED:
+            return
+        if mods:
+            rows = "\n".join(f"  {m.name}" + (f"   ({', '.join(m.games)})" if m.games else "")
+                             + ("" if m.managed else "   - not installed by ReWii") for m in mods)
+            ch = await self.choose("Riivolution mods", f"Mods on the drive:\n{rows}",
+                                   a="Add a mod…", b="Remove a mod…")
+            if ch is None:
+                return
+            if ch == "b":
+                await self._remove_mod(lay, [m for m in mods if m.managed])
+                return
         picked = await self.pick("Choose a Riivolution mod (.zip file, or its folder)", exts={".zip"}, either=True)
         if not picked:
             return
         src, s = picked[0], self.settings
-        res = await self.job("Installing mod", lambda p, c: RV.install_mod(src, lay.root, settings=s),
+        res = await self.job("Installing mod", lambda p, c: RV.install_mod(src, lay, settings=s),
                              cancellable=False, quiet=True)
         if res is FAILED:
             return

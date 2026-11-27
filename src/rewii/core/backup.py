@@ -20,14 +20,15 @@ from typing import Optional
 from collections.abc import Iterable
 
 from .config import Settings
-from .layout import DriveLayout, safe_name
-from .fileops import (UnsafePath, copy_atomic, is_inside, is_temp_name, require_drive, safe_join,
+from .layout import GAME_DIR_NAMES, DriveLayout, safe_name
+from .fileops import (PARTIAL_DIR_SUFFIX, UnsafePath, copy_atomic, is_inside, is_temp_name, require_drive, safe_join,
                       sha1_file)
 from .progress import CancelToken, ProgressFn, Reporter
+from .errors import ReWiiError
 
 MANIFEST = "manifest.json"
 FILES = "files"
-GAME_DIRS = ("wbfs", "games")
+GAME_DIRS = GAME_DIR_NAMES
 # OS clutter that is never backed up, compared or deleted
 SKIP_NAMES = {"system volume information", "$recycle.bin", ".spotlight-v100", ".trashes",
               ".fseventsd", ".temporaryitems", "thumbs.db", ".ds_store"}
@@ -44,7 +45,7 @@ def _human(n: int) -> str:
     return f"{n} bytes"
 
 
-class BackupError(Exception):
+class BackupError(ReWiiError):
     """A backup/restore/clone can't proceed."""
 
 
@@ -121,15 +122,6 @@ def scan_tree(root: Path, *, include_games: bool = True,
     return out
 
 
-def _sha1(path: Path, rep: Reporter | None = None) -> str:
-    return sha1_file(path, rep)
-
-
-def _copy(src: Path, dest: Path, rep: Reporter, hash_: bool = False) -> str:
-    """Chunked atomic copy keeping mtime; returns SHA-1 if ``hash_``."""
-    return copy_atomic(src, dest, rep, want_hash=hash_)
-
-
 def _same(a: FileEntry, b: FileEntry) -> bool:
     """Quick "unchanged" test: same size and (same SHA-1, if both known, else same time).
 
@@ -203,7 +195,7 @@ def list_snapshots(settings: Settings, label: str | None = None) -> list[Snapsho
         if not ldir.is_dir() or (label is not None and ldir.name != safe_name(label)):
             continue
         for d in sorted(ldir.iterdir()):
-            if d.is_dir() and not d.name.endswith(".partial"):
+            if d.is_dir() and not d.name.endswith(PARTIAL_DIR_SUFFIX):
                 s = _load_snapshot(d)
                 if s:
                     out.append(s)
@@ -242,7 +234,7 @@ def create_snapshot(source: Path, settings: Settings, label: str, *,
     while final.exists():
         final = ldir / f"{stamp}-{i}"
         i += 1
-    tmp = final.with_name(final.name + ".partial")
+    tmp = final.with_name(final.name + PARTIAL_DIR_SUFFIX)
     shutil.rmtree(tmp, ignore_errors=True)
     (tmp / FILES).mkdir(parents=True)
     rep.set_total(sum(e.size for e in entries), "Backing up drive")
@@ -253,7 +245,7 @@ def create_snapshot(source: Path, settings: Settings, label: str, *,
             dst = _rel_to_path(tmp / FILES, e.path)
             old = prev_map.get(e.path)
             if hash_files and old is not None and old.size == e.size:
-                e.sha1 = _sha1(src)       # needed to compare with the previous snapshot
+                e.sha1 = sha1_file(src)       # needed to compare with the previous snapshot
             linked = False
             if old is not None and _same(e, old):
                 prev_file = _rel_to_path(prev[0].files_dir, e.path)
@@ -267,7 +259,7 @@ def create_snapshot(source: Path, settings: Settings, label: str, *,
                         linked = False
             if not linked:
                 rep.message = e.path
-                digest = _copy(src, dst, rep, hash_=hash_files and not e.sha1)
+                digest = copy_atomic(src, dst, rep, want_hash=hash_files and not e.sha1)
                 if digest:
                     e.sha1 = digest
         created = (now or datetime.now()).isoformat(timespec="seconds")
@@ -301,7 +293,7 @@ def verify_snapshot(snapshot: Snapshot, progress: ProgressFn | None = None,
             continue
         if p.stat().st_size != e.size:
             probs.append(f"{e.path}: wrong size")
-        elif e.sha1 and _sha1(p, rep) != e.sha1:
+        elif e.sha1 and sha1_file(p, rep) != e.sha1:
             probs.append(f"{e.path}: damaged (SHA-1 mismatch)")
         elif not e.sha1:
             rep.advance(e.size)
@@ -342,7 +334,7 @@ def diff_snapshot(snapshot: Snapshot, drive: Path, *, deep: bool = False,
             d.added.append(p)
             continue
         if deep and o.sha1 and e.size == o.size:
-            e.sha1 = _sha1(_rel_to_path(Path(drive), p))
+            e.sha1 = sha1_file(_rel_to_path(Path(drive), p))
             if e.sha1 != o.sha1:
                 d.changed.append(p)
         elif not _same(e, FileEntry(o.path, o.size, o.mtime)):
@@ -522,8 +514,8 @@ def restore_snapshot(snapshot: Snapshot, target: Path, *, paths: Iterable[str] |
         if not src.is_file():
             raise BackupError(f"snapshot is missing {e.path}")
         rep.message = e.path
-        _copy(src, dst, rep)
-        if verify and e.sha1 and _sha1(dst) != e.sha1:      # re-read what landed on the drive
+        copy_atomic(src, dst, rep)
+        if verify and e.sha1 and sha1_file(dst) != e.sha1:      # re-read what landed on the drive
             report.failed_verify.append(e.path)
         report.copied.append(e.path)
         report.bytes_copied += e.size
@@ -556,8 +548,8 @@ def clone_drive(source: Path, target: Path, *, include_games: bool = True,
     for src, dst, e in todo:
         rep.check()
         rep.message = e.path
-        digest = _copy(src, dst, rep, hash_=verify)
-        if verify and _sha1(dst, rep) != digest:
+        digest = copy_atomic(src, dst, rep, want_hash=verify)
+        if verify and sha1_file(dst, rep) != digest:
             report.failed_verify.append(e.path)
         report.copied.append(e.path)
         report.bytes_copied += e.size

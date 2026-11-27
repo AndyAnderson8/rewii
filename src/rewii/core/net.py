@@ -5,7 +5,6 @@ import hashlib
 import re
 import json
 import os
-import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -14,25 +13,29 @@ from collections.abc import Callable
 import httpx
 
 from .. import __version__
-from .config import cache_dir
+from . import config, fileops
 from .progress import CancelToken, ProgressFn, Reporter
+from .errors import ReWiiError
 
-USER_AGENT = f"ReWii/{__version__} (+https://github.com/rewii)"
+USER_AGENT = f"ReWii/{__version__} (+https://github.com/AndyAnderson8/rewii)"
 TIMEOUT = httpx.Timeout(30.0, connect=15.0)
 
 
-class NetError(Exception):
+class NetError(ReWiiError):
     pass
 
 
 _client: Optional[httpx.Client] = None
+#: Transport for the default client (None = real network). The test suite sets a
+#: transport here that refuses every request, so nothing un-mocked reaches the internet.
+transport: Optional[httpx.BaseTransport] = None
 
 
 def client() -> httpx.Client:
     global _client
     if _client is None:
         _client = httpx.Client(headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT,
-                               follow_redirects=True)
+                               follow_redirects=True, transport=transport)
     return _client
 
 
@@ -109,7 +112,7 @@ def cached(url: str, name: str, max_age: float = 7 * 86400, refresh: bool = Fals
     portal page, an error document) never overwrites a good copy and is never
     kept - the old copy is returned, or :class:`NetError` raised if there is none.
     """
-    p = cache_dir() / name
+    p = config.cache_dir() / name
     p.parent.mkdir(parents=True, exist_ok=True)
     fresh = p.exists() and (time.time() - p.stat().st_mtime) < max_age
     if fresh and not refresh:
@@ -121,7 +124,7 @@ def cached(url: str, name: str, max_age: float = 7 * 86400, refresh: bool = Fals
         if p.exists():
             return p
         raise
-    tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.part")
+    tmp = fileops.part_path(p, unique=True)
     try:
         tmp.write_bytes(data)
         if validate is not None and not validate(tmp):
@@ -136,17 +139,25 @@ def cached(url: str, name: str, max_age: float = 7 * 86400, refresh: bool = Fals
     return p
 
 
-def download(url: str, dest: Path, *, md5: str | None = None, progress: ProgressFn | None = None,
-             cancel: CancelToken | None = None, max_bytes: int | None = None) -> Path:
-    """Stream a download to ``dest`` with progress; verifies md5 if given.
+class ChecksumMismatch(NetError):
+    """A download finished but isn't the file that was expected (nothing was kept)."""
 
+
+def download(url: str, dest: Path, *, md5: str | None = None, sha256: str | None = None,
+             progress: ProgressFn | None = None,
+             cancel: CancelToken | None = None, max_bytes: int | None = None) -> Path:
+    """Stream a download to ``dest`` with progress.
+
+    ``md5`` / ``sha256`` (hex) are checked before the file gets its real name:
+    on a mismatch :class:`ChecksumMismatch` is raised and nothing is kept.
     ``max_bytes`` aborts (with :class:`NetError`) a download that is larger.
     """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(dest.name + ".part")
+    tmp = fileops.part_path(dest)
     rep = Reporter(progress, cancel, message=f"Downloading {dest.name}")
     h = hashlib.md5()
+    h256 = hashlib.sha256() if sha256 else None
     got = 0
     try:
         with client().stream("GET", url) as r:
@@ -166,6 +177,8 @@ def download(url: str, dest: Path, *, md5: str | None = None, progress: Progress
                         raise NetError(f"{dest.name}: the download is larger than expected")
                     f.write(chunk)
                     h.update(chunk)
+                    if h256 is not None:
+                        h256.update(chunk)
                     rep.advance(len(chunk))
     except (httpx.HTTPError, httpx.InvalidURL) as e:
         tmp.unlink(missing_ok=True)
@@ -173,8 +186,9 @@ def download(url: str, dest: Path, *, md5: str | None = None, progress: Progress
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    if md5 and h.hexdigest().lower() != md5.lower():
+    if (md5 and h.hexdigest().lower() != md5.lower()) or \
+            (h256 is not None and sha256 and h256.hexdigest().lower() != sha256.lower()):
         tmp.unlink(missing_ok=True)
-        raise NetError(f"{dest.name}: checksum mismatch")
+        raise ChecksumMismatch(f"{dest.name}: checksum mismatch")
     os.replace(tmp, dest)
     return dest

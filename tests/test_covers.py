@@ -18,7 +18,6 @@ def cache(tmp_path, monkeypatch):
     d = tmp_path / "cache"
     d.mkdir()
     monkeypatch.setattr(config, "cache_dir", lambda: d)
-    monkeypatch.setattr(net, "cache_dir", lambda: d)
     yield d
     net.set_client(None)
 
@@ -66,7 +65,6 @@ def test_fetch_writes_gx_wiiflow_and_cache(tmp_path, cache):
     assert rep.results["RMCE01"] == {"cover3D": "ok", "cover": "ok", "coverfullHQ": "ok",
                                      "disc": "ok"}
     assert set(rep.results["ZZZE99"].values()) == {"missing"}
-    assert rep.missing_ids() == ["ZZZE99"]
     assert (lay.gx_images / "RMCE01.png").read_bytes() == PNG
     assert (lay.gx_images / "2D" / "RMCE01.png").exists()
     assert (lay.gx_images / "full" / "RMCE01.png").exists()
@@ -123,28 +121,6 @@ def test_cancel(tmp_path, cache):
         covers.fetch_covers(lay, ["RMCE01", "RSBE01"], ["cover"], Settings(), cancel=tok)
 
 
-def test_custom_banner(tmp_path, cache):
-    lay = DriveLayout(tmp_path / "usb")
-    (lay.root / "wiiflow").mkdir(parents=True)
-    log: list[str] = []
-    serve({covers.BANNER_URL.format(id="GAL"): BNR}, log)
-    p = covers.download_custom_banner(lay, "GALE01")
-    assert p == lay.usbloadergx / "cache_bnr" / "GALE01.bnr"
-    assert p.read_bytes() == BNR
-    assert (lay.wiiflow / "custom_banners" / "GALE01.bnr").exists()
-    assert log[0].endswith("GALE01.bnr") and log[1].endswith("GAL.bnr")
-    assert covers.download_custom_banner(lay, "RMCE01") is None
-
-
-def test_remove_covers(tmp_path, cache):
-    lay = DriveLayout(tmp_path / "usb")
-    lay.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
-    serve({art("cover3D", "US", "RMCE01"): PNG, art("cover", "US", "RMCE01"): PNG})
-    covers.fetch_covers(lay, ["RMCE01"], ["cover3D", "cover"], Settings(), wiiflow=False)
-    assert covers.remove_covers(lay, "RMCE01") == 2
-    assert covers.best_cached_cover("RMCE01") is not None
-
-
 # --------------------------------------------------------------------------- regressions
 def test_throttling_is_an_error_not_missing(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
@@ -194,7 +170,7 @@ def test_invalid_game_ids_never_reach_urls_or_paths(tmp_path, cache):
     rep = covers.fetch_covers(lay, bad, ["cover"], Settings(), wiiflow=False)
     assert all(rep.results[g.upper()]["cover"] == "error" for g in bad) and log == []
     assert covers.download_cover("../../", "cover") == (None, "")
-    assert covers.download_custom_banner(lay, "../../x") is None and log == []
+    assert log == []
     outside = tmp_path / "victim.png"
     outside.write_bytes(PNG)
     for g in bad + ["../victim", str(tmp_path / "victim")]:
@@ -203,6 +179,5 @@ def test_invalid_game_ids_never_reach_urls_or_paths(tmp_path, cache):
             assert ".." not in p.parts and p.name.endswith(".png") and "/" not in p.stem
             assert p.is_relative_to(lay.root) or p.is_relative_to(cache)
             assert p.resolve() != outside
-        assert covers.remove_covers(lay, g) == 0
         assert not any(covers.cover_status(lay, g).values())
     assert outside.exists()

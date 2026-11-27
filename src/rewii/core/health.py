@@ -16,26 +16,25 @@ from __future__ import annotations
 import os
 import shutil
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
-from collections.abc import Iterator
+from typing import Optional
+from collections.abc import Callable, Iterator
 
-from .disc import FAT32_SPLIT, DiscError, DiscInfo, NeedsConversion, disc_info, split_parts
+from .disc import GC_DRIVE_EXTS, NEEDS_CONVERSION_EXTS, WII_DRIVE_EXTS, FAT32_SPLIT, DiscError, DiscInfo, NeedsConversion, disc_info, split_parts
 from .drives import EXFAT, FAT16, FAT32, NTFS, UNKNOWN, WBFS, Drive, human_size
 from .fat32 import MAX_SIZE, Fat32Error, plan_fat32
-from .layout import DriveLayout, game_folder_name, id_from_folder
-from .fileops import (TEMP_IDLE_SECONDS, TEMP_PREFIX, explain_os_error, is_inside, is_temp_name,
+from .layout import APPS_DIR, MANAGED_TOPS, DriveLayout, game_folder_name, id_from_folder
+from .osc import starter_kit
+from .fileops import (NEW_SUFFIX, PART_SUFFIX, TEMP_IDLE_SECONDS, TEMP_PREFIX, part_path, explain_os_error, is_inside, is_temp_name,
                       rename_path, same_file)
-from .progress import CancelToken, ProgressFn, Reporter
+from .findings import SAFE_FIXES, Finding, Fix, Severity
+from .progress import UNIT_STEPS, CancelToken, ProgressFn, Reporter
+from .errors import ReWiiError
 
-INFO, WARN, ERROR = "info", "warn", "error"
+INFO, WARN, ERROR = Severity.INFO, Severity.WARNING, Severity.ERROR
 
 FAT32_MAX_FILE = 0xFFFFFFFF          # 4 GiB - 1
 RECOMMENDED_CLUSTER = 32768
-
-SAFE_FIXES = frozenset({"flatten_nested_apps", "flatten_app_folder", "move_wii_game",
-                        "move_gc_game", "split_file", "delete_mac_junk", "delete_temp_files"})
 
 #: A line of :func:`fix`'s log that starts with this reports something that could NOT be fixed.
 NOT_FIXED = "couldn't fix:"
@@ -49,44 +48,19 @@ def expected_cluster(size: int) -> int:
     except (Fat32Error, ValueError):
         return RECOMMENDED_CLUSTER
 
-#: Starter apps: folder name under apps/ -> (display name, essential?)
-STARTER_APPS: dict[str, tuple[str, bool]] = {
-    "usbloader_gx": ("USB Loader GX", True),
-    "nintendont": ("Nintendont", True),
-    "yawmme": ("YAWMME", False),
-    "savegame_manager_gx": ("SaveGame Manager GX", False),
-    "wiixplorer": ("WiiXplorer", False),
-}
-
 # not ".Trashes": that holds files the user put in the Mac trash and may still want back
 MAC_JUNK_DIRS = frozenset({".Spotlight-V100", ".fseventsd", ".TemporaryItems"})
 MAC_JUNK_FILES = frozenset({".DS_Store"})
 
-WII_EXTS = (".wbfs", ".iso", ".ciso")
-GC_EXTS = (".iso", ".gcm", ".ciso")
-CONVERT_EXTS = (".rvz", ".wia", ".gcz", ".wdf", ".nkit")
+# tuples for str.endswith(); the sets themselves are defined in ``disc``
+WII_EXTS = tuple(sorted(WII_DRIVE_EXTS))
+GC_EXTS = tuple(sorted(GC_DRIVE_EXTS))
+CONVERT_EXTS = (*sorted(NEEDS_CONVERSION_EXTS), ".nkit")
 ARCHIVE_EXTS = (".zip", ".7z", ".rar")
 
 
-class FixError(Exception):
+class FixError(ReWiiError):
     """A fix couldn't be applied (conflict, unsupported fix, unreadable game...)."""
-
-
-@dataclass
-class Finding:
-    """One problem (or note) about a drive."""
-
-    id: str                       # machine-readable kind, e.g. "nested_apps"
-    severity: str                 # INFO | WARN | ERROR
-    message: str                  # plain language for the user
-    fix_id: Optional[str] = None  # see module docstring / SAFE_FIXES
-    path: Optional[Path] = None   # the file/folder concerned, if any
-    data: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def auto_fixable(self) -> bool:
-        """True if :func:`fix` can repair this finding by itself."""
-        return self.fix_id in SAFE_FIXES
 
 
 # --------------------------------------------------------------------------- drive-level
@@ -98,29 +72,29 @@ def check_drive(drive: Drive) -> list[Finding]:
         out.append(Finding("fs_ntfs", WARN,
                            "This drive uses NTFS. USB Loader GX can play Wii games from NTFS, but "
                            "the Homebrew Channel, Nintendont (GameCube games) and most apps need "
-                           "FAT32. Reformatting to FAT32 is recommended.", "format_drive"))
+                           "FAT32. Reformatting to FAT32 is recommended.", Fix.FORMAT_DRIVE))
     elif fs == EXFAT:
         out.append(Finding("fs_exfat", ERROR,
                            "This drive uses exFAT, which the Wii can't read. It needs to be "
-                           "reformatted to FAT32.", "format_drive"))
+                           "reformatted to FAT32.", Fix.FORMAT_DRIVE))
     elif fs == WBFS:
         out.append(Finding("fs_wbfs", ERROR,
                            "This is an old WBFS-formatted drive. Modern loaders use FAT32. Import "
-                           "your games to the computer first, then reformat the drive.", "import_wbfs"))
+                           "your games to the computer first, then reformat the drive.", Fix.IMPORT_WBFS))
     elif fs == FAT16:
         out.append(Finding("fs_fat16", ERROR,
                            "This drive uses FAT16, which is too small for Wii games. It needs to "
-                           "be reformatted to FAT32.", "format_drive"))
+                           "be reformatted to FAT32.", Fix.FORMAT_DRIVE))
     elif fs != FAT32:
         what = "no file system" if fs == UNKNOWN else fs
         extra = " (ReWii needs admin rights to look closer)" if drive.needs_admin else ""
         out.append(Finding("fs_other", ERROR,
                            f"This drive has {what}{extra}, which the Wii can't read. It needs to "
-                           "be formatted as FAT32.", "format_drive"))
+                           "be formatted as FAT32.", Fix.FORMAT_DRIVE))
     if drive.partition_style == "GPT":
         out.append(Finding("gpt", ERROR,
                            "This drive uses the GPT partition style. The Wii needs MBR. "
-                           "Reformatting with ReWii fixes this.", "format_drive"))
+                           "Reformatting with ReWii fixes this.", Fix.FORMAT_DRIVE))
     cs = drive.cluster_size
     want = expected_cluster(drive.size) if drive.size else RECOMMENDED_CLUSTER
     # a small drive can't have 32 KB clusters: what ReWii's formatter chose is right for it
@@ -129,7 +103,7 @@ def check_drive(drive: Drive) -> list[Finding]:
                            f"This drive uses {cs // 1024 or cs} {'KB' if cs >= 1024 else 'byte'} "
                            f"clusters. {want // 1024} KB clusters are recommended for the Wii on a "
                            "drive this size (faster loading, fewer problems). Reformatting fixes "
-                           "this.", "format_drive", data={"cluster_size": cs, "expected": want}))
+                           "this.", Fix.FORMAT_DRIVE, data={"cluster_size": cs, "expected": want}))
     if drive.size > MAX_SIZE:
         out.append(Finding("too_big", WARN,
                            f"This drive is {human_size(drive.size)}. A Wii-compatible (MBR) drive "
@@ -191,14 +165,14 @@ def check_apps(layout: DriveLayout) -> list[Finding]:
     if not apps.is_dir():
         out.append(Finding("no_apps", WARN,
                            "There's no apps folder, so the Homebrew Channel won't find any apps "
-                           "on this drive.", "install_starter_apps"))
+                           "on this drive.", Fix.INSTALL_STARTER_APPS))
         return out
-    nested = _ci_child(apps, "apps")
+    nested = _ci_child(apps, APPS_DIR)
     if nested is not None and nested.is_dir():
         out.append(Finding("nested_apps", ERROR,
                            "There's an apps folder inside the apps folder (apps/apps), so the "
                            "Homebrew Channel can't see those apps. ReWii can move them up.",
-                           "flatten_nested_apps", nested))
+                           Fix.FLATTEN_NESTED_APPS, nested))
     present = set()
     data_only = {"images", "cache_bnr", "cache", "theme", "language", "gxglobal.cfg", "gxgamesettings.cfg"}
     for app in _subdirs(apps):
@@ -215,19 +189,19 @@ def check_apps(layout: DriveLayout) -> list[Finding]:
         if child_names and child_names <= data_only:
             continue
         present.add(app.name.lower())
-        inner_apps = _ci_child(app, "apps")
+        inner_apps = _ci_child(app, APPS_DIR)
         if inner_apps is not None and inner_apps.is_dir():
             out.append(Finding("nested_apps", ERROR,
                                f"apps/{app.name} contains another apps folder; the app inside "
                                "won't show up. ReWii can move it to the right place.",
-                               "flatten_nested_apps", inner_apps))
+                               Fix.FLATTEN_NESTED_APPS, inner_apps))
             continue
         inner = [s for s in _subdirs(app) if _has_boot(s)]
         if len(inner) == 1:
             out.append(Finding("app_double_folder", WARN,
                                f"apps/{app.name} has its app one folder too deep "
                                f"(apps/{app.name}/{inner[0].name}). ReWii can move it up.",
-                               "flatten_app_folder", inner[0]))
+                               Fix.FLATTEN_APP_FOLDER, inner[0]))
             present.add(inner[0].name.lower())
             continue
         out.append(Finding("app_no_boot", WARN,
@@ -235,13 +209,14 @@ def check_apps(layout: DriveLayout) -> list[Finding]:
                            "Reinstall the app.", None, app))
     if nested is not None and nested.is_dir():
         present.update(sub.name.lower() for sub in _subdirs(nested))
-    missing = [(k, name, ess) for k, (name, ess) in STARTER_APPS.items() if k not in present]
+    # the essential part of the one starter list (osc.STARTER_KIT), minus what depends on
+    # the console type - which a drive check doesn't know
+    missing = [i for i in starter_kit("", "essential") if i.folder.lower() not in present]
     if missing:
-        essential = any(ess for _k, _n, ess in missing)
-        names = ", ".join(n for _k, n, _e in missing)
-        out.append(Finding("missing_apps", WARN if essential else INFO,
-                           f"Recommended apps not installed: {names}.", "install_starter_apps",
-                           data={"missing": [k for k, _n, _e in missing]}))
+        out.append(Finding("missing_apps", WARN if any(i.required for i in missing) else INFO,
+                           f"Recommended apps not installed: {', '.join(i.title for i in missing)}.",
+                           Fix.INSTALL_STARTER_APPS,
+                           data={"missing": [i.folder.lower() for i in missing]}))
     return out
 
 
@@ -251,7 +226,7 @@ def _info(p: Path) -> tuple[Optional[DiscInfo], Optional[Finding]]:
     except NeedsConversion as e:
         return None, Finding("needs_conversion", WARN,
                              f"{p.name} is in {e.fmt} format, which the Wii can't load. ReWii can "
-                             "convert it.", "convert_game", p, {"format": e.fmt})
+                             "convert it.", Fix.CONVERT_GAME, p, {"format": e.fmt})
     except (DiscError, OSError, ValueError) as e:
         return None, Finding("unreadable_game", WARN, f"{p.name} doesn't look like a Wii or "
                              f"GameCube game ({e}).", None, p)
@@ -263,7 +238,7 @@ def _convert_finding(p: Path) -> Optional[Finding]:
         fmt = "NKit" if ".nkit" in name else p.suffix[1:].upper()
         return Finding("needs_conversion", WARN,
                        f"{p.name} is in {fmt} format, which the Wii can't load. ReWii can "
-                       "convert it.", "convert_game", p, {"format": fmt})
+                       "convert it.", Fix.CONVERT_GAME, p, {"format": fmt})
     if name.endswith(ARCHIVE_EXTS):
         return Finding("archive_on_drive", WARN,
                        f"{p.name} is a compressed archive. Extract it (or add the game with "
@@ -300,7 +275,7 @@ def check_wii_games(layout: DriveLayout, fat32_target: bool = True) -> list[Find
         if not info.is_wii:
             out.append(Finding("gc_in_wbfs", WARN,
                                f"{p.name} is a GameCube game but it's in the Wii games folder. "
-                               "ReWii can move it to games/.", "move_gc_game", p,
+                               "ReWii can move it to games/.", Fix.MOVE_GC_GAME, p,
                                {"game_id": info.game_id}))
             return
         gid = info.game_id
@@ -309,27 +284,27 @@ def check_wii_games(layout: DriveLayout, fat32_target: bool = True) -> list[Find
             out.append(Finding("wii_flat", WARN,
                                f"{p.name} should be in its own folder "
                                f"(wbfs/{game_folder_name(info.title, gid)}/{gid}{ext}).",
-                               "move_wii_game", p, {"game_id": gid}))
+                               Fix.MOVE_WII_GAME, p, {"game_id": gid}))
         elif id_from_folder(folder.name) != gid:
             out.append(Finding("wii_folder_name", WARN,
                                f"The folder \"{folder.name}\" should be named "
                                f"\"{game_folder_name(info.title, gid)}\" so loaders find the game.",
-                               "move_wii_game", p, {"game_id": gid}))
+                               Fix.MOVE_WII_GAME, p, {"game_id": gid}))
         elif p.name != f"{gid}{ext}":
             out.append(Finding("wii_file_name", WARN,
                                f"{folder.name}/{p.name} should be named {gid}{ext}.",
-                               "move_wii_game", p, {"game_id": gid}))
+                               Fix.MOVE_WII_GAME, p, {"game_id": gid}))
         if _big(p, fat32_target):
             if ext == ".wbfs":
                 out.append(Finding("file_too_big", ERROR,
                                    f"{p.name} is larger than 4 GB, which FAT32 can't store. "
                                    "ReWii can split it into .wbfs + .wbf1 parts.",
-                                   "split_file", p))
+                                   Fix.SPLIT_FILE, p))
             else:
                 out.append(Finding("file_too_big", ERROR,
                                    f"{p.name} is larger than 4 GB, which FAT32 can't store. Re-add "
                                    "the game with ReWii to store it as split WBFS.",
-                                   "convert_game", p))
+                                   Fix.CONVERT_GAME, p))
 
     def orphans(files: list[Path]) -> None:
         names = {f.name.lower() for f in files}
@@ -379,7 +354,7 @@ def check_gc_games(layout: DriveLayout) -> list[Finding]:
         if info.is_wii:
             out.append(Finding("wii_in_games", WARN,
                                f"{p.name} is a Wii game but it's in the GameCube games folder. "
-                               "ReWii can move it to wbfs/.", "move_wii_game", p,
+                               "ReWii can move it to wbfs/.", Fix.MOVE_WII_GAME, p,
                                {"game_id": info.game_id}))
             return
         gid = info.game_id
@@ -388,18 +363,18 @@ def check_gc_games(layout: DriveLayout) -> list[Finding]:
             out.append(Finding("gc_flat", INFO,
                                f"{p.name} works in Nintendont but USB Loader GX won't list it. "
                                f"It should be games/{game_folder_name(info.title, gid)}/{want}.",
-                               "move_gc_game", p, {"game_id": gid}))
+                               Fix.MOVE_GC_GAME, p, {"game_id": gid}))
         elif id_from_folder(folder.name) != gid:
             out.append(Finding("gc_folder_name", WARN,
                                f"The folder \"{folder.name}\" should be named "
                                f"\"{game_folder_name(info.title, gid)}\".",
-                               "move_gc_game", p, {"game_id": gid}))
+                               Fix.MOVE_GC_GAME, p, {"game_id": gid}))
         elif p.name != want:
             kind = "gc_disc2_name" if info.disc_number else "gc_file_name"
             out.append(Finding(kind, WARN,
                                f"{folder.name}/{p.name} should be named {want}"
                                + (" (disc 2 of this game)." if info.disc_number else "."),
-                               "move_gc_game", p, {"game_id": gid}))
+                               Fix.MOVE_GC_GAME, p, {"game_id": gid}))
 
     for f in _files(root):
         game(f, None)
@@ -431,13 +406,12 @@ def check_mac_junk(layout: DriveLayout) -> list[Finding]:
     return [Finding("mac_junk", INFO if len(junk) < 5 else WARN,
                     f"Found {len(junk)} hidden macOS file(s) (like ._ files and .Spotlight). They "
                     "can show up as broken entries on the Wii. ReWii can delete them.",
-                    "delete_mac_junk", layout.root, {"paths": [str(p) for p in junk]})]
+                    Fix.DELETE_MAC_JUNK, layout.root, {"paths": [str(p) for p in junk]})]
 
 
 #: Top-level folders ReWii writes to; a generic ``*.part`` elsewhere may be the user's own file.
-_MANAGED_TOPS = frozenset({"apps", "wbfs", "games", "wad", "txtcodes", "codes", "savegames", "saves",
-                           "private", "riivolution", "rewii", "bootmii", "controllers", "wiiflow"})
-_OWN_SUFFIXES = (".rewii-part", ".rewii-new", ".rewii-tmp")
+_MANAGED_TOPS = MANAGED_TOPS
+_OWN_SUFFIXES = (PART_SUFFIX, NEW_SUFFIX, ".rewii-tmp")
 
 
 def _is_leftover(rel: Path) -> bool:
@@ -487,7 +461,7 @@ def check_temp_files(layout: DriveLayout) -> list[Finding]:
         msg += (f" {len(found) - len(old)} of them changed less than an hour ago and may belong to "
                 "a copy that is still running, so those are left alone for now - check again later.")
     return [Finding("temp_leftovers", WARN if old else INFO, msg,
-                    "delete_temp_files" if old else None, layout.root,
+                    Fix.DELETE_TEMP_FILES if old else None, layout.root,
                     {"paths": [str(p) for p in old], "recent": len(found) - len(old)})]
 
 
@@ -526,8 +500,7 @@ def check(layout: DriveLayout, drive: Optional[Drive] = None) -> list[Finding]:
     out += check_gc_games(layout)
     out += check_mac_junk(layout)
     out += check_temp_files(layout)
-    order = {ERROR: 0, WARN: 1, INFO: 2}
-    return sorted(out, key=lambda f: order.get(f.severity, 3))
+    return sorted(out, key=lambda f: f.severity.rank)
 
 
 # --------------------------------------------------------------------------- fixes
@@ -610,96 +583,125 @@ def fix(layout: DriveLayout, finding: Finding, progress: Optional[ProgressFn] = 
     overwrite something. Never deletes user data except macOS junk files.
     """
     rep = Reporter(progress, cancel)
-    fid = finding.fix_id
-    if fid not in SAFE_FIXES:
+    fixer = FIXERS.get(finding.fix_id or "")
+    if finding.fix_id not in SAFE_FIXES or fixer is None:
         raise FixError(f"'{finding.id}' can't be fixed automatically.")
     layout.require_root()
     p = finding.path
     if p is not None and not is_inside(Path(p), layout.root):
         # a finding from another drive (the drive was switched after the check)
         raise FixError("That finding belongs to a different drive. Check the drive again.")
-
-    if fid == "delete_mac_junk":
-        paths = [Path(x) for x in finding.data.get("paths", [])] or list(_walk_junk(layout.root))
-        rep.set_total(len(paths), "Deleting macOS junk files")
-        deleted: list[str] = []
-        root = layout.root.resolve()
-        for jp in paths:
-            rep.check()
-            try:
-                if root in jp.parent.resolve().parents or jp.parent.resolve() == root:
-                    if jp.is_dir() and not jp.is_symlink():
-                        shutil.rmtree(jp)
-                    elif jp.exists() or jp.is_symlink():
-                        jp.unlink()
-                    deleted.append(f"Deleted {jp}")
-            except OSError as e:
-                deleted.append(f"{NOT_FIXED} {jp.name}: {explain_os_error(e, layout.root)}")
-            rep.advance(1)
-        return deleted
-
-    if fid == "delete_temp_files":
-        # look again instead of trusting the finding: only ReWii's own temp names, only files,
-        # and only ones nothing has written to for an hour (a running copy is never touched)
-        rep.note("Deleting unfinished files")
-        removed: list[str] = []
-        for tp in _walk_temp(layout.root):
-            rep.check()
-            if tp.is_symlink() or not tp.is_file() or not _idle(tp):
-                continue
-            try:
-                tp.unlink()
-                removed.append(f"Deleted {tp}")
-                if _is_game_folder(layout, tp.parent):      # "Title [ID]" with nothing else in it
-                    _rmdir_if_empty(tp.parent)
-            except OSError as e:
-                removed.append(f"{NOT_FIXED} {tp.name}: {explain_os_error(e, layout.root)}")
-        return removed
-
-    if p is None:
+    if p is None and finding.fix_id not in _WHOLE_DRIVE_FIXES:
         raise FixError("This finding doesn't say which file to fix.")
+    return fixer(layout, finding, rep)
 
-    if fid == "flatten_nested_apps":
-        rep.note("Moving apps to the right folder")
-        done: list[str] = []
-        skipped: list[str] = []
-        _merge_move(p, layout.apps, done, skipped)
-        parent = p.parent
-        if parent != layout.apps and parent.parent == layout.apps:
-            _rmdir_if_empty(parent)
-        if skipped:
-            done.append("Kept (already present in apps/): " + ", ".join(skipped))
-        return done
 
-    if fid == "flatten_app_folder":
-        rep.note("Moving app up one folder")
-        done, skipped = [], []
-        outer = p.parent
-        dest = layout.apps / p.name
-        if dest.resolve() == outer.resolve():
-            tmp = outer.with_name(outer.name + ".rewii-tmp")
-            os.replace(p, tmp)
-            _merge_move(tmp, outer, done, skipped)
-        else:
-            _merge_move(p, dest, done, skipped)
-            _rmdir_if_empty(outer)
-        if skipped:
-            done.append("Kept (already present): " + ", ".join(skipped))
-        return done
-
-    if fid in ("move_wii_game", "move_gc_game"):
+def _fix_mac_junk(layout: DriveLayout, finding: Finding, rep: Reporter) -> list[str]:
+    paths = [Path(x) for x in finding.data.get("paths", [])] or list(_walk_junk(layout.root))
+    rep.set_total(len(paths), "Deleting macOS junk files", unit=UNIT_STEPS)
+    deleted: list[str] = []
+    root = layout.root.resolve()
+    for jp in paths:
+        rep.check()
         try:
-            info = disc_info(p)
-        except (DiscError, OSError) as e:
-            raise FixError(f"Couldn't read {p.name}: {e}") from e
-        rep.note(f"Moving {info.title}")
-        return _move_game(p, _game_dest(layout, p, info), rep)
+            if root in jp.parent.resolve().parents or jp.parent.resolve() == root:
+                if jp.is_dir() and not jp.is_symlink():
+                    shutil.rmtree(jp)
+                elif jp.exists() or jp.is_symlink():
+                    jp.unlink()
+                deleted.append(f"Deleted {jp}")
+        except OSError as e:
+            deleted.append(f"{NOT_FIXED} {jp.name}: {explain_os_error(e, layout.root)}")
+        rep.advance(1)
+    return deleted
 
-    # split_file
+
+def _fix_temp_files(layout: DriveLayout, finding: Finding, rep: Reporter) -> list[str]:
+    # look again instead of trusting the finding: only ReWii's own temp names, only files,
+    # and only ones nothing has written to for an hour (a running copy is never touched)
+    rep.note("Deleting unfinished files")
+    removed: list[str] = []
+    for tp in _walk_temp(layout.root):
+        rep.check()
+        if tp.is_symlink() or not tp.is_file() or not _idle(tp):
+            continue
+        try:
+            tp.unlink()
+            removed.append(f"Deleted {tp}")
+            if _is_game_folder(layout, tp.parent):      # "Title [ID]" with nothing else in it
+                _rmdir_if_empty(tp.parent)
+        except OSError as e:
+            removed.append(f"{NOT_FIXED} {tp.name}: {explain_os_error(e, layout.root)}")
+    return removed
+
+
+def _fix_nested_apps(layout: DriveLayout, finding: Finding, rep: Reporter) -> list[str]:
+    p = finding.path
+    assert p is not None
+    rep.note("Moving apps to the right folder")
+    done: list[str] = []
+    skipped: list[str] = []
+    _merge_move(p, layout.apps, done, skipped)
+    parent = p.parent
+    if parent != layout.apps and parent.parent == layout.apps:
+        _rmdir_if_empty(parent)
+    if skipped:
+        done.append("Kept (already present in apps/): " + ", ".join(skipped))
+    return done
+
+
+def _fix_app_folder(layout: DriveLayout, finding: Finding, rep: Reporter) -> list[str]:
+    p = finding.path
+    assert p is not None
+    rep.note("Moving app up one folder")
+    done: list[str] = []
+    skipped: list[str] = []
+    outer = p.parent
+    dest = layout.apps / p.name
+    if dest.resolve() == outer.resolve():
+        tmp = outer.with_name(outer.name + ".rewii-tmp")
+        os.replace(p, tmp)
+        _merge_move(tmp, outer, done, skipped)
+    else:
+        _merge_move(p, dest, done, skipped)
+        _rmdir_if_empty(outer)
+    if skipped:
+        done.append("Kept (already present): " + ", ".join(skipped))
+    return done
+
+
+def _fix_move_game(layout: DriveLayout, finding: Finding, rep: Reporter) -> list[str]:
+    p = finding.path
+    assert p is not None
+    try:
+        info = disc_info(p)
+    except (DiscError, OSError) as e:
+        raise FixError(f"Couldn't read {p.name}: {e}") from e
+    rep.note(f"Moving {info.title}")
+    return _move_game(p, _game_dest(layout, p, info), rep)
+
+
+def _fix_split_file(layout: DriveLayout, finding: Finding, rep: Reporter) -> list[str]:
+    p = finding.path
+    assert p is not None
     if p.suffix.lower() != ".wbfs":
         raise FixError("Only .wbfs files can be split; re-add other games with ReWii.")
-    parts = split_file(p, progress=progress, cancel=cancel)
+    parts = split_file(p, progress=rep.fn, cancel=rep.cancel)
     return [f"Split {p.name} into {len(parts)} parts"]
+
+
+#: What :func:`fix` runs for each safe fix (the keys are exactly :data:`SAFE_FIXES`).
+FIXERS: dict[str, Callable[[DriveLayout, Finding, Reporter], list[str]]] = {
+    Fix.DELETE_MAC_JUNK: _fix_mac_junk,
+    Fix.DELETE_TEMP_FILES: _fix_temp_files,
+    Fix.FLATTEN_NESTED_APPS: _fix_nested_apps,
+    Fix.FLATTEN_APP_FOLDER: _fix_app_folder,
+    Fix.MOVE_WII_GAME: _fix_move_game,
+    Fix.MOVE_GC_GAME: _fix_move_game,
+    Fix.SPLIT_FILE: _fix_split_file,
+}
+#: Fixes that look at the whole drive instead of the one path in the finding.
+_WHOLE_DRIVE_FIXES = frozenset({Fix.DELETE_MAC_JUNK, Fix.DELETE_TEMP_FILES})
 
 
 def split_file(path: Path | str, part_size: int = FAT32_SPLIT,
@@ -715,9 +717,9 @@ def split_file(path: Path | str, part_size: int = FAT32_SPLIT,
     """
     path = Path(path)
     if path.suffix.lower() != ".wbfs":
-        raise ValueError("split_file only supports .wbfs files (.wbf1 naming)")
+        raise FixError("split_file only supports .wbfs files (.wbf1 naming)")
     if part_size <= 0 or part_size % 512:
-        raise ValueError("part_size must be a positive multiple of 512")
+        raise FixError("part_size must be a positive multiple of 512")
     size = path.stat().st_size
     nparts = max(1, -(-size // part_size))
     existing = [path.with_suffix(f".wbf{i}") for i in range(1, nparts)]
@@ -733,7 +735,7 @@ def split_file(path: Path | str, part_size: int = FAT32_SPLIT,
                 start = i * part_size
                 end = min(size, start + part_size)
                 dst_path = path.with_suffix(f".wbf{i}")
-                tmp = dst_path.with_name(dst_path.name + ".partial")
+                tmp = part_path(dst_path)
                 try:
                     with open(tmp, "wb") as dst:
                         src.seek(start)

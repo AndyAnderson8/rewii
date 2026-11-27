@@ -11,16 +11,18 @@ from rewii.core.channels import build_channel, channel_problem
 from rewii.core.config import Settings
 from rewii.core.layout import DriveLayout
 
+CERTS = bytes(2560)       # a stand-in certificate chain (the builders only embed it)
+
 
 @pytest.fixture
 def certs(monkeypatch):
-    monkeypatch.setattr(F, "cert_chain", lambda: bytes(2560))
+    monkeypatch.setattr("rewii.core.nus.cert_chain", lambda: CERTS)
 
 
 @pytest.fixture
 def nin():
     # any libogc DOL with an argv area works as a stand-in for Nintendont
-    return F._asset("ConfUsbLoaderFat.dol") + b"$$Version:6.510\0"
+    return F.asset("ConfUsbLoaderFat.dol") + b"$$Version:6.510\0"
 
 
 @pytest.fixture
@@ -82,7 +84,7 @@ def test_banner_structure_preserved():
     t = _texts(banner)
     assert t["T_name"] == "Kirby Air Ride" and t["T_coder"] == "Nintendo" and t["T_PF"] == "GameCube"
     # same files, same order, same uncompressed sizes as the template
-    tpl = F._asset("gc_banner_template.bnr")[0x640:]
+    tpl = F.asset("gc_banner_template.bnr")[0x640:]
     a, b = GC._u8_files(tpl), GC._u8_files(banner[0x640:])
     assert list(a) == list(b)
     for name in ("banner.bin", "icon.bin"):
@@ -102,10 +104,10 @@ def test_make_gc_channel(drive, tmp_path, certs, nin):
     lay, game = drive
     (lay.root / "nincfg.bin").write_bytes(GC.build_nin_cfg("/old.iso", "GOLD", None)[:8]
                                           + struct.pack(">III", 1 << 3 | 1 << 5, 0x10, 1) + bytes(528))
-    ci = GC.make_gc_channel(game, lay.root, tmp_path / "out", nintendont=nin, publisher="Pub", year="2001")
+    ci = GC.make_gc_channel(game, lay.root, tmp_path / "out", nintendont=nin, publisher="Pub", year="2001", cert_chain=CERTS)
     assert ci.channel_id == "GTST" and F.verify_wad(ci.path) == (True, "ok")
     assert F.channel_game_id(ci.path) == "GTST01"
-    r = F.unpack_wad(ci.path.read_bytes())
+    r = F.verify_unpack(ci.path.read_bytes())
     raw = F.read_argv_raw(r["contents"][1])
     a0, cfg = raw.split(b"\0", 1)
     assert a0 == b"usb:/apps/Nintendont/boot.dol"
@@ -130,9 +132,9 @@ def test_gc_channel_rules(drive, tmp_path, certs, nin):
     assert channel_problem("gc", 0, "GTST01", True) is None
     outside = make_gc_iso(tmp_path / "elsewhere.iso")
     with pytest.raises(F.ForwarderError):
-        GC.make_gc_channel(outside, lay.root, tmp_path / "o", nintendont=nin)
+        GC.make_gc_channel(outside, lay.root, tmp_path / "o", nintendont=nin, cert_chain=CERTS)
     s = Settings(library_dir=str(tmp_path / "lib"))
-    ci = build_channel(game, s, drive_root=lay.root, nintendont=nin)
+    ci = build_channel(game, s, layout=lay, nintendont=nin)
     assert ci.style == "gamecube"
 
 
@@ -163,8 +165,8 @@ def test_gc_channel_uses_cheat_file(drive, tmp_path, certs, nin):
     lay, game = drive
     (lay.root / "codes").mkdir()
     (lay.root / "codes" / "GTST01.gct").write_bytes(b"\x00\xd0\xc0\xde" * 2)
-    ci = GC.make_gc_channel(game, lay.root, tmp_path / "out", nintendont=nin)
-    cfg = F.read_argv_raw(F.unpack_wad(ci.path.read_bytes())["contents"][1]).split(b"\0", 1)[1]
+    ci = GC.make_gc_channel(game, lay.root, tmp_path / "out", nintendont=nin, cert_chain=CERTS)
+    cfg = F.read_argv_raw(F.verify_unpack(ci.path.read_bytes())["contents"][1]).split(b"\0", 1)[1]
     config = struct.unpack(">I", cfg[8:12])[0]
     assert config & GC.CFG_CHEATS and config & GC.CFG_CHEAT_PATH
     assert cfg[275:300].split(b"\0")[0] == b"/codes/GTST01.gct"

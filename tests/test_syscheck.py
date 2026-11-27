@@ -161,3 +161,12 @@ def test_korean_region_changed_console_is_never_offered_the_update() -> None:
     assert not r.korean_region_changed and "update_43" in [f.fix for f in r.findings]
     r = SC.parse_syscheck(OLD.replace("Region: NTSC-U (original region: JAP)", "Region: KOR"))
     assert not r.korean_region_changed
+
+
+def test_profile_keeps_a_family_edition_the_user_chose() -> None:
+    """SysCheck reports a Family Edition as a plain Wii; importing must not undo the user's choice."""
+    r = SC.parse_syscheck(WII_PAL)
+    assert SC.profile_from_syscheck(r) == ("wii", "PAL")
+    assert SC.profile_from_syscheck(r, "family") == ("family", "PAL")
+    assert SC.profile_from_syscheck(r, "vwii") == ("wii", "PAL")          # a different platform is corrected
+    assert SC.profile_from_syscheck(SC.parse_syscheck(VWII), "family") == ("vwii", "NTSC-U")

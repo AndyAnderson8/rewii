@@ -27,11 +27,13 @@ import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 from . import config, net
+from .fileops import write_atomic
 from .ids import id_for_filename, valid_game_id
 from .layout import DriveLayout
+from .errors import ReWiiError
 
 CHEAT_SOURCES: list[str] = [
     "https://codes.rc24.xyz/txt.php?txt={game_id}",
@@ -45,7 +47,7 @@ _HEX = set("0123456789ABCDEFabcdef")
 _AUTHOR_RE = re.compile(r"\s*\[([^\]]+)\]\s*$")
 
 
-class CheatError(Exception):
+class CheatError(ReWiiError):
     """Bad txtcodes data or unfilled placeholders."""
 
 
@@ -124,9 +126,6 @@ class CheatFile:
     title: str
     cheats: list[Cheat] = field(default_factory=list)
 
-    def by_name(self, name: str) -> Optional[Cheat]:
-        return next((c for c in self.cheats if c.name == name), None)
-
 
 def parse_txtcodes(text: str | bytes) -> CheatFile:
     """Parse a txtcodes file. Cheats without code lines (headers/notes) are dropped,
@@ -164,18 +163,6 @@ def parse_txtcodes(text: str | bytes) -> CheatFile:
     return CheatFile(game_id, title, cheats)
 
 
-def format_txtcodes(cf: CheatFile) -> str:
-    """Serialize back to txtcodes text (CRLF, like the source files)."""
-    out = [cf.game_id, cf.title, ""]
-    for c in cf.cheats:
-        out.append(c.name)
-        out += [f"{a} {b}" for a, b in c.codes]
-        if c.comment:
-            out += c.comment.splitlines()
-        out.append("")
-    return "\r\n".join(out)
-
-
 # --------------------------------------------------------------------------- drive paths
 def txt_path(layout: DriveLayout, game_id: str) -> Path:
     return layout.txtcodes / f"{id_for_filename(game_id)}.txt"
@@ -186,22 +173,15 @@ def gct_path(layout: DriveLayout, game_id: str) -> Path:
 
 
 def wiiflow_txt_path(layout: DriveLayout, game_id: str) -> Path:
-    return layout.wiiflow / "codes" / f"{id_for_filename(game_id)}.txt"
+    return layout.wiiflow_codes / f"{id_for_filename(game_id)}.txt"
 
 
 def wiiflow_gct_path(layout: DriveLayout, game_id: str) -> Path:
-    return layout.wiiflow / "codes" / "gct" / f"{id_for_filename(game_id)}.gct"
+    return layout.wiiflow_gct / f"{id_for_filename(game_id)}.gct"
 
 
 def _write(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".part")
-    try:
-        tmp.write_bytes(data)
-        tmp.replace(path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    write_atomic(path, data)
 
 
 def _looks_valid(data: Optional[bytes], game_id: str) -> bool:
@@ -250,7 +230,7 @@ def fetch_cheats(layout: DriveLayout, game_id: str, *, wiiflow: Optional[bool] =
         return None
     layout.require_root()
     if wiiflow is None:
-        wiiflow = layout.wiiflow.is_dir()
+        wiiflow = layout.has_wiiflow
     dest = txt_path(layout, gid)
     cache = config.cache_dir() / "cheats" / f"{gid}.txt"
 
@@ -319,7 +299,7 @@ def build_gct(layout: DriveLayout, game_id: str, cheats: Sequence[Cheat],
     gid = game_id.strip().upper()
     layout.require_root()
     if wiiflow is None:
-        wiiflow = layout.wiiflow.is_dir()
+        wiiflow = layout.has_wiiflow
     targets = [gct_path(layout, gid)] + ([wiiflow_gct_path(layout, gid)] if wiiflow else [])
     if not cheats:
         for t in targets:
@@ -349,36 +329,3 @@ def selected_in_gct(cf: CheatFile, gct: bytes) -> list[int]:
             out.append(i)
     return out
 
-
-@dataclass
-class CheatStatus:
-    """Cheat files on the drive for one game."""
-
-    game_id: str
-    title: str
-    txt: Optional[Path]
-    gct: Optional[Path]
-    count: int
-
-
-def list_cheats(layout: DriveLayout) -> list[CheatStatus]:
-    """Every game with a txtcodes and/or gct file on the drive, sorted by ID."""
-    ids: dict[str, CheatStatus] = {}
-
-    def ids_in(folder: Path, ext: str) -> Iterable[tuple[str, Path]]:
-        if folder.is_dir():
-            for p in folder.iterdir():
-                if p.is_file() and p.suffix.lower() == ext:
-                    yield p.stem.upper(), p
-
-    for gid, p in ids_in(layout.txtcodes, ".txt"):
-        try:
-            cf = parse_txtcodes(p.read_bytes())
-            title, count = cf.title, len(cf.cheats)
-        except (OSError, CheatError):
-            title, count = "", 0
-        ids[gid] = CheatStatus(gid, title, p, None, count)
-    for gid, p in ids_in(layout.codes, ".gct"):
-        st = ids.setdefault(gid, CheatStatus(gid, "", None, None, 0))
-        st.gct = p
-    return [ids[k] for k in sorted(ids)]

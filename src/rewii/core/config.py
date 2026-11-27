@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 from platformdirs import user_cache_dir, user_config_dir
 
+from .console import CONSOLE_TYPES, REGIONS, ConsoleProfile
+from .errors import ReWiiError
+from .fileops import write_atomic
+
 APP = "ReWii"
 
-CONSOLE_TYPES = ("wii", "vwii", "mini", "family")
-REGIONS = ("NTSC-U", "PAL", "NTSC-J", "NTSC-K")
 FORWARDER_STYLES = ("cover", "black", "classic")
 ONLINE_SERVERS = ("wiimmfi", "altwfc", "off")
 COVER_LANGS = ("EN", "US", "FR", "DE", "ES", "IT", "NL", "JA", "KO", "ZH")
@@ -26,35 +29,57 @@ _CHOICES: dict[str, tuple[str, ...]] = {
 }
 
 
+class ConfigError(ReWiiError, ValueError):
+    """A setting the user typed can't be used (the message says why, in plain language)."""
+
+
 def check_library_path(text: str) -> Path:
-    """The library folder for what the user typed. Raises ValueError (plain-language
+    """The library folder for what the user typed. Raises ConfigError, a ValueError (plain-language
     message) for an empty or relative path - a relative library would silently
     follow whatever folder ReWii happens to be started from."""
     t = (text or "").strip().strip('"')
     if not t:
-        raise ValueError("Enter a folder for the library.")
+        raise ConfigError("Enter a folder for the library.")
     p = Path(t).expanduser()
     if not p.is_absolute():
-        raise ValueError("The library folder must be a full path (for example "
+        raise ConfigError("The library folder must be a full path (for example "
                          f"{Path.home() / 'ReWii'}).")
     return p
 
 
+#: Environment variables that move ReWii's settings / cache folder (portable installs, tests).
+ENV_CONFIG_DIR = "REWII_CONFIG_DIR"
+ENV_CACHE_DIR = "REWII_CACHE_DIR"
+
+
 def config_dir() -> Path:
-    p = Path(user_config_dir(APP, appauthor=False))
+    """Where settings and the log live: ``$REWII_CONFIG_DIR`` if set, else the per-OS folder.
+
+    Always call this as ``config.config_dir()`` (not imported by name), so there is one
+    place to redirect it."""
+    override = os.environ.get(ENV_CONFIG_DIR, "").strip()
+    p = Path(override).expanduser() if override else Path(user_config_dir(APP, appauthor=False))
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
 def cache_dir() -> Path:
-    p = Path(user_cache_dir(APP, appauthor=False))
+    """Where downloads are cached: ``$REWII_CACHE_DIR`` if set, else the per-OS folder.
+    Call it as ``config.cache_dir()`` (see :func:`config_dir`)."""
+    override = os.environ.get(ENV_CACHE_DIR, "").strip()
+    p = Path(override).expanduser() if override else Path(user_cache_dir(APP, appauthor=False))
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
+def default_library_dir() -> str:
+    """``~/ReWii``, worked out when a Settings object is made (not when ReWii is imported)."""
+    return str(Path.home() / "ReWii")
+
+
 @dataclass
 class Settings:
-    library_dir: str = str(Path.home() / "ReWii")
+    library_dir: str = field(default_factory=lambda: default_library_dir())
     # console profile; only needed for system-level features (NUS, themes, NAND)
     console_type: str = ""          # "" = not set yet; see CONSOLE_TYPES
     console_region: str = ""        # see REGIONS
@@ -73,6 +98,11 @@ class Settings:
     last_drive: str = ""
     wii_ip: str = ""                # last address used for "Send to Wii"
     first_run_done: bool = False
+
+    @property
+    def profile(self) -> ConsoleProfile:
+        """The console these settings describe (type, region, Korean-changed flag)."""
+        return ConsoleProfile(self.console_type, self.console_region, self.korean_region_changed)
 
     @property
     def library(self) -> Path:
@@ -150,10 +180,7 @@ class Settings:
     def save(self, path: Path | None = None) -> None:
         """Write the settings file (raises OSError if the config folder isn't writable)."""
         path = path or self.path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(asdict(self), indent=2), "utf-8")
-        tmp.replace(path)
+        write_atomic(path, json.dumps(asdict(self), indent=2))
 
 
 def _coerce(name: str, default: Any, value: Any) -> Any:

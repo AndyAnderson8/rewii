@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from typing import Any, Optional
 from collections.abc import Callable
 
@@ -12,15 +11,15 @@ from textual.containers import Horizontal
 from textual.widgets import Button, Input, Label, Static
 
 from ...core import games as G
+from ...core.disc import PICKABLE_EXTS, cleanrip_part
 from ...core.forwarder import brick_risk
 from ...core.layout import DriveLayout
-from ...core.progress import Cancelled, Reporter
+from ...core.progress import UNIT_STEPS, Cancelled, Reporter
 from ..base import FAILED, Pane, titles
 from ..widgets import MarkTable, human_size
 from ._channels import build_channels, collision_warning
 
-GAME_EXTS = {".wbfs", ".iso", ".ciso", ".gcm", ".rvz", ".wia", ".gcz", ".nkit", ".wdf"}
-_PART_N = re.compile(r"\.part[1-9]\d*\.iso$", re.I)
+GAME_EXTS = set(PICKABLE_EXTS)
 
 
 class Row:
@@ -224,7 +223,7 @@ class GamesPane(Pane):
         if not paths:
             return
         # CleanRip dumps: picking .part0.iso is enough, the other parts are joined automatically
-        paths = [p for p in paths if not _PART_N.search(p.name)]
+        paths = [p for p in paths if not (cleanrip_part(p.name) or 0) >= 1]    # only the first part
         if not paths:
             self.app.notify("Pick the .part0.iso of a CleanRip dump - the other parts are joined automatically",
                             severity="warning")
@@ -342,7 +341,7 @@ class GamesPane(Pane):
             return
 
         def run(progress: Any, cancel: Any) -> list[str]:
-            rep = Reporter(progress, cancel, total=len(games))
+            rep = Reporter(progress, cancel, total=len(games), unit=UNIT_STEPS)
             errs = []
             for g in games:
                 rep.note(f"Removing {g.title}")
@@ -403,7 +402,7 @@ class GamesPane(Pane):
         s = self.settings
 
         def run(progress: Any, cancel: Any) -> list[str]:
-            rep = Reporter(progress, cancel, total=len(games))
+            rep = Reporter(progress, cancel, total=len(games), unit=UNIT_STEPS)
             errs = []
             for g in games:
                 rep.note(f"Deleting {g.title}")
@@ -516,7 +515,7 @@ class GamesPane(Pane):
         from ...core import cheats
 
         def run(progress: Any, cancel: Any) -> tuple[int, list[str], list[str]]:
-            rep = Reporter(progress, cancel, total=len(ids))
+            rep = Reporter(progress, cancel, total=len(ids), unit=UNIT_STEPS)
             found, none, failed = 0, [], []
             for gid in ids:
                 rep.note(f"Cheats for {gid}")

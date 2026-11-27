@@ -26,15 +26,16 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Optional
 
-from . import archive
+from . import archive, fileops
 from .config import Settings
-from .fileops import require_drive
-from .layout import DriveLayout, safe_name
+from .fileops import copy_atomic
+from .layout import BOOTMII_DIR, REWII_DIR, RIIVOLUTION_DIR, WAD_DIR, DriveLayout, safe_name
+from .errors import ReWiiError
 
 RECORD = "riivolution.json"
 JUNK = {"__macosx", ".ds_store", "thumbs.db", "desktop.ini"}
 MAX_MOD_BYTES = 8 * 1024 ** 3          # largest unpacked mod ReWii accepts
-PROTECTED_TOPS = {"rewii", "bootmii", "wad"}
+PROTECTED_TOPS = {REWII_DIR, BOOTMII_DIR, WAD_DIR}
 PROTECTED_PREFIXES = (("private", "wii", "title"),)
 """Drive folders a mod's XML may not point into: ReWii's own records, BootMii/NAND
 backups, staged WADs and Wii saves. (``apps/`` and the rest of ``private/`` are
@@ -42,7 +43,7 @@ allowed - mod packs legitimately ship there - but a mod can never replace a
 different file that already exists.)"""
 
 
-class ModError(Exception):
+class ModError(ReWiiError):
     """A mod is invalid or can't be installed/removed."""
 
 
@@ -150,7 +151,7 @@ def _safe_extract(zpath: Path, dest: Path) -> None:
 
 def _find_base(folder: Path) -> tuple[Path, Path]:
     """Return ``(base, xml_folder)``: base is the folder treated as the drive root."""
-    cands = [p for p in folder.rglob("*") if p.is_dir() and p.name.lower() == "riivolution"
+    cands = [p for p in folder.rglob("*") if p.is_dir() and p.name.lower() == RIIVOLUTION_DIR
              and not any(x.lower() in JUNK for x in p.relative_to(folder).parts)
              and any(q.suffix.lower() == ".xml" for q in p.iterdir())]
     if cands:
@@ -195,7 +196,7 @@ def _resolve_src(base: Path, xml_folder: Path, drive_path: str) -> Optional[Path
     if p is not None:
         return p
     # mods packed without the riivolution/ wrapper: relative to the XML's folder
-    if rel.parts and rel.parts[0].lower() == "riivolution":
+    if rel.parts and rel.parts[0].lower() == RIIVOLUTION_DIR:
         return _walk_ci(xml_folder, rel.parts[1:])
     return None
 
@@ -241,10 +242,7 @@ def _load_record(drive_root: Path) -> dict:
 
 def _save_record(drive_root: Path, data: dict) -> None:
     p = _record_path(drive_root)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2), "utf-8")
-    tmp.replace(p)
+    fileops.write_atomic(p, json.dumps(data, indent=2))
 
 
 def _record_paths(entry: object) -> list[str]:
@@ -273,15 +271,6 @@ def _plan_tree(src: Path, dst: Path) -> list[tuple[Path, Path]]:
             if f.is_file() and not any(x.lower() in JUNK for x in f.relative_to(src).parts)]
 
 
-def _copy_file(src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(src, dst)
-    try:
-        shutil.copystat(src, dst)      # FAT32 mounts may refuse modes; times are a nicety
-    except OSError:
-        pass
-
-
 def _copy_plan(plan: list[tuple[Path, Path]], overwrite: bool, root: Path) -> list[str]:
     """Copy every pair of ``plan``. All conflicts are found *before* anything is
     written; if a copy fails midway the files this call created are removed again.
@@ -302,14 +291,10 @@ def _copy_plan(plan: list[tuple[Path, Path]], overwrite: bool, root: Path) -> li
             existed = target.exists()
             if not existed:
                 created.append(target)
-            _copy_file(f, target)
+            copy_atomic(f, target)
             placed.append(target.relative_to(root).as_posix())
     except BaseException:
-        for t in created:
-            try:
-                t.unlink(missing_ok=True)
-            except OSError:
-                pass
+        fileops.remove_quietly(created)
         raise
     return placed
 
@@ -321,8 +306,8 @@ def _store_in_library(source: Path, lib: Path) -> Path:
     if rs == rl or rl in rs.parents:
         return lib
     lib.parent.mkdir(parents=True, exist_ok=True)
-    tmp = lib.with_name(lib.name + ".rewii-new")
-    old = lib.with_name(lib.name + ".rewii-old")
+    tmp = lib.with_name(lib.name + fileops.NEW_SUFFIX)
+    old = lib.with_name(lib.name + fileops.OLD_SUFFIX)
     for junk in (tmp, old):
         if junk.exists():
             shutil.rmtree(junk, ignore_errors=True)
@@ -344,7 +329,83 @@ def _store_in_library(source: Path, lib: Path) -> Path:
     return lib
 
 
-def install_mod(source: Path, drive_root: Path, settings: Settings | None = None, *,
+def _open_mod(source: Path, scratch: Path) -> Path:
+    """The folder holding the mod's files: ``source`` itself, or its zip unpacked into ``scratch``."""
+    if source.is_file():
+        if not zipfile.is_zipfile(source):
+            raise ModError(f"{source.name} isn't a zip file or folder")
+        _safe_extract(source, scratch)
+        return scratch
+    if source.is_dir():
+        return source
+    raise ModError(f"{source} doesn't exist")
+
+
+def _resolve_externals(xmls: list[RiivoXml], base: Path, xml_folder: Path) -> tuple[dict[str, Path], list[str]]:
+    """Where each file the XMLs refer to is inside the mod: ``({drive path: source}, [missing])``."""
+    copies: dict[str, Path] = {}
+    missing: list[str] = []
+    for x in xmls:
+        for ext in x.externals:
+            src = _resolve_src(base, xml_folder, ext)
+            if src is None:
+                missing.append(ext)
+            else:
+                _check_drive_path(ext)
+                copies[ext] = src
+    return copies, missing
+
+
+def _build_plan(layout: DriveLayout, base: Path, xml_folder: Path, xml_files: list[Path],
+                copies: dict[str, Path]) -> list[tuple[Path, Path]]:
+    """Every ``(file in the mod, target on the drive)`` pair to copy, one per drive path."""
+    drive_root = layout.root
+    plan: list[tuple[Path, Path]] = []
+    for p in xml_files:
+        try:
+            archive.safe_parts(p.name)
+        except archive.ArchiveError as e:
+            raise ModError(str(e)) from e
+        plan += _plan_tree(p, layout.riivolution / p.name)
+    # copy whole top-level referenced folders when the mod ships them (keeps
+    # files referenced through {$params} we can't resolve)
+    done: set[str] = set()
+    for ext, src in sorted(copies.items()):
+        parts = PurePosixPath(ext).parts
+        top = "/" + parts[1] if len(parts) > 1 else ext
+        if top.lower() == "/riivolution":
+            top = "/" + "/".join(parts[1:3]) if len(parts) > 2 else ext
+        top_src = _resolve_src(base, xml_folder, top)
+        unit, unit_src = (top, top_src) if top_src is not None else (ext, src)
+        if unit in done or any(unit.startswith(d + "/") for d in done):
+            continue
+        done.add(unit)
+        dst = drive_root.joinpath(*PurePosixPath(unit).parts[1:])
+        if dst.resolve() == drive_root.resolve():
+            continue
+        plan += _plan_tree(unit_src, dst)
+    # one target per (case-insensitive) drive path
+    uniq: dict[str, tuple[Path, Path]] = {}
+    for f, target in plan:
+        uniq.setdefault(str(target).lower(), (f, target))
+    return list(uniq.values())
+
+
+def _refuse_other_mods_files(plan: list[tuple[Path, Path]], drive_root: Path, rec: dict, name: str) -> None:
+    """Files another installed mod put there are never replaced, not even with
+    ``overwrite``: that mod would stay listed but be broken (and removing this
+    one later would take the shared file with it). FAT32 ignores case, so
+    "MODA.XML" is another mod's "ModA.xml"."""
+    owners = {q.casefold(): n for n, d in rec.items() if n != name for q in _record_paths(d)}
+    for f, target in plan:
+        owner = owners.get(target.relative_to(drive_root).as_posix().casefold())
+        if owner and target.exists() and not (target.is_file() and filecmp.cmp(f, target, shallow=False)):
+            raise ModError(f"{target.relative_to(drive_root).as_posix()} belongs to the installed "
+                           f"mod \"{owner}\" and is different in this one. Remove \"{owner}\" "
+                           "first if you want this mod instead.")
+
+
+def install_mod(source: Path, layout: DriveLayout | Path, settings: Settings | None = None, *,
                 name: str | None = None, game_id: str | None = None,
                 overwrite: bool = False) -> InstallResult:
     """Install a Riivolution mod (zip or folder) onto a drive.
@@ -357,18 +418,11 @@ def install_mod(source: Path, drive_root: Path, settings: Settings | None = None
     ``overwrite``) or points into a protected folder (``rewii/``, ``apps/``,
     ``bootmii/``, ``private/``, ``wad/``); a copy that fails midway is rolled back.
     """
-    source, drive_root = Path(source), require_drive(drive_root)
+    layout = DriveLayout.of(layout)
+    source, drive_root = Path(source), layout.require_root()
     name = safe_name(name or source.stem)
     with tempfile.TemporaryDirectory(prefix="rewii-mod-") as td:
-        if source.is_file():
-            if not zipfile.is_zipfile(source):
-                raise ModError(f"{source.name} isn't a zip file or folder")
-            folder = Path(td)
-            _safe_extract(source, folder)
-        elif source.is_dir():
-            folder = source
-        else:
-            raise ModError(f"{source} doesn't exist")
+        folder = _open_mod(source, Path(td))
         base, xml_folder = _find_base(folder)
         xml_files = sorted(p for p in xml_folder.iterdir()
                            if p.is_file() and p.suffix.lower() == ".xml")
@@ -378,62 +432,14 @@ def install_mod(source: Path, drive_root: Path, settings: Settings | None = None
             want = ", ".join(sorted({g for x in xmls for g in x.game_ids})) or "?"
             warnings.append(f"This mod is for {want}, not {game_id.upper()} (wrong game or "
                             "region); Riivolution won't offer it for that disc.")
-        # what to copy: each external resolved to a source; group by drive path
-        copies: dict[str, Path] = {}
-        missing: list[str] = []
-        for x in xmls:
-            for ext in x.externals:
-                src = _resolve_src(base, xml_folder, ext)
-                if src is None:
-                    missing.append(ext)
-                else:
-                    _check_drive_path(ext)
-                    copies[ext] = src
+        copies, missing = _resolve_externals(xmls, base, xml_folder)
         if missing:
             warnings.append(f"{len(missing)} file(s) the XML refers to aren't in the mod, e.g. "
                             + ", ".join(sorted(missing)[:3]))
-        lay = DriveLayout(drive_root)
-        plan: list[tuple[Path, Path]] = []
-        for p in xml_files:
-            try:
-                archive.safe_parts(p.name)
-            except archive.ArchiveError as e:
-                raise ModError(str(e)) from e
-            plan += _plan_tree(p, lay.riivolution / p.name)
-        # copy whole top-level referenced folders when the mod ships them (keeps
-        # files referenced through {$params} we can't resolve)
-        done: set[str] = set()
-        for ext, src in sorted(copies.items()):
-            parts = PurePosixPath(ext).parts
-            top = "/" + parts[1] if len(parts) > 1 else ext
-            if top.lower() == "/riivolution":
-                top = "/" + "/".join(parts[1:3]) if len(parts) > 2 else ext
-            top_src = _resolve_src(base, xml_folder, top)
-            unit, unit_src = (top, top_src) if top_src is not None else (ext, src)
-            if unit in done or any(unit.startswith(d + "/") for d in done):
-                continue
-            done.add(unit)
-            dst = drive_root.joinpath(*PurePosixPath(unit).parts[1:])
-            if dst.resolve() == drive_root.resolve():
-                continue
-            plan += _plan_tree(unit_src, dst)
-        # one target per (case-insensitive) drive path
-        uniq: dict[str, tuple[Path, Path]] = {}
-        for f, target in plan:
-            uniq.setdefault(str(target).lower(), (f, target))
+        plan = _build_plan(layout, base, xml_folder, xml_files, copies)
         rec = _load_record(drive_root)
-        # Files another installed mod put there are never replaced, not even with
-        # ``overwrite``: that mod would stay listed but be broken (and removing this
-        # one later would take the shared file with it). FAT32 ignores case, so
-        # "MODA.XML" is another mod's "ModA.xml".
-        owners = {q.casefold(): n for n, d in rec.items() if n != name for q in _record_paths(d)}
-        for f, target in uniq.values():
-            owner = owners.get(target.relative_to(drive_root).as_posix().casefold())
-            if owner and target.exists() and not (target.is_file() and filecmp.cmp(f, target, shallow=False)):
-                raise ModError(f"{target.relative_to(drive_root).as_posix()} belongs to the installed "
-                               f"mod \"{owner}\" and is different in this one. Remove \"{owner}\" "
-                               "first if you want this mod instead.")
-        placed = _copy_plan(list(uniq.values()), overwrite, drive_root)
+        _refuse_other_mods_files(plan, drive_root, rec, name)
+        placed = _copy_plan(plan, overwrite, drive_root)
         # record what is on the drive before anything else can fail
         rec[name] = {"xmls": [p.name for p in xml_files], "paths": sorted(set(placed)),
                      "games": sorted({g for x in xmls for g in x.game_ids}),
@@ -460,9 +466,9 @@ class InstalledMod:
     managed: bool
 
 
-def list_installed_mods(drive_root: Path) -> list[InstalledMod]:
+def list_installed_mods(layout: DriveLayout | Path) -> list[InstalledMod]:
     """Mods installed by ReWii plus any other XMLs found in ``riivolution/``."""
-    drive_root = Path(drive_root)
+    drive_root = DriveLayout.of(layout).root
     rec = _load_record(drive_root)
     out = [InstalledMod(n, _strs(d.get("xmls")), _strs(d.get("games")), _record_paths(d), True)
            for n, d in sorted(rec.items())]
@@ -475,17 +481,17 @@ def list_installed_mods(drive_root: Path) -> list[InstalledMod]:
                     games = parse_xml(p).game_ids
                 except ModError:
                     games = []
-                out.append(InstalledMod(p.stem, [p.name], games, [f"riivolution/{p.name}"],
+                out.append(InstalledMod(p.stem, [p.name], games, [f"{RIIVOLUTION_DIR}/{p.name}"],
                                         False))
     return out
 
 
-def remove_mod(drive_root: Path, name: str) -> list[str]:
+def remove_mod(layout: DriveLayout | Path, name: str) -> list[str]:
     """Remove a ReWii-installed mod's files (shared files used by other mods stay).
 
     Returns the removed paths. Empty folders left behind are pruned.
     """
-    drive_root = Path(drive_root)
+    drive_root = DriveLayout.of(layout).root
     rec = _load_record(drive_root)
     if name not in rec:
         raise ModError(f"{name} wasn't installed by ReWii")

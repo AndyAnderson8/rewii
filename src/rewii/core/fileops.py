@@ -11,28 +11,40 @@ import contextlib
 import errno
 import hashlib
 import os
+import re
 import shutil
+import threading
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from .progress import Reporter
+from .errors import ReWiiError
 
 CHUNK = 4 * 1024 * 1024
+
+# ---- the temp-name convention (everything here is recognised by is_temp_name) ----
+#: A FILE that is still being written: ``<final name>.rewii-part`` next to its final name
+#: (see :func:`part_path`, :func:`write_atomic`, :func:`copy_atomic`).
 PART_SUFFIX = ".rewii-part"
-
-
-#: Prefix of staging files written next to their final name (see ``games``).
+#: A FOLDER that is still being filled (a snapshot, a NAND archive): ``<name>.partial``.
+PARTIAL_DIR_SUFFIX = ".partial"
+#: The two names used while a finished file/folder is swapped in for an existing one.
+NEW_SUFFIX, OLD_SUFFIX = ".rewii-new", ".rewii-old"
+#: Prefix of game staging files written next to their final name (see ``games``).
 TEMP_PREFIX = ".rewii-tmp-"
-#: Suffixes ReWii gives a file (or folder) while it is still being written or swapped in.
-TEMP_SUFFIXES = (PART_SUFFIX, ".part", ".partial", ".rewii-new", ".rewii-old", ".rewii-tmp")
+#: Every suffix that marks something unfinished. ``.part`` and ``.rewii-tmp`` are no longer
+#: written but may be left on a drive by older versions.
+TEMP_SUFFIXES = (PART_SUFFIX, ".part", PARTIAL_DIR_SUFFIX, NEW_SUFFIX, OLD_SUFFIX, ".rewii-tmp")
 #: A leftover temp file is only cleaned up when nothing has written to it for this long.
 TEMP_IDLE_SECONDS = 3600
 
 
-class UnsafePath(ValueError):
+class UnsafePath(ReWiiError, ValueError):
     """A relative path that would escape its base folder."""
 
 
-class DriveNotConnected(OSError):
+class DriveNotConnected(ReWiiError, OSError):
     """The drive's root folder is gone (unplugged, unmounted). Nothing is ever
     created in its place - that would silently write to the computer's own disk."""
 
@@ -58,6 +70,28 @@ def require_drive(root: Path | str) -> Path:
     if not ok:
         raise DriveNotConnected(root)
     return root
+
+
+_RESERVED = re.compile(r"^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])$", re.I)
+
+
+def is_reserved_name(part: str) -> bool:
+    """True for Windows device names (``CON``, ``nul.txt``, ``COM1`` ...), which can't be
+    file or folder names there - so they must never be put on a FAT32 drive."""
+    return _RESERVED.match(part.split(".", 1)[0].rstrip(" ")) is not None
+
+
+def same_content(a: Path, b: Path) -> bool:
+    """True if two files hold exactly the same bytes."""
+    if a.stat().st_size != b.stat().st_size:
+        return False
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        while True:
+            x, y = fa.read(CHUNK), fb.read(CHUNK)
+            if x != y:
+                return False
+            if not x:
+                return True
 
 
 def is_temp_name(name: str) -> bool:
@@ -187,8 +221,23 @@ def explain_os_error(exc: BaseException, drive_root: Path | str | None = None) -
     return str(exc) or type(exc).__name__
 
 
-def sha1_file(path: Path, rep: Reporter | None = None) -> str:
-    h = hashlib.sha1()
+def part_path(dest: Path, unique: bool = False) -> Path:
+    """The temp name a file is written under before it is renamed to ``dest``.
+    ``unique`` adds the process and thread id (for caches several threads may fill)."""
+    tag = f".{os.getpid()}.{threading.get_ident()}" if unique else ""
+    return dest.with_name(f"{dest.name}{tag}{PART_SUFFIX}")
+
+
+def remove_quietly(paths: Iterable[Path]) -> None:
+    """Delete files, ignoring any that are missing or can't be removed (cleanup paths)."""
+    for p in paths:
+        with contextlib.suppress(OSError):
+            p.unlink()
+
+
+def hash_file(path: Path, algo: str = "sha1", rep: Reporter | None = None) -> str:
+    """Hex digest of a file (``algo``: sha1, sha256, md5...), advancing ``rep`` by bytes read."""
+    h = hashlib.new(algo)
     with open(path, "rb") as f:
         while True:
             b = f.read(CHUNK)
@@ -200,35 +249,80 @@ def sha1_file(path: Path, rep: Reporter | None = None) -> str:
     return h.hexdigest()
 
 
-def copy_atomic(src: Path, dest: Path, rep: Reporter | None = None, *, want_hash: bool = False,
-                fsync: bool = False, keep_times: bool = True) -> str:
-    """Copy ``src`` to ``dest`` via a temp file. Returns the SHA-1 of the bytes
-    read when ``want_hash`` (else ""). ``fsync`` flushes to the device before the
-    rename (use it for anything irreplaceable written to removable media)."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(dest.name + PART_SUFFIX)
-    h = hashlib.sha1() if want_hash else None
+def sha1_file(path: Path, rep: Reporter | None = None) -> str:
+    return hash_file(path, "sha1", rep)
+
+
+def write_atomic(path: Path, data: bytes | str, *, fsync: bool = False, encoding: str = "utf-8",
+                 errors: str = "strict", unique: bool = False) -> Path:
+    """Write ``data`` to ``path`` through a temp file and a rename: a crash or a full disk
+    never leaves a half-written file under the real name. Creates the parent folder.
+    ``fsync`` flushes to the device first (use it on removable media for anything that matters)."""
+    path = Path(path)
+    raw = data.encode(encoding, errors) if isinstance(data, str) else data
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = part_path(path, unique)
     try:
-        with open(src, "rb") as fi, open(tmp, "wb") as fo:
+        with open(tmp, "wb") as f:
+            f.write(raw)
+            if fsync:
+                f.flush()
+                os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        remove_quietly([tmp])
+        raise
+    return path
+
+
+def copy_into(src: Path, out: Path, rep: Reporter | None = None, *, fsync: bool = False,
+              hasher: Any = None, message: str | None = None) -> None:
+    """Chunked copy of ``src`` to exactly ``out`` (overwriting it). ``out`` is normally a temp
+    name the caller renames afterwards; it is removed again if the copy fails or is cancelled."""
+    try:
+        with open(src, "rb") as fi, open(out, "wb") as fo:
             while True:
                 b = fi.read(CHUNK)
                 if not b:
                     break
                 fo.write(b)
-                if h is not None:
-                    h.update(b)
+                if hasher is not None:
+                    hasher.update(b)
                 if rep is not None:
-                    rep.advance(len(b))
+                    rep.advance(len(b), message)
             if fsync:
                 fo.flush()
                 os.fsync(fo.fileno())
+    except BaseException:
+        remove_quietly([out])
+        raise
+
+
+def copy_plain(src: Path | str, dest: Path | str) -> None:
+    """Plain (not atomic) copy of one file, then times/modes where the file system allows
+    (FAT32 may not). For files inside a folder that is itself still temporary, and as the
+    ``copy_function`` of :func:`shutil.copytree`."""
+    shutil.copyfile(src, dest)
+    with contextlib.suppress(OSError):
+        shutil.copystat(src, dest)
+
+
+def copy_atomic(src: Path, dest: Path, rep: Reporter | None = None, *, want_hash: bool = False,
+                fsync: bool = False, keep_times: bool = True, message: str | None = None) -> str:
+    """Copy ``src`` to ``dest`` via a temp file. Returns the SHA-1 of the bytes
+    read when ``want_hash`` (else ""). ``fsync`` flushes to the device before the
+    rename (use it for anything irreplaceable written to removable media)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = part_path(dest)
+    h = hashlib.sha1() if want_hash else None
+    try:
+        copy_into(src, tmp, rep, fsync=fsync, hasher=h, message=message)
         if keep_times:
             with contextlib.suppress(OSError):      # FAT/exFAT mounts may refuse chmod/utime
                 shutil.copystat(src, tmp)
         os.replace(tmp, dest)
     except BaseException:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
+        remove_quietly([tmp])
         raise
     return h.hexdigest() if h is not None else ""
 

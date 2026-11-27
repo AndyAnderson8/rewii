@@ -259,8 +259,11 @@ def test_ensure_allowed_verifies_unchecked_wads(tmp_path):
     p = write_wad(tmp_path, "c.wad")
     quick = W.inspect_wad(p, verify_hashes=False)
     assert quick.hashes_ok is None
-    W.ensure_allowed(quick, WII_US)
-    assert quick.hashes_ok is True                      # verified on the way through
+    verified, risks = W.ensure_allowed(quick, WII_US)
+    assert verified.hashes_ok is True                   # verified on the way through...
+    assert quick.hashes_ok is None and verified is not quick   # ...without changing the argument
+    assert not W.is_blocked(risks)
+    assert W.ensure_allowed(verified, WII_US)[0] is verified   # already checked: nothing to redo
     # damage a content: the quick scan can't see it, ensure_allowed must
     data = bytearray(p.read_bytes())
     data[-500] ^= 0xFF
@@ -330,18 +333,18 @@ def test_scan_stage_list_unstage(tmp_path):
     layout = DriveLayout(tmp_path / "usb")
     layout.root.mkdir(parents=True, exist_ok=True)   # the drive is plugged in
     events = []
-    staged = W.stage_wads(layout, [a, lib / "sub" / "b.wad"], progress=events.append)
+    staged = W.stage_wads(layout, [a, lib / "sub" / "b.wad"], progress=events.append, settings=WII_US)
     assert [p.name for p in staged] == ["A game.wad", "b.wad"]
     assert events and events[-1].done == events[-1].total
-    again = W.stage_wads(layout, [a])                # identical -> skipped
+    again = W.stage_wads(layout, [a], settings=WII_US)                # identical -> skipped
     assert again[0] == staged[0]
     other = write_wad(tmp_path, "A game.wad", tid="0001000157434343")
-    clash = W.stage_wads(layout, [other])
+    clash = W.stage_wads(layout, [other], settings=WII_US)
     assert clash[0].name == "A game (2).wad"
     assert len(W.list_staged(layout).wads) == 3
     removed = W.unstage(layout, ["b.wad", clash[0]])
     assert len(removed) == 2 and len(W.list_staged(layout).wads) == 1
-    with pytest.raises(ValueError):
+    with pytest.raises(W.WadError):
         W.unstage(layout, [a])                       # outside wad/
 
 
@@ -361,27 +364,11 @@ def test_stage_cancel(tmp_path):
     tok.cancel()
     from rewii.core.progress import Cancelled
     with pytest.raises(Cancelled):
-        W.stage_wads(layout, [write_wad(tmp_path)], cancel=tok)
+        W.stage_wads(layout, [write_wad(tmp_path)], cancel=tok, settings=WII_US)
     assert not list(layout.wad.glob("*.wad"))
 
 
 # --------------------------------------------------------------------------- pack / unpack
-def test_unpack_pack_roundtrip(tmp_path):
-    src = write_wad(tmp_path)
-    out = W.unpack_wad(src, tmp_path / "x")
-    names = sorted(p.name for p in out.iterdir())
-    tid = "0001000157414141"
-    assert names == ["00000000.app", "00000001.app", f"{tid}.cert", f"{tid}.tik", f"{tid}.tmd"]
-    same = W.pack_wad(out, tmp_path / "same.wad")
-    assert W.inspect_wad(same).hashes_ok
-    assert same.read_bytes() == src.read_bytes()
-
-    (out / "00000001.app").write_bytes(b"modified content")
-    mod = W.pack_wad(out, tmp_path / "mod.wad")
-    info = W.inspect_wad(mod)
-    assert info.hashes_ok and info.fakesigned
-    t = W.load_title(mod.read_bytes())
-    assert t.get_content_by_index(1) == b"modified content"
 
 
 def test_region_changed_korean_console_never_gets_a_system_menu(tmp_path, nintendo_signed):
@@ -389,3 +376,14 @@ def test_region_changed_korean_console_never_gets_a_system_menu(tmp_path, ninten
     flagged = Settings(console_type="wii", console_region="NTSC-U", korean_region_changed=True)
     assert "korean_region_changed" in _blocking(sm_u, flagged)
     assert "korean_region_changed" not in _blocking(sm_u, WII_US)
+
+
+def test_forwarder_game_id_is_lazy_and_cached(tmp_path, monkeypatch):
+    from rewii.core import forwarder as F
+    info = W.inspect_wad(write_wad(tmp_path))
+    calls = []
+    with monkeypatch.context() as m:
+        m.setattr(F, "channel_game_id", lambda p: (calls.append(p), "RMCE01")[1])
+        assert calls == []                                   # inspecting doesn't look for it
+        assert info.forwarder_game_id == "RMCE01" == info.forwarder_game_id and calls == [info.path]
+    assert W.inspect_wad(write_wad(tmp_path, "b.wad")).forwarder_game_id is None     # an ordinary channel

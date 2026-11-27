@@ -1,7 +1,6 @@
 """Channels & WADs: game channels, Virtual Console / WiiWare WADs, staging for YAWMME."""
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 from typing import Any, Optional
 from collections.abc import Callable
@@ -12,8 +11,6 @@ from textual.containers import Horizontal
 from textual.widgets import Button, DataTable, Label, Static
 
 from ...core import wad as W
-from ...core.forwarder import channel_game_id
-from ...core.progress import Reporter
 from ..base import FAILED, Pane, titles
 from ..widgets import MarkTable, human_size
 from ._channels import build_channels, collision_warning
@@ -82,11 +79,8 @@ class ChannelsPane(Pane):
             for where, w in found:
                 if w.path is None:
                     continue
-                try:
-                    gid = channel_game_id(w.path)
-                except Exception:  # noqa: BLE001 - not a ReWii channel
-                    gid = None
-                items[str(w.path)] = Item(where, w, w.path, gid)
+                # worked out here, off the UI thread; reads only the WAD's loader (see WadInfo)
+                items[str(w.path)] = Item(where, w, w.path, w.forwarder_game_id)
         except Exception as e:  # noqa: BLE001 - an unreadable folder must not close the app
             self.scan_failed("Reading the WAD list", e)
             return
@@ -126,27 +120,11 @@ class ChannelsPane(Pane):
         paths = await self.pick("Import WAD files", exts={".wad"}, multiple=True)
         if not paths:
             return
-        dest = self.settings.wads_dir
+        s = self.settings
 
         def run(progress: Any, cancel: Any) -> tuple[int, list[str]]:
-            rep = Reporter(progress, cancel, total=len(paths))
-            dest.mkdir(parents=True, exist_ok=True)
-            n, skipped = 0, []
-            for p in paths:
-                rep.note(f"Copying {p.name}")
-                dst = dest / p.name
-                if dst.exists():
-                    skipped.append(f"{p.name}: a WAD with this name is already in the library")
-                else:
-                    tmp = dst.with_name(dst.name + ".part")
-                    try:
-                        shutil.copy2(p, tmp)
-                        tmp.replace(dst)
-                    finally:
-                        tmp.unlink(missing_ok=True)
-                    n += 1
-                rep.advance(1)
-            return n, skipped
+            imported, skipped = W.import_wads(s, paths, progress, cancel)
+            return len(imported), skipped
 
         res = await self.job(f"Importing {len(paths)} WAD(s)", run, quiet=True)
         self.reload()

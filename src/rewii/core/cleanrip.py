@@ -25,15 +25,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .disc import GC_DISC_SIZE, GC_MAGIC, VALID_DISC_SIZES, WII_DL_SIZE, WII_MAGIC, WII_SL_SIZE
+from .disc import CLEANRIP_PART_RE, GC_DISC_SIZE, GC_MAGIC, VALID_DISC_SIZES, WII_DL_SIZE, WII_MAGIC, WII_SL_SIZE
+from .fileops import part_path
+from .ids import is_disc_id
 from .progress import CancelToken, ProgressFn, Reporter
+from .errors import ReWiiError
 
 CHUNK = 4 * 1024 * 1024
 MIN_SPLIT = 1 << 30      # CleanRip's smallest chunk size; smaller "parts" are not judged by size
-_PART = re.compile(r"^(?P<base>.+)\.part(?P<n>\d+)\.iso$", re.IGNORECASE)
+_PART = CLEANRIP_PART_RE
 
 
-class CleanRipError(Exception):
+class CleanRipError(ReWiiError):
     """A dump set is incomplete or unreadable."""
 
 
@@ -284,7 +287,7 @@ def _header_info(first: bytes) -> tuple[Optional[str], str]:
         return None, ""
     wii, gc = struct.unpack(">II", first[0x18:0x20])
     plat = "wii" if wii == WII_MAGIC else "gc" if gc == GC_MAGIC else None
-    gid = first[:6].decode("ascii") if plat and re.fullmatch(rb"[A-Za-z0-9]{6}", first[:6]) else ""
+    gid = first[:6].decode("ascii") if plat and is_disc_id(first[:6]) else ""
     return plat, gid
 
 
@@ -335,7 +338,7 @@ def join_dump(dump: CleanRipDump, dest: Path | str, progress: ProgressFn | None 
     dest.parent.mkdir(parents=True, exist_ok=True)
     rep = Reporter(progress, cancel)
     rep.set_total(dump.size, f"Joining {dump.name}")
-    tmp = dest.with_name(dest.name + ".part")
+    tmp = part_path(dest)
     try:
         res = _stream(dump.parts, tmp, rep)
         os.replace(tmp, dest)
@@ -347,17 +350,3 @@ def join_dump(dump: CleanRipDump, dest: Path | str, progress: ProgressFn | None 
     _check_dat(res, Path(dat) if dat else (_dat_for(dump, res.platform) if use_dat else None))
     return res
 
-
-def verify_dump(dump: CleanRipDump, progress: ProgressFn | None = None,
-                cancel: CancelToken | None = None, *, dat: Path | str | None = None,
-                use_dat: bool = True) -> VerifyResult:
-    """Checksum a dump (split or not) in place without writing anything."""
-    if not dump.complete:
-        raise CleanRipError(f"{dump.name}: part(s) {', '.join(map(str, dump.missing_parts))} are missing")
-    rep = Reporter(progress, cancel)
-    rep.set_total(dump.size, f"Checking {dump.name}")
-    res = _stream(dump.parts, None, rep)
-    res.path = dump.parts[0] if len(dump.parts) == 1 else None
-    _compare(res, dump.info())
-    _check_dat(res, Path(dat) if dat else (_dat_for(dump, res.platform) if use_dat else None))
-    return res

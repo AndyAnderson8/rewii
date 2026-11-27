@@ -32,9 +32,10 @@ from pathlib import Path
 from typing import Optional
 
 from .config import Settings
-from .layout import DriveLayout
-from .fileops import copy_atomic, require_drive, sha1_file
+from .layout import BOOTMII_DIR, DriveLayout
+from .fileops import PARTIAL_DIR_SUFFIX, copy_atomic, require_drive, sha1_file
 from .progress import CancelToken, ProgressFn, Reporter
+from .errors import ReWiiError
 
 KEYS_SIZE = 0x400
 NAND_SIZE_NO_ECC = 0x20000000          # 536,870,912 (pages without spare)
@@ -42,7 +43,6 @@ NAND_SIZE_ECC = 0x21000000             # 553,648,128 (pages + 64 B spare each)
 NAND_SIZE_ECC_KEYS = 0x21000400        # 553,649,152 (BootMii >= 1.0, nanddumper@ios)
 NAND_PAGE = 0x800
 NAND_SPARE = 0x40
-NAND_PAGES_PER_BLOCK = 64
 CONSOLE_ID_OFFSET = 0x124              # OTP 0x24 inside keys.bin
 OTP_OFFSET = 0x100
 SUPERBLOCK_START = 0x1FC00000          # in the de-spared image
@@ -66,20 +66,11 @@ MANIFEST = "manifest.json"
 SHA1SUMS = "sha1sums.txt"
 
 
-class NandError(Exception):
+class NandError(ReWiiError):
     """A NAND dump is invalid or an operation is unsafe."""
 
 
 # --------------------------------------------------------------------------- helpers
-def _sha1(path: Path, rep: Reporter | None = None) -> str:
-    return sha1_file(path, rep)
-
-
-def _copy(src: Path, dest: Path, rep: Reporter) -> str:
-    """Atomic, fsynced copy returning the SHA-1 of the copied bytes."""
-    return copy_atomic(src, dest, rep, want_hash=True, fsync=True)
-
-
 def _timestamp(now: datetime | None = None) -> str:
     return (now or datetime.now()).strftime("%Y%m%d-%H%M%S")
 
@@ -180,17 +171,17 @@ def _has_bootmii(d: Path) -> bool:
     return all((d / n).is_file() for n in BOOTMII_REQUIRED)
 
 
-def find_nand_dumps(root: Path) -> list[NandDump]:
-    """Find BootMii and nanddumper@ios NAND dumps on a drive root."""
-    root = Path(root)
-    lay = DriveLayout(root)
+def find_nand_dumps(layout: DriveLayout | Path) -> list[NandDump]:
+    """Find BootMii and nanddumper@ios NAND dumps on a drive (a layout or its root)."""
+    lay = DriveLayout.of(layout)
+    root = lay.root
     bm = lay.bootmii if _has_bootmii(lay.bootmii) else None
     out: list[NandDump] = []
     for d in (root, lay.bootmii):
         n = d / "nand.bin"
         if n.is_file():
             k = d / "keys.bin"
-            here = d / "bootmii" if _has_bootmii(d / "bootmii") else bm
+            here = d / BOOTMII_DIR if _has_bootmii(d / BOOTMII_DIR) else bm
             out.append(NandDump(n, k if k.is_file() else None, "bootmii", n.stat().st_size,
                                 bootmii_dir=here))
     bdir = lay.nand_dumps
@@ -216,9 +207,9 @@ def find_nand_dumps(root: Path) -> list[NandDump]:
     return out
 
 
-def find_vwii_dumps(root: Path) -> list[VwiiDump]:
-    """Find Wii U NAND dumper output (slc/slccmpt/otp/seeprom/mlc parts) at a root."""
-    root = Path(root)
+def find_vwii_dumps(layout: DriveLayout | Path) -> list[VwiiDump]:
+    """Find Wii U NAND dumper output (slc/slccmpt/otp/seeprom/mlc parts) on a drive."""
+    root = DriveLayout.of(layout).root
     out: list[VwiiDump] = []
     for d in (root, root / "wiiu" / "backups", root / "nanddumper"):
         if not d.is_dir():
@@ -315,7 +306,7 @@ def validate_dump(dump: NandDump, *, check_hash: bool = True,
     v.sha1_expected = expected_sha1(dump)
     if check_hash:
         rep = Reporter(progress, cancel, total=size, message=f"Hashing {dump.nand.name}")
-        v.sha1 = _sha1(dump.nand, rep)
+        v.sha1 = sha1_file(dump.nand, rep)
         if v.sha1_expected:
             v.sha1_matches = v.sha1 == v.sha1_expected
             if not v.sha1_matches:
@@ -414,17 +405,17 @@ def archive_dump(dump: NandDump, settings: Settings, *, include_bootmii: bool = 
     cdir = settings.nand_backups_dir / label
     cdir.mkdir(parents=True, exist_ok=True)
     final = _new_dir(cdir, now)
-    tmp = final.with_name(final.name + ".partial")
+    tmp = final.with_name(final.name + PARTIAL_DIR_SUFFIX)
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir()
     total = dump.size + (dump.keys.stat().st_size if dump.keys else 0)
     rep = Reporter(progress, cancel, total=total, message="Archiving NAND backup")
     try:
-        hashes = {"nand.bin": _copy(dump.nand, tmp / "nand.bin", rep)}
+        hashes = {"nand.bin": copy_atomic(dump.nand, tmp / "nand.bin", rep, want_hash=True, fsync=True)}
         if hashes["nand.bin"] != v.sha1:
             raise NandError("nand.bin changed while it was being copied")
         if dump.keys is not None:
-            hashes["keys.bin"] = _copy(dump.keys, tmp / "keys.bin", rep)
+            hashes["keys.bin"] = copy_atomic(dump.keys, tmp / "keys.bin", rep, want_hash=True, fsync=True)
         else:
             with open(dump.nand, "rb") as f:
                 f.seek(NAND_SIZE_ECC)
@@ -439,7 +430,7 @@ def archive_dump(dump: NandDump, settings: Settings, *, include_bootmii: bool = 
             for p in sorted(dump.bootmii_dir.iterdir()):
                 if p.is_file() and p.suffix.lower() in (".bin", ".elf", ".ini"):
                     shutil.copy2(p, tmp / "bootmii" / p.name)
-                    hashes[f"bootmii/{p.name}"] = _sha1(tmp / "bootmii" / p.name)
+                    hashes[f"bootmii/{p.name}"] = sha1_file(tmp / "bootmii" / p.name)
         meta = {"console_id": label, "kind": "wii",
                 "created": (now or datetime.now()).isoformat(timespec="seconds"),
                 "source": str(dump.nand), "tool": dump.tool, "serial": dump.serial,
@@ -468,11 +459,11 @@ def archive_vwii_dump(dump: VwiiDump, settings: Settings, *, now: datetime | Non
     cdir = settings.nand_backups_dir / label
     cdir.mkdir(parents=True, exist_ok=True)
     final = _new_dir(cdir, now)
-    tmp = final.with_name(final.name + ".partial")
+    tmp = final.with_name(final.name + PARTIAL_DIR_SUFFIX)
     tmp.mkdir()
     rep = Reporter(progress, cancel, total=dump.size, message="Archiving Wii U NAND dump")
     try:
-        hashes = {n: _copy(p, tmp / n, rep) for n, p in sorted(dump.files.items())}
+        hashes = {n: copy_atomic(p, tmp / n, rep, want_hash=True, fsync=True) for n, p in sorted(dump.files.items())}
         _write_manifest(tmp, {"console_id": label, "kind": "vwii",
                               "created": (now or datetime.now()).isoformat(timespec="seconds"),
                               "source": str(dump.root), "tool": "wiiu-nanddumper"}, hashes)
@@ -508,7 +499,7 @@ def verify_archive(archive: ArchivedNand, progress: ProgressFn | None = None,
         p = archive.dir / name
         if not p.is_file():
             probs.append(f"{name} is missing")
-        elif _sha1(p, rep) != want:
+        elif sha1_file(p, rep) != want:
             probs.append(f"{name} is damaged (SHA-1 mismatch)")
     return probs
 
@@ -590,12 +581,12 @@ def build_rescue_kit(archive: ArchivedNand, target: Path, *,
         raise NandError("the archived backup failed verification: " + "; ".join(probs))
     target = require_drive(target)          # the card must be there; never create it
     plan = [(archive.nand, target / "nand.bin"), (archive.keys, target / "keys.bin")]
-    plan += [(p, target / "bootmii" / p.name) for p in sorted(bm.iterdir())
+    plan += [(p, DriveLayout.of(target).bootmii / p.name) for p in sorted(bm.iterdir())
              if p.is_file() and p.suffix.lower() in (".bin", ".elf", ".ini")]
     todo = []
     for src, dst in plan:
         if dst.is_file():
-            if dst.stat().st_size == src.stat().st_size and _sha1(dst) == _sha1(src):
+            if dst.stat().st_size == src.stat().st_size and sha1_file(dst) == sha1_file(src):
                 continue                    # already on the card, identical: nothing to write
             if not overwrite:
                 raise NandError(f"{dst} already exists and is different; refusing to replace it")
@@ -610,7 +601,7 @@ def build_rescue_kit(archive: ArchivedNand, target: Path, *,
                    message="Writing rescue kit")
     for src, dst in todo:
         dst.parent.mkdir(parents=True, exist_ok=True)
-        _copy(src, dst, rep)
+        copy_atomic(src, dst, rep, want_hash=True, fsync=True)
     files = [dst for _, dst in plan]
     readme = target / "REWII-RESCUE-README.txt"
     readme.write_text(RESCUE_README.format(console=archive.console_id, created=archive.created,
@@ -632,10 +623,11 @@ def fetch_bootmii_sd_files(dest: Path, *, progress: ProgressFn | None = None,
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
     zpath = dest / "bootmii_sd_files.zip"
-    net.download(BOOTMII_SD_ZIP_URL, zpath, progress=progress, cancel=cancel)
     try:
-        if hashlib.sha256(zpath.read_bytes()).hexdigest() != BOOTMII_SD_ZIP_SHA256:
-            raise NandError("downloaded BootMii files don't match the expected checksum")
+        net.download(BOOTMII_SD_ZIP_URL, zpath, sha256=BOOTMII_SD_ZIP_SHA256, progress=progress, cancel=cancel)
+    except net.ChecksumMismatch:
+        raise NandError("downloaded BootMii files don't match the expected checksum") from None
+    try:
         out = dest / "bootmii"
         out.mkdir(exist_ok=True)
         with zipfile.ZipFile(zpath) as z:

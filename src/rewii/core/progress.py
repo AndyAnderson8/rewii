@@ -31,11 +31,17 @@ class CancelToken:
             raise Cancelled()
 
 
+#: What ``done``/``total`` of a progress event count.
+UNIT_BYTES = "bytes"      # the default: almost everything long-running moves bytes
+UNIT_STEPS = "steps"      # items, files, or an abstract scale such as 0..1000
+
+
 @dataclass
 class ProgressEvent:
     done: int
     total: int
     message: str = ""
+    unit: str = UNIT_BYTES      # UNIT_BYTES or UNIT_STEPS - the UI only shows sizes for bytes
 
     @property
     def fraction(self) -> float:
@@ -49,20 +55,24 @@ class Reporter:
     """Small helper that wraps an optional callback + cancel token."""
 
     def __init__(self, progress: Optional[ProgressFn] = None,
-                 cancel: Optional[CancelToken] = None, total: int = 0, message: str = "") -> None:
+                 cancel: Optional[CancelToken] = None, total: int = 0, message: str = "",
+                 unit: str = UNIT_BYTES) -> None:
         self.fn = progress
         self.cancel = cancel
         self.total = total
         self.done = 0
         self.message = message
+        self.unit = unit
 
     def check(self) -> None:
         if self.cancel is not None:
             self.cancel.check()
 
-    def set_total(self, total: int, message: str | None = None) -> None:
+    def set_total(self, total: int, message: str | None = None, unit: str | None = None) -> None:
         self.total = total
         self.done = 0
+        if unit is not None:
+            self.unit = unit
         if message is not None:
             self.message = message
         self._emit()
@@ -87,4 +97,4 @@ class Reporter:
 
     def _emit(self) -> None:
         if self.fn is not None:
-            self.fn(ProgressEvent(self.done, self.total, self.message))
+            self.fn(ProgressEvent(self.done, self.total, self.message, self.unit))
