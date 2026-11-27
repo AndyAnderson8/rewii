@@ -133,8 +133,8 @@ def test_remove_never_deletes_outside_the_drive(tmp_path: Path) -> None:
 
 
 def test_mod_cannot_plant_rewii_records_or_touch_protected_folders(tmp_path: Path) -> None:
-    for top in ("rewii", "bootmii", "wad", "ReWii"):
-        mod = tmp_path / f"evil-{top}"
+    for n, top in enumerate(("rewii", "bootmii", "wad", "ReWii")):
+        mod = tmp_path / f"evil-{n}"                     # not named after `top`: macOS/Windows fold case
         (mod / "riivolution").mkdir(parents=True)
         (mod / top).mkdir()
         (mod / "riivolution" / "evil.xml").write_text(
@@ -142,7 +142,7 @@ def test_mod_cannot_plant_rewii_records_or_touch_protected_folders(tmp_path: Pat
             f'<file disc="/a" external="/{top}/x.bin"/></patch></wiidisc>')
         (mod / top / "x.bin").write_text("x")
         (mod / top / "riivolution.json").write_text('{"Cool Mod": {"paths": ["/etc/passwd"]}}')
-        drive = tmp_path / f"drive-{top}"
+        drive = tmp_path / f"drive-{n}"
         drive.mkdir()
         with pytest.raises(R.ModError, match="doesn't allow"):
             R.install_mod(mod, drive)

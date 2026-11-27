@@ -157,10 +157,22 @@ class Pane(Vertical):
 
     # ---- background scans (thread workers)
     def from_thread(self, fn: Callable[..., Any], *args: Any) -> None:
-        """``call_from_thread`` that doesn't blow up when the app is closing."""
+        """``call_from_thread`` that doesn't blow up when the app is closing.
+
+        A scan can finish after the screen has started to come down; its result then
+        has nowhere to go (the widgets are gone), which must not count as a crash."""
+        def run() -> None:
+            if not self.is_attached:
+                return
+            try:
+                fn(*args)
+            except NoMatches:
+                if self.is_attached and self.app.is_running:
+                    raise
+
         try:
-            self.app.call_from_thread(fn, *args)
-        except RuntimeError:
+            self.app.call_from_thread(run)
+        except (RuntimeError, NoMatches):
             pass
 
     def scan_failed(self, what: str, exc: BaseException) -> None:
