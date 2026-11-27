@@ -173,11 +173,12 @@ def identify_theme(path: Path) -> ThemeInfo:
             if body[off:off + len(sig)] == sig:
                 info.signed = sig.split(b"_")[0].decode("latin-1")
                 break
+    # The file name (NNNNNNNN.app) is only a hint for the platform/version when the
+    # contents don't say. The region is never taken from the name: it decides whether
+    # a theme bricks the Wii Menu, so it has to be proven by the archive itself.
     if info.content_id is not None and info.content_id in MENU_43_CONTENT and not info.platform:
-        plat, letter, _v = MENU_43_CONTENT[info.content_id]
+        plat, _letter, _v = MENU_43_CONTENT[info.content_id]
         info.platform, info.major, info.minor = plat, 4, 3
-        if not info.regions:
-            info.regions = [letter]
     return info
 
 
@@ -228,6 +229,9 @@ def check_theme(info: ThemeInfo, console_type: str, region: str) -> list[str]:
     if info.major is not None and info.major != 4:
         errs.append(f"this theme is for System Menu {info.major}.x; update to 4.3 first or "
                     "pick a 4.3 theme")
+    elif info.major == 4 and info.minor is not None and info.minor != 3:
+        errs.append(f"this theme is for System Menu 4.{info.minor}; ReWii only stages 4.3 themes "
+                    "(update to 4.3 first or pick a 4.3 theme)")
     return errs
 
 
@@ -253,9 +257,18 @@ def stage_theme(theme: Path, drive_root: Path, *, console_type: str, region: str
     dest_dir = Path(drive_root) / THEMES_DIR
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / theme.name
-    if dest.exists() and not overwrite and dest.read_bytes() != theme.read_bytes():
-        raise ThemeError(f"{dest.name} already exists in themes/ and is different")
-    shutil.copy2(theme, dest)
+    if dest.exists():
+        if dest.resolve() == theme.resolve():
+            return StagedTheme(dest, info, warnings)        # already staged
+        if not overwrite and dest.read_bytes() != theme.read_bytes():
+            raise ThemeError(f"{dest.name} already exists in themes/ and is different")
+    tmp = dest.with_name(dest.name + ".part")
+    try:
+        shutil.copyfile(theme, tmp)
+        tmp.replace(dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return StagedTheme(dest, info, warnings)
 
 

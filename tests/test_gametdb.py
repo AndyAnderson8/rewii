@@ -146,3 +146,38 @@ def test_index_roundtrip(cache):
     db._write_index(p)
     back = TitleDB._read_index(p, "EN")
     assert back is not None and back.games == db.games and back.version == "v1"
+
+
+# --------------------------------------------------------------------------- regressions
+def test_captive_portal_page_is_not_cached(cache):
+    calls = []
+
+    def portal(req):
+        calls.append(1)
+        return httpx.Response(200, content=b"<html>Please log in</html>")
+    mock(portal)
+    assert not TitleDB.load(Settings()).available
+    assert not list((cache / "gametdb").glob("*.zip"))          # nothing kept for a week
+    mock(lambda req: httpx.Response(200, content=make_zip()))
+    assert TitleDB.load(Settings()).available                   # works as soon as the network does
+    # ...and a later bad refresh keeps the good database
+    mock(portal)
+    db = TitleDB.load(Settings(), refresh=True)
+    assert db.available and len(list((cache / "gametdb").glob("*.zip"))) == 1
+
+
+def test_stale_bad_zip_from_older_versions_is_dropped(cache):
+    z = cache / TitleDB.zip_cache_name("EN")
+    z.parent.mkdir(parents=True)
+    z.write_bytes(b"<html>cached by an older ReWii</html>")
+    mock(lambda req: httpx.Response(500))
+    assert not TitleDB.load(Settings()).available
+    assert not z.exists()
+
+
+def test_index_that_is_not_an_object_is_ignored(cache):
+    idx = TitleDB.index_path("EN")
+    idx.parent.mkdir(parents=True)
+    idx.write_text("[1, 2, 3]")
+    mock(lambda req: httpx.Response(500))
+    assert not TitleDB.load(Settings()).available               # "never raises"

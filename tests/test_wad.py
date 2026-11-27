@@ -160,14 +160,21 @@ def test_system_menu_region():
 
 # --------------------------------------------------------------------------- risks
 def _sm(tmp_path, version, vwii=False):
-    tid = ("00000007" if vwii else "00000001") + "00000002"
-    return W.inspect_wad(write_wad(tmp_path, f"sm{version}.wad", tid=tid, version=version, ios=80,
-                                   region=0, name=None))
+    # real vWii system titles carry 00000001 IDs with the TMD's vWii flag set
+    return W.inspect_wad(write_wad(tmp_path, f"sm{version}.wad", tid="0000000100000002",
+                                   version=version, ios=80, region=0, name=None,
+                                   vwii=int(vwii), fakesign=False))
 
 
-def test_system_menu_rules(tmp_path):
+@pytest.fixture
+def nintendo_signed(monkeypatch):
+    """Synthetic certificates can't carry Nintendo's signatures; pretend they verify."""
+    monkeypatch.setattr(Title, "get_is_signed", lambda self: True)
+
+
+def test_system_menu_rules(tmp_path, nintendo_signed):
     sm_u = _sm(tmp_path, 513)
-    assert sm_u.title_type == W.T_SYSTEM_MENU and sm_u.region == "NTSC-U"
+    assert sm_u.title_type == W.T_SYSTEM_MENU and sm_u.region == "NTSC-U" and sm_u.signed
     risks = W.classify_risk(sm_u, WII_US)
     assert not W.is_blocked(risks) and any(r.code == "system_menu" for r in risks)
     assert W.is_blocked(W.classify_risk(sm_u, Settings(console_type="wii", console_region="PAL")))
@@ -182,6 +189,91 @@ def test_system_menu_rules(tmp_path):
     assert not W.is_blocked(W.classify_risk(vsm, VWII_US))
 
 
+def _blocking(info, settings):
+    return [r.code for r in W.classify_risk(info, settings) if r.blocks]
+
+
+def test_system_menu_must_be_signed_43(tmp_path, monkeypatch):
+    # a fakesigned / modified Wii Menu of the right region and version is refused
+    mod = W.inspect_wad(write_wad(tmp_path, "mod.wad", tid="0000000100000002", version=513,
+                                  ios=80, region=1, name=None))
+    assert not mod.signed and "modified_menu" in _blocking(mod, WII_US)
+    monkeypatch.setattr(Title, "get_is_signed", lambda self: True)
+    # a genuine but older menu of the right region (4.1U v449) is a downgrade: refused
+    old = _sm(tmp_path, 449)
+    assert W.system_menu_region(449) == "NTSC-U" and old.signed
+    assert _blocking(old, WII_US) == ["menu_version"]
+    # the Wii's 4.3U is not the vWii's 4.3U and vice versa
+    assert "menu_version" in _blocking(_sm(tmp_path, 513, vwii=True), VWII_US)
+    assert _blocking(_sm(tmp_path, 513), WII_US) == []
+    with pytest.raises(W.Refused, match="4.3"):
+        W.ensure_allowed(old, WII_US)
+
+
+def test_menu_ios_stub_and_unsigned_blocked(tmp_path, nintendo_signed):
+    def ios(n, ver, **kw):
+        return W.inspect_wad(write_wad(tmp_path, f"ios{n}-{ver}.wad", tid=f"00000001{n:08x}",
+                                       version=ver, ios=0, region=3, name=None, fakesign=False, **kw))
+    # Nintendo-signed stubs of the IOS a Wii Menu runs on
+    for n, ver in ((30, 2816), (50, 5120), (60, 6400), (70, 6912)):
+        assert _blocking(ios(n, ver), WII_US) == ["stub_menu_ios"], (n, ver)
+    # the genuine working versions pass (with a warning)
+    for n, ver in ((80, 6944), (70, 6687), (60, 6174)):
+        assert _blocking(ios(n, ver), WII_US) == [], (n, ver)
+    # other IOS are not menu IOS: stubs and cIOS bases stay installable
+    assert _blocking(ios(58, 6176), WII_US) == [] and _blocking(ios(249, 65280), WII_US) == []
+    assert W.is_menu_ios("0000000100000050") and W.is_menu_ios("0000000700000050")
+    assert not W.is_menu_ios("000000010000003a") and not W.is_menu_ios("0001000148414441")
+
+
+def test_vwii_menu_ios_must_be_signed(tmp_path):
+    # vWii IOS80 as it really is: 00000001-00000050 with the vWii flag; fakesigned -> refused
+    v80 = W.inspect_wad(write_wad(tmp_path, "v80.wad", tid="0000000100000050", version=7200,
+                                  ios=0, region=3, name=None, vwii=1))
+    assert v80.platform == "vwii" and "modified_menu_ios" in _blocking(v80, VWII_US)
+    # a re-keyed (so no longer signed) vWii cIOS base is not a menu IOS and stays allowed
+    v38 = W.inspect_wad(write_wad(tmp_path, "v38.wad", tid="0000000100000026", version=4380,
+                                  ios=0, region=3, name=None, vwii=1, fakesign=False))
+    assert not v38.signed and _blocking(v38, VWII_US) == []
+    assert W.is_blocked(W.classify_risk(v38, WII_US))
+
+
+def test_boot2_type_wad_blocked_whatever_its_id(tmp_path):
+    info = W.inspect_wad(write_wad(tmp_path))
+    assert _blocking(info, WII_US) == []
+    info.wad_type = "ib"
+    assert _blocking(info, WII_US) == ["boot2"]
+
+
+def test_fakesigned_forwarder_channel_still_allowed(tmp_path):
+    # what ReWii's own forwarder builder produces: a fakesigned 00010001 channel
+    info = W.inspect_wad(write_wad(tmp_path, "fwd.wad", tid="0001000155484145", region=3))
+    assert info.fakesigned and info.title_type == W.T_CHANNEL
+    assert _blocking(info, WII_US) == [] and _blocking(info, VWII_US) == []
+    W.ensure_allowed(info, WII_US)
+    assert W.stage_wads(DriveLayout(tmp_path / "usb"), [info.path], settings=WII_US)
+
+
+def test_ensure_allowed_verifies_unchecked_wads(tmp_path):
+    p = write_wad(tmp_path, "c.wad")
+    quick = W.inspect_wad(p, verify_hashes=False)
+    assert quick.hashes_ok is None
+    W.ensure_allowed(quick, WII_US)
+    assert quick.hashes_ok is True                      # verified on the way through
+    # damage a content: the quick scan can't see it, ensure_allowed must
+    data = bytearray(p.read_bytes())
+    data[-500] ^= 0xFF
+    p.write_bytes(bytes(data))
+    quick = W.inspect_wad(p, verify_hashes=False)
+    with pytest.raises(W.Refused, match="damaged"):
+        W.ensure_allowed(quick, WII_US)
+    # nothing to verify against -> refused rather than waved through
+    quick = W.inspect_wad(write_wad(tmp_path, "d.wad"), verify_hashes=False)
+    quick.path = None
+    with pytest.raises(W.Refused):
+        W.ensure_allowed(quick, WII_US)
+
+
 def test_ios_rules(tmp_path):
     ios = W.inspect_wad(write_wad(tmp_path, "ios.wad", tid="0000000100000026", ios=0, region=3,
                                   name=None))
@@ -189,8 +281,8 @@ def test_ios_rules(tmp_path):
     assert ios.region == "World" and ios.required_ios == 0
     assert not W.is_blocked(W.classify_risk(ios, WII_US))
     assert W.is_blocked(W.classify_risk(ios, VWII_US))       # Wii IOS on vWii
-    vios = W.inspect_wad(write_wad(tmp_path, "vios.wad", tid="0000000700000026", ios=0, region=3,
-                                   name=None))
+    vios = W.inspect_wad(write_wad(tmp_path, "vios.wad", tid="0000000100000026", ios=0, region=3,
+                                   name=None, vwii=1))
     assert W.is_blocked(W.classify_risk(vios, WII_US))       # vWii IOS on Wii
     assert not W.is_blocked(W.classify_risk(vios, VWII_US))
     ios80 = W.inspect_wad(write_wad(tmp_path, "ios80.wad", tid="0000000100000050", ios=0, region=3,

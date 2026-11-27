@@ -143,3 +143,21 @@ def test_not_a_report_and_find(tmp_path: Path) -> None:
     (tmp_path / "SysCheck.csv").write_bytes(WII_PAL.encode("cp1252"))
     p = SC.find_syscheck(tmp_path)
     assert p is not None and SC.read_syscheck(p).sysmenu == "4.3E"
+
+
+def test_korean_region_changed_console_is_never_offered_the_update() -> None:
+    kor = OLD.replace("original region: JAP", "original region: KOR")
+    r = SC.parse_syscheck(kor)
+    assert r.original_region == "KOR" and r.korean_region_changed
+    assert r.sysmenu_version == 481                      # 4.2U: would normally get update_43
+    errs = [f for f in r.findings if f.severity == "error" and "Error 003" in f.message]
+    assert len(errs) == 1 and errs[0].fix == ""
+    assert "update_43" not in [f.fix for f in r.findings]
+    # also when IOS58 is missing (the other route to update_43)
+    r = SC.parse_syscheck(kor.replace("IOS58 (rev 6176): USB 2.0\n", ""))
+    assert "update_43" not in [f.fix for f in r.findings]
+    # other region changes keep the old behaviour; a Korean console still in Korea is fine
+    r = SC.parse_syscheck(OLD)
+    assert not r.korean_region_changed and "update_43" in [f.fix for f in r.findings]
+    r = SC.parse_syscheck(OLD.replace("Region: NTSC-U (original region: JAP)", "Region: KOR"))
+    assert not r.korean_region_changed

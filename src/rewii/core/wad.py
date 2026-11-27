@@ -88,8 +88,35 @@ _SM_REGION_BY_LOW = {0: "NTSC-J", 1: "NTSC-U", 2: "PAL", 6: "NTSC-K"}
 
 COMMON_KEY_NAMES = {0: "Normal", 1: "Korean", 2: "vWii"}
 
-#: The System Menu's IOS on a Wii; a broken copy of this is an instant brick.
-SYSTEM_MENU_IOS = {"0000000100000050", "0000000100000046", "000000010000003C"}  # IOS80, 70, 60
+#: IOS slots a System Menu runs on (3.2: 30, 3.3K: 40, 3.4: 50, 3.5K: 52, 4.0/4.1: 60,
+#: 4.2: 70, 4.3 and vWii: 80). A broken or stubbed copy of the one in use is an instant brick.
+MENU_IOS_SLOTS = frozenset({30, 40, 50, 52, 60, 70, 80})
+#: Title IDs of those IOS (lower-case hex; vWii WADs carry the same 00000001 IDs).
+SYSTEM_MENU_IOS = frozenset(f"{HIGH_SYSTEM}{n:08x}" for n in MENU_IOS_SLOTS)
+
+#: The only System Menu ReWii lets through: 4.3 for the console's platform and region.
+SYSTEM_MENU_43 = {
+    ("wii", "NTSC-J"): 512, ("wii", "NTSC-U"): 513, ("wii", "PAL"): 514, ("wii", "NTSC-K"): 518,
+    ("vwii", "NTSC-J"): 608, ("vwii", "NTSC-U"): 609, ("vwii", "PAL"): 610,
+}
+
+
+def is_menu_ios(title_id: str) -> bool:
+    """True if ``title_id`` is an IOS that some System Menu version runs on."""
+    tid = title_id.lower()
+    if len(tid) != 16 or tid[:8] not in (HIGH_SYSTEM, HIGH_VWII_SYSTEM):
+        return False
+    try:
+        return int(tid[8:], 16) in MENU_IOS_SLOTS
+    except ValueError:
+        return False
+
+
+def is_stub_ios_version(version: int) -> bool:
+    """Nintendo's stub IOS (empty placeholders that replaced retired IOS, e.g. IOS60
+    v6400, IOS70 v6912, IOS30 v2816) all have a version that is a multiple of 256;
+    no working IOS does."""
+    return version % 256 == 0
 
 
 def system_menu_region(version: int) -> str | None:
@@ -278,7 +305,7 @@ def info_from_title(title: Title, *, path: Optional[Path] = None, file_size: int
     tid = tmd.title_id.lower()
     ttype = title_type_of(tid)
     ascii_id = title_ascii(tid)
-    vwii = tid.startswith("0007", 4) or tid[:8] == HIGH_VWII_SYSTEM or bool(tmd.vwii)
+    vwii = tid[:4] == "0007" or tid[:8] == HIGH_VWII_SYSTEM or bool(tmd.vwii)
     vwii = vwii or tik.common_key_index == 2
     if ttype == T_SYSTEM_MENU:
         region = system_menu_region(tmd.title_version) or "Unknown"
@@ -397,7 +424,7 @@ def classify_risk(info: WadInfo, settings: Settings) -> list[Risk]:
             "Installing it could break the title or the console. Download it again.")
 
     t = info.title_type
-    if t == T_BOOT2:
+    if t == T_BOOT2 or info.wad_type == "ib":
         add("error", "boot2", "This WAD contains boot2, the Wii's lowest-level boot code. "
             "Installing it is extremely dangerous and ReWii will never do it.")
         return risks
@@ -426,12 +453,30 @@ def classify_risk(info: WadInfo, settings: Settings) -> list[Risk]:
             elif sm_reg != reg:
                 add("error", "region_mismatch", f"This Wii Menu is for {sm_reg} consoles but yours is "
                     f"{reg}. Installing it will brick your console.")
+            else:
+                plat = "vwii" if ct == "vwii" else "wii"
+                want = SYSTEM_MENU_43.get((plat, reg))
+                if want is None or info.version != want:
+                    add("error", "menu_version", "ReWii only installs Wii Menu 4.3 for your console "
+                        f"({'v' + str(want) if want else 'not available for this region'}); this "
+                        f"WAD is version v{info.version}. Installing an older or different Wii Menu "
+                        "can brick the console.")
+            if not info.signed:
+                add("error", "modified_menu", "This Wii Menu is modified or not signed by Nintendo. "
+                    "Installing a changed Wii Menu can brick the console; use themes "
+                    "(csm-installer) to change its look instead.")
             add("warning", "system_menu", "Replacing the Wii Menu is risky. Make sure Priiloader "
                 "(and BootMii, on a Wii) is installed before you continue.")
         if t == T_IOS:
-            if info.title_id in SYSTEM_MENU_IOS and not info.signed:
-                add("error", "modified_menu_ios", f"{info.name} is the IOS your Wii Menu runs on, and "
-                    "this copy is modified or not properly signed. Installing it can brick the console.")
+            if is_menu_ios(info.title_id):
+                if is_stub_ios_version(info.version):
+                    add("error", "stub_menu_ios", f"{info.name} v{info.version} is an empty placeholder "
+                        "(a \"stub\"). If your Wii Menu runs on this IOS, installing it bricks the "
+                        "console.")
+                elif not info.signed:
+                    add("error", "modified_menu_ios", f"{info.name} is the IOS your Wii Menu runs on, "
+                        "and this copy is modified or not properly signed. Installing it can brick "
+                        "the console.")
             add("warning", "ios", f"This WAD replaces {info.name}, part of the console's system "
                 "software. Only install IOS from Nintendo's servers or the guide.")
         if t in (T_BC, T_MIOS, T_SYSTEM):
@@ -476,7 +521,26 @@ def is_blocked(risks: Iterable[Risk]) -> bool:
 
 
 def ensure_allowed(info: WadInfo, settings: Settings) -> list[Risk]:
-    """Raise :class:`Refused` with the first blocking reason, else return the risks."""
+    """Raise :class:`Refused` with the first blocking reason, else return the risks.
+
+    A WAD whose contents haven't been checked yet (``info.hashes_ok is None``,
+    e.g. from a quick :func:`scan_wads`) is verified here first - its file is read
+    again and ``info`` is updated in place. If there is no file to check, it is
+    refused: nothing unverified gets through.
+    """
+    if info.hashes_ok is None:
+        if info.path is None:
+            raise Refused("This WAD's contents haven't been checked, so ReWii won't use it.")
+        try:
+            full = inspect_wad(info.path, verify_hashes=True)
+        except WadError as e:
+            raise Refused(str(e)) from e
+        if full.title_id != info.title_id or full.version != info.version:
+            raise Refused("This WAD changed while ReWii was checking it. Try again.")
+        info.hashes_ok, info.bad_contents = full.hashes_ok, full.bad_contents
+        info.signed = full.signed
+        info.tmd_fakesigned, info.ticket_fakesigned = full.tmd_fakesigned, full.ticket_fakesigned
+        info.wad_type, info.platform = full.wad_type, full.platform
     risks = classify_risk(info, settings)
     for r in risks:
         if r.blocks:
@@ -517,7 +581,9 @@ _FAT_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 def staged_name(path: Path) -> str:
     """A FAT32-safe file name for a WAD in ``wad/``."""
     stem = _FAT_BAD.sub("", Path(path).stem).strip().rstrip(".") or "title"
-    stem = re.sub(r"\s+", " ", stem)[:80].rstrip()
+    stem = re.sub(r"\s+", " ", stem)[:80].rstrip(" .") or "title"
+    if re.fullmatch(r"(?i)(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?", stem):
+        stem = "_" + stem           # Windows device names can't be file names
     return f"{stem}.wad"
 
 

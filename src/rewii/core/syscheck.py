@@ -50,6 +50,7 @@ MINI_SYSMENU = {4609, 4610}
 EXPECTED_CIOS = {248: 38, 249: 56, 250: 57, 251: 58}
 D2X_MIN_VERSION = 11
 HBC_LATEST = (1, 1, 2)
+_KOREAN_NAMES = {"KOR", "KOREA", "KOREAN", "NTSC-K", "K"}
 
 
 def sysmenu_name(version: int) -> str:
@@ -134,6 +135,16 @@ class SysCheckReport:
         if self.boot2_version is None:
             return None
         return self.boot2_version == 65535
+
+    @property
+    def korean_region_changed(self) -> bool:
+        """A Korean console whose region was changed to something else. Wii Menu
+        4.2+ bricks these with "Error 003", so system updates must not be offered."""
+        orig = self.original_region.strip().upper()
+        if orig not in _KOREAN_NAMES:
+            return False
+        now = self.region.strip().upper()
+        return now not in _KOREAN_NAMES and not (not now and self.region_letter == "K")
 
     @property
     def region_letter(self) -> str:
@@ -316,13 +327,21 @@ def analyze(r: SysCheckReport) -> list[Finding]:
         f.append(Finding("error", "This doesn't look like a SysCheck report (no IOS list found).",
                          ""))
         return f
+    korean_changed = r.korean_region_changed
     if r.sysmenu_version is None:
         f.append(Finding("warning", "The System Menu version couldn't be read.", ""))
-    elif ctype == "wii" and r.sysmenu_version < 512 and r.sysmenu_version not in VWII_SYSMENU:
+    elif ctype == "wii" and r.sysmenu_version < 512 and r.sysmenu_version not in VWII_SYSMENU \
+            and not korean_changed:
         f.append(Finding("warning", f"The Wii Menu is version {r.sysmenu or r.sysmenu_version}. "
                          "Updating to 4.3 is recommended (do it only after Priiloader and a "
                          "NAND backup).", "update_43"))
-    if r.original_region:
+    if korean_changed:
+        f.append(Finding("error", "This is a Korean console that was changed to another region "
+                         f"({r.region or r.sysmenu or 'unknown'}). Do NOT update the Wii Menu or "
+                         "install a different Wii Menu on it: Wii Menu 4.2 and newer refuse to "
+                         "start on such consoles (\"Error 003\"), which bricks them. ReWii won't "
+                         "offer the 4.3 update for this console.", ""))
+    elif r.original_region:
         f.append(Finding("warning", f"This console was region-changed (originally "
                          f"{r.original_region}). Be careful with themes and system updates.",
                          ""))
@@ -363,7 +382,7 @@ def analyze(r: SysCheckReport) -> list[Finding]:
                              "can't be installed until it's restored.", "restore_ios"))
     if ctype == "wii" and 58 not in r.ios:
         f.append(Finding("warning", "IOS58 is missing (needed for USB 2.0 in homebrew).",
-                         "update_43"))
+                         "" if korean_changed else "update_43"))
     if ctype == "wii" and not r.bootmii_ios and not r.bootmii_boot2:
         f.append(Finding("info", "BootMii isn't installed. It's needed for NAND backups and "
                          "unbricking.", "install_bootmii"))

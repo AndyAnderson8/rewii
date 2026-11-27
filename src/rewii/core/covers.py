@@ -20,6 +20,7 @@ from collections.abc import Iterable
 
 from . import config, net
 from .config import Settings
+from .ids import id_for_filename, valid_game_id
 from .layout import DriveLayout
 from .progress import CancelToken, Cancelled, ProgressFn, Reporter
 
@@ -41,6 +42,7 @@ OTHER_REGIONS = ("OTHER", "AU", "DE", "FR", "ES", "IT", "NL", "PT", "RU", "JA", 
 # USB Loader GX rejects these sizes as GameTDB placeholder images
 _PLACEHOLDER_SIZES = {36864, 7386, 4446}
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+ALL_KINDS = frozenset(COVER_KINDS) | {k for v in KIND_FALLBACKS.values() for k in v}
 
 OK = "ok"
 MISSING = "missing"
@@ -76,9 +78,23 @@ def _valid_png(data: Optional[bytes]) -> bool:
             and len(data) not in _PLACEHOLDER_SIZES)
 
 
+def _png_file_ok(path: Path) -> bool:
+    """True if ``path`` is a usable cover (a real PNG, not empty/truncated/placeholder)."""
+    try:
+        if not path.is_file():
+            return False
+        size = path.stat().st_size
+        if size <= 1024 or size in _PLACEHOLDER_SIZES:
+            return False
+        with open(path, "rb") as f:
+            return f.read(8) == _PNG_MAGIC
+    except OSError:
+        return False
+
+
 def cache_path(game_id: str, kind: str) -> Path:
     """Where the local cached copy of a cover lives (may not exist)."""
-    return config.cache_dir() / "covers" / kind / f"{game_id.upper()}.png"
+    return config.cache_dir() / "covers" / id_for_filename(kind) / f"{id_for_filename(game_id)}.png"
 
 
 def cached_cover_path(game_id: str, kind: str = "cover3D") -> Optional[Path]:
@@ -90,26 +106,31 @@ def cached_cover_path(game_id: str, kind: str = "cover3D") -> Optional[Path]:
 def wiiflow_cover_path(layout: DriveLayout, game_id: str, kind: str) -> Optional[Path]:
     """WiiFlow Lite location for ``kind`` (flat -> covers/, full -> boxcovers/), or None."""
     if kind == "cover":
-        return layout.wiiflow / "covers" / f"{game_id}.png"
+        return layout.wiiflow / "covers" / f"{id_for_filename(game_id)}.png"
     if kind in ("coverfull", "coverfullHQ"):
-        return layout.wiiflow / "boxcovers" / f"{game_id}.png"
+        return layout.wiiflow / "boxcovers" / f"{id_for_filename(game_id)}.png"
     return None
 
 
 def gx_cover_path(layout: DriveLayout, game_id: str, kind: str) -> Path:
     """USB Loader GX location for a cover of ``kind``."""
-    return layout.gx_cover_dir(kind) / f"{game_id}.png"
+    return layout.gx_cover_dir(kind) / f"{id_for_filename(game_id)}.png"
 
 
 def download_cover(game_id: str, kind: str, lang: str = "EN",
                    cancel: Optional[CancelToken] = None) -> tuple[Optional[bytes], str]:
     """Try every region (and fallback art types) for one cover.
 
-    Returns ``(png_bytes, region)``; ``(None, "")`` when GameTDB has none.
-    Raises :class:`net.NetError` only if *every* attempt failed with a network error.
+    Returns ``(png_bytes, region)``; ``(None, "")`` when GameTDB has none (every
+    region answered "not found") or ``game_id`` isn't a valid ID.
+    Raises :class:`net.NetError` if no cover was found and at least one attempt
+    failed for another reason (offline, HTTP 429/5xx ...): that cover may well
+    exist, so it must not be reported as missing.
     """
+    if not valid_game_id(game_id) or kind not in ALL_KINDS:
+        return None, ""
+    game_id = game_id.strip().upper()
     last_err: Optional[net.NetError] = None
-    any_answer = False
     for k in (kind, *KIND_FALLBACKS.get(kind, ())):
         for region in cover_regions(game_id, lang):
             if cancel is not None:
@@ -120,10 +141,9 @@ def download_cover(game_id: str, kind: str, lang: str = "EN",
             except net.NetError as e:
                 last_err = e
                 continue
-            any_answer = True
             if _valid_png(data):
                 return data, region
-    if last_err is not None and not any_answer:
+    if last_err is not None:
         raise last_err
     return None, ""
 
@@ -153,8 +173,12 @@ class CoverReport:
 def _write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".part")
-    tmp.write_bytes(data)
-    tmp.replace(path)
+    try:
+        tmp.write_bytes(data)
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _targets(layout: DriveLayout, game_id: str, kind: str, gx: bool, wiiflow: bool) -> list[Path]:
@@ -195,18 +219,21 @@ def fetch_covers(layout: DriveLayout, game_ids: Iterable[str],
     tok = cancel
 
     def work(gid: str, kind: str) -> tuple[str, str]:
+        if not valid_game_id(gid):
+            return ERROR, f"{gid!r} is not a valid game ID"
         targets = _targets(layout, gid, kind, usbloadergx, bool(wiiflow))
-        if not overwrite and targets and all(t.is_file() for t in targets):
+        # a broken file on the drive (empty, truncated, not a PNG) doesn't count as "there"
+        if not overwrite and targets and all(_png_file_ok(t) for t in targets):
             return SKIPPED, ""
         cp = cache_path(gid, kind)
         data: Optional[bytes] = None
-        if cp.is_file() and not refresh:
+        if not refresh and _png_file_ok(cp):
             data = cp.read_bytes()
         else:
             try:
                 data, _region = download_cover(gid, kind, lang, tok)
             except net.NetError as e:
-                if cp.is_file():
+                if _png_file_ok(cp):
                     data = cp.read_bytes()
                 else:
                     return ERROR, str(e)
@@ -216,7 +243,7 @@ def fetch_covers(layout: DriveLayout, game_ids: Iterable[str],
                 _write(cp, data)
         with write_lock:
             for t in targets:
-                if overwrite or not t.is_file():
+                if overwrite or not _png_file_ok(t):
                     _write(t, data)
         return OK, ""
 
@@ -249,7 +276,7 @@ def cover_status(layout: DriveLayout, game_id: str) -> dict[str, bool]:
 
     Also reports ``wiiflow_cover``/``wiiflow_box`` and ``cached`` (any local cache copy).
     """
-    gid = game_id.upper()
+    gid = id_for_filename(game_id)
     out = {k: gx_cover_path(layout, gid, k).is_file() for k in COVER_KINDS}
     out["wiiflow_cover"] = (layout.wiiflow / "covers" / f"{gid}.png").is_file()
     out["wiiflow_box"] = (layout.wiiflow / "boxcovers" / f"{gid}.png").is_file()
@@ -270,7 +297,7 @@ def best_cached_cover(game_id: str,
 
 def remove_covers(layout: DriveLayout, game_id: str) -> int:
     """Delete every cover for ``game_id`` from the drive (not the cache). Returns count."""
-    gid = game_id.upper()
+    gid = id_for_filename(game_id)
     n = 0
     paths = {gx_cover_path(layout, gid, k) for k in COVER_KINDS}
     paths |= {layout.wiiflow / "covers" / f"{gid}.png", layout.wiiflow / "boxcovers" / f"{gid}.png"}
@@ -307,6 +334,8 @@ def download_custom_banner(layout: DriveLayout, game_id: str, *,
     games. Raises :class:`net.NetError` when offline and nothing is cached.
     """
     gid = game_id.strip().upper()
+    if not valid_game_id(gid):
+        return None
     if wiiflow is None:
         wiiflow = layout.wiiflow.is_dir()
     dest = gx_banner_dir(layout) / f"{gid}.bnr"

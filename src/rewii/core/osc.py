@@ -10,24 +10,27 @@ the drive so updates can be detected reliably.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
 import zipfile
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Optional
 from collections.abc import Iterable, Sequence
 from xml.etree import ElementTree as ET
 
-from . import config, net
+from . import archive, config, net
+from .archive import MAX_UNCOMPRESSED
 from .layout import DriveLayout
-from .progress import CancelToken, ProgressEvent, ProgressFn, Reporter
+from .progress import CancelToken, ProgressEvent, ProgressFn
 
 OSC_API = "https://hbb1.oscwii.org/api/v4/contents"
 INDEX_MAX_AGE = 86400
 RECORD_NAME = "osc_installed.json"
-MAX_UNCOMPRESSED = 4 * 1024 ** 3      # zip-bomb guard
+MAX_INDEX_BYTES = 32 * 1024 ** 2
+MAX_ARCHIVE_BYTES = 2 * 1024 ** 3     # largest app zip ReWii will download
 CATEGORIES = ("utilities", "games", "emulators", "media", "demos")
 PLATFORMS = ("wii", "vwii", "wii_mini")
 # Settings.console_type -> OSC platform name
@@ -66,9 +69,22 @@ class App:
 
     @classmethod
     def from_api(cls, d: dict[str, Any]) -> App:
-        assets = d.get("assets") or {}
-        archive = assets.get("archive") or {}
-        desc = d.get("description") or {}
+        """Build an App from one index entry, tolerating missing or mistyped fields."""
+        def dct(v: Any) -> dict[str, Any]:
+            return v if isinstance(v, dict) else {}
+
+        def num(v: Any) -> int:
+            try:
+                return int(v or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        def strs(v: Any) -> list[str]:
+            return [str(x) for x in v] if isinstance(v, (list, tuple)) else []
+
+        assets = dct(d.get("assets"))
+        archive_ = dct(assets.get("archive"))
+        desc = dct(d.get("description"))
         return cls(
             slug=str(d.get("slug", "")),
             name=str(d.get("name") or d.get("slug", "")),
@@ -77,19 +93,19 @@ class App:
             category=str(d.get("category") or ""),
             description_short=str(desc.get("short") or ""),
             description_long=str(desc.get("long") or ""),
-            supported_platforms=list(d.get("supported_platforms") or []),
-            file_size=int(archive.get("size") or 0),
-            uncompressed_size=int(d.get("uncompressed_size") or 0),
-            archive_url=str(archive.get("url") or ""),
-            archive_hash=str(archive.get("hash") or ""),
-            binary_hash=str((assets.get("binary") or {}).get("hash") or ""),
-            icon_url=str((assets.get("icon") or {}).get("url") or ""),
-            subdirectories=list(d.get("subdirectories") or []),
-            flags=list(d.get("flags") or []),
+            supported_platforms=strs(d.get("supported_platforms")),
+            file_size=num(archive_.get("size")),
+            uncompressed_size=num(d.get("uncompressed_size")),
+            archive_url=str(archive_.get("url") or ""),
+            archive_hash=str(archive_.get("hash") or ""),
+            binary_hash=str(dct(assets.get("binary")).get("hash") or ""),
+            icon_url=str(dct(assets.get("icon")).get("url") or ""),
+            subdirectories=strs(d.get("subdirectories")),
+            flags=strs(d.get("flags")),
             package_type=str(d.get("package_type") or ""),
-            peripherals=list(d.get("peripherals") or []),
-            release_date=int(d.get("release_date") or 0),
-            downloads=int(d.get("downloads") or 0),
+            peripherals=strs(d.get("peripherals")),
+            release_date=num(d.get("release_date")),
+            downloads=num(d.get("downloads")),
         )
 
     @property
@@ -98,9 +114,26 @@ class App:
         out: list[str] = []
         for s in self.subdirectories:
             parts = [p for p in s.replace("\\", "/").split("/") if p]
-            if len(parts) >= 2 and parts[0].lower() == "apps" and parts[1] not in out:
+            if (len(parts) >= 2 and parts[0].lower() == "apps" and parts[1] not in out
+                    and _plain_name(parts[1])):
                 out.append(parts[1])
         return out or [self.slug]
+
+    @property
+    def allowed_dirs(self) -> list[str]:
+        """Drive-relative folders (lower-case POSIX) this app may write into: every
+        ``apps/<folder>`` it owns plus the ``subdirectories`` the index declares.
+        ReWii's own ``rewii/`` folder is never included."""
+        out = [f"apps/{f.lower()}" for f in self.app_folders if _plain_name(f)]
+        for s in self.subdirectories:
+            parts = [p for p in s.replace("\\", "/").split("/") if p]
+            if not parts or not all(_plain_name(p) for p in parts):
+                continue
+            d = "/".join(parts).lower()
+            if d == "apps" or parts[0].lower() == RESERVED_TOP or d in out:
+                continue
+            out.append(d)
+        return out
 
     @property
     def folder(self) -> str:
@@ -120,18 +153,38 @@ class App:
         return not p or not self.supported_platforms or p in self.supported_platforms
 
 
+def _plain_name(part: str) -> bool:
+    """A single safe folder name (no separators, ``..``, drive letters, reserved names)."""
+    try:
+        return archive.safe_parts(part) == [part]
+    except archive.ArchiveError:
+        return False
+
+
+RESERVED_TOP = "rewii"     # ReWii's own records; no app may write there
+
+
+def _index_ok(p: Path) -> bool:
+    try:
+        return isinstance(json.loads(p.read_text("utf-8")), list)
+    except (OSError, ValueError):
+        return False
+
+
 def fetch_index(refresh: bool = False) -> list[App]:
     """The OSC app list (cached for a day; stale cache used when offline).
 
     Raises :class:`net.NetError` when offline with no cache, or if the data is invalid.
     """
-    p = net.cached(OSC_API, "osc/contents.json", INDEX_MAX_AGE, refresh)
+    p = net.cached(OSC_API, "osc/contents.json", INDEX_MAX_AGE, refresh, validate=_index_ok,
+                   max_bytes=MAX_INDEX_BYTES)
     try:
         data = json.loads(p.read_text("utf-8"))
     except (OSError, ValueError) as e:
         p.unlink(missing_ok=True)
         raise net.NetError(f"Open Shop Channel index is unreadable: {e}") from e
     if not isinstance(data, list):
+        p.unlink(missing_ok=True)
         raise net.NetError("Open Shop Channel index has an unexpected format")
     return [App.from_api(d) for d in data if isinstance(d, dict) and d.get("slug")]
 
@@ -214,8 +267,8 @@ def read_meta(path: Path) -> dict[str, str]:
         if not out.get("coder"):
             out["coder"] = " ".join((root.findtext("author") or "").split())
         return out
-    except ET.ParseError:
-        pass
+    except (ET.ParseError, ValueError, LookupError):
+        out = {}                     # bad XML / unknown encoding: fall back to regexes
     text = raw.decode("utf-8", errors="replace")
     for k in ("name", "version", "coder", "short_description"):
         out[k] = _meta_text(text, k)
@@ -238,7 +291,9 @@ def _boot_file(folder: Path) -> Optional[str]:
 def _load_records(layout: DriveLayout) -> dict[str, dict[str, str]]:
     try:
         data = json.loads((layout.rewii / RECORD_NAME).read_text("utf-8"))
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): v for k, v in data.items() if isinstance(v, dict)}
     except (OSError, ValueError):
         return {}
 
@@ -258,7 +313,7 @@ def _scan(folder: Path, nested: bool, records: dict[str, dict[str, str]]) -> Ins
                         version=meta.get("version", ""), coder=meta.get("coder", ""),
                         short_description=meta.get("short_description", ""),
                         boot_file=_boot_file(folder), nested=nested,
-                        slug=rec.get("slug", ""), archive_hash=rec.get("hash", ""))
+                        slug=str(rec.get("slug") or ""), archive_hash=str(rec.get("hash") or ""))
 
 
 def installed_apps(layout: DriveLayout) -> list[InstalledApp]:
@@ -303,22 +358,13 @@ def misplaced_apps(layout: DriveLayout) -> list[Path]:
 def _safe_parts(name: str) -> Optional[list[str]]:
     """Validated path components of a zip entry, None for directory entries.
 
-    Raises OSCError for absolute paths, drive letters, ``..`` or bad characters.
+    Raises OSCError for absolute paths, drive letters, ``..``, bad characters or
+    Windows reserved names (see :func:`rewii.core.archive.safe_parts`).
     """
-    n = name.replace("\\", "/")
-    if n.endswith("/"):
-        return None
-    if n.startswith("/") or re.match(r"^[A-Za-z]:", n):
-        raise OSCError(f"unsafe path in archive: {name!r}")
-    parts = [p for p in PurePosixPath(n).parts if p not in ("", ".")]
-    if not parts:
-        return None
-    for p in parts:
-        if p == ".." or any(c in p for c in ':*?"<>|') or any(ord(c) < 32 for c in p):
-            raise OSCError(f"unsafe path in archive: {name!r}")
-        if p.rstrip(" .") != p:
-            raise OSCError(f"invalid FAT32 name in archive: {name!r}")
-    return parts
+    try:
+        return archive.safe_parts(name)
+    except archive.ArchiveError as e:
+        raise OSCError(str(e)) from e
 
 
 def plan_archive(names: Sequence[str], default_folder: str) -> dict[str, str]:
@@ -355,53 +401,49 @@ def plan_archive(names: Sequence[str], default_folder: str) -> dict[str, str]:
     return plan
 
 
+def _allow_fn(allowed: Optional[Iterable[str]]):
+    if allowed is None:
+        return None
+    dirs = [d.strip("/").lower() for d in allowed if d.strip("/")]
+
+    def allow(rel: str) -> bool:
+        low = rel.lower()
+        if low.split("/", 1)[0] == RESERVED_TOP:
+            return False
+        return any(low.startswith(d + "/") for d in dirs)
+    return allow
+
+
 def extract_archive(zip_path: Path, dest_root: Path, default_folder: str,
                     progress: Optional[ProgressFn] = None,
-                    cancel: Optional[CancelToken] = None) -> list[Path]:
-    """Safely extract an app zip onto the drive root. Returns the files written."""
-    written: list[Path] = []
-    root = Path(dest_root).resolve()
+                    cancel: Optional[CancelToken] = None, *,
+                    allowed: Optional[Iterable[str]] = None,
+                    skipped: Optional[list[str]] = None) -> list[Path]:
+    """Safely extract an app zip onto the drive root. Returns the files written.
+
+    ``allowed`` (see :attr:`App.allowed_dirs`) limits extraction to those
+    drive-relative folders; other entries are not written and their destinations
+    are appended to ``skipped`` when a list is passed. Unsafe archives (path
+    tricks, reserved names, duplicate names, oversized) raise :class:`OSCError`
+    before anything is written.
+    """
     try:
-        z = zipfile.ZipFile(zip_path)
-    except zipfile.BadZipFile as e:
-        raise OSCError(f"{Path(zip_path).name} is not a valid zip") from e
-    with z:
-        infos = [i for i in z.infolist() if not i.is_dir()]
-        total = sum(i.file_size for i in infos)
-        if total > MAX_UNCOMPRESSED:
-            raise OSCError("archive is unreasonably large")
-        plan = plan_archive([i.filename for i in infos], default_folder)
-        rep = Reporter(progress, cancel, total=total, message="Extracting")
-        rep.set_total(total)
-        for info in infos:
-            rel = plan.get(info.filename)
-            if rel is None:
-                continue
-            target = root.joinpath(*rel.split("/"))
-            if not target.resolve().is_relative_to(root):
-                raise OSCError(f"unsafe path in archive: {info.filename!r}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            tmp = target.with_name(target.name + ".part")
-            try:
-                with z.open(info) as src, open(tmp, "wb") as dst:
-                    while True:
-                        chunk = src.read(256 * 1024)
-                        if not chunk:
-                            break
-                        dst.write(chunk)
-                        rep.advance(len(chunk), f"Extracting {target.name}")
-                tmp.replace(target)
-            except BaseException:
-                tmp.unlink(missing_ok=True)
-                raise
-            written.append(target)
-    return written
+        res = archive.extract_zip(zip_path, dest_root,
+                                  mapping=lambda names: plan_archive(names, default_folder),
+                                  allow=_allow_fn(allowed), max_total=MAX_UNCOMPRESSED,
+                                  progress=progress, cancel=cancel)
+    except archive.ArchiveError as e:
+        raise OSCError(str(e)) from e
+    if skipped is not None:
+        skipped.extend(res.skipped)
+    return res.written
 
 
 @dataclass
 class InstallResult:
     app: App
     files: list[Path]
+    skipped: list[str] = field(default_factory=list)   # zip entries outside the app's folders
 
     @property
     def folder(self) -> str:
@@ -418,7 +460,10 @@ def download_archive(app: App, progress: Optional[ProgressFn] = None,
     dest = config.cache_dir() / "osc" / "zips" / f"{safe_slug}-{tag}.zip"
     if dest.is_file() and not refresh and _archive_ok(app, dest):
         return dest
-    net.download(app.archive_url, dest, progress=progress, cancel=cancel)
+    if not app.archive_url.lower().startswith("https://"):
+        raise OSCError(f"{app.name}: refusing a download that isn't https")
+    net.download(app.archive_url, dest, progress=progress, cancel=cancel,
+                 max_bytes=MAX_ARCHIVE_BYTES)
     if not _archive_ok(app, dest):
         dest.unlink(missing_ok=True)
         raise OSCError(f"{app.name}: the download is damaged (checksum mismatch)")
@@ -427,29 +472,40 @@ def download_archive(app: App, progress: Optional[ProgressFn] = None,
 
 def _archive_ok(app: App, zip_path: Path) -> bool:
     """Zip MD5 matches - or, when the shop repacked the zip without updating its
-    hash, the app's boot.dol/boot.elf inside matches the published binary hash."""
+    hash, the app's own ``apps/<folder>/boot.dol|elf`` matches the published binary
+    hash.
+
+    The fallback only vouches for that one file, so it is strict: the match must
+    be the boot file that will actually be installed for this app (after
+    :func:`plan_archive`), it must be the only boot file in that folder, and the
+    archive must pass every safety check (no duplicate names etc.). Everything
+    else in the zip stays confined by :attr:`App.allowed_dirs` at extraction.
+    An app without a published zip hash can't be verified at all and is accepted.
+    """
     if not app.archive_hash:
         return True
     if _md5(zip_path) == app.archive_hash.lower():
         return True
-    if not app.binary_hash:
+    if not app.binary_hash or not _plain_name(app.folder):
         return False
-    import hashlib
-    import zipfile
+    base = f"apps/{app.folder.lower()}/"
     try:
         with zipfile.ZipFile(zip_path) as zf:
-            for n in zf.namelist():
-                low = n.lower()
-                if low.endswith(("/boot.dol", "/boot.elf")) and low.count("/") <= 2:
-                    if hashlib.md5(zf.read(n)).hexdigest() == app.binary_hash.lower():
-                        return True
-    except (OSError, zipfile.BadZipFile):
+            plan = archive.plan_zip(zf, lambda names: plan_archive(names, app.folder))
+            boots = [info for info, rel in plan
+                     if rel.lower() in (base + "boot.dol", base + "boot.elf")]
+            if len(boots) != 1:
+                return False
+            h = hashlib.md5()
+            with zf.open(boots[0]) as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            return h.hexdigest() == app.binary_hash.lower()
+    except (OSError, zipfile.BadZipFile, archive.ArchiveError, OSCError):
         return False
-    return False
 
 
 def _md5(path: Path) -> str:
-    import hashlib
     h = hashlib.md5()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
@@ -477,14 +533,20 @@ def install_app(layout: DriveLayout, app: App, progress: Optional[ProgressFn] = 
     """
     zpath = download_archive(app, _phase(progress, 0.0, 0.5, f"Downloading {app.name}"),
                              cancel, refresh)
+    if not _plain_name(app.folder):
+        raise OSCError(f"{app.name}: invalid app folder name {app.folder!r}")
+    skipped: list[str] = []
     files = extract_archive(zpath, layout.root, app.folder,
-                            _phase(progress, 0.5, 0.5, f"Installing {app.name}"), cancel)
+                            _phase(progress, 0.5, 0.5, f"Installing {app.name}"), cancel,
+                            allowed=app.allowed_dirs, skipped=skipped)
+    if not any(f.name.lower() in ("boot.dol", "boot.elf") for f in files):
+        raise OSCError(f"{app.name}: the download has no boot.dol/boot.elf for apps/{app.folder}")
     rec = _load_records(layout)
     for folder in app.app_folders:
         rec[folder.lower()] = {"slug": app.slug, "version": app.version,
                                "hash": app.archive_hash, "folder": folder}
     _save_records(layout, rec)
-    return InstallResult(app, files)
+    return InstallResult(app, files, skipped)
 
 
 def remove_app(layout: DriveLayout, folder: str) -> bool:

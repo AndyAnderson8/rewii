@@ -68,3 +68,20 @@ def test_options_table():
     assert O.GX_OPTIONS["PrivateServer"].choices["2"] == "Wiimmfi"
     assert O.GX_OPTIONS["GameCubeMode"].choices["2"] == "Nintendont"
     assert set(O.PRIVATE_SERVERS.values()) == {0, 1, 2, 3, 4}
+
+
+def test_rewrite_keeps_non_utf8_bytes_in_other_lines(tmp_path):
+    layout = DriveLayout(tmp_path)
+    layout.gx_config.parent.mkdir(parents=True)
+    raw = (b"# USB Loader GX R1283 - Main settings file\r\n"
+           b"titlestxt_path = usb1:/jeux pr\xe9f\xe9r\xe9s/\r\n"      # latin-1, not UTF-8
+           b"PrivateServer = 0\r\n")
+    layout.gx_config.write_bytes(raw)
+    O.set_loader_private_server(layout, "wiimmfi")
+    out = layout.gx_config.read_bytes()
+    assert b"titlestxt_path = usb1:/jeux pr\xe9f\xe9r\xe9s/\n" in out
+    assert b"PrivateServer = 2\n" in out and "\ufffd".encode() not in out
+    assert O.read_gx_config(layout)["PrivateServer"] == "2"
+    assert not list(layout.gx_config.parent.glob("*.tmp"))
+    with pytest.raises(ValueError):
+        O.write_gx_config(layout, {"#comment": "1"})
