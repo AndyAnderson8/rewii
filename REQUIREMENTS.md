@@ -182,3 +182,24 @@ Priority: **MVP** = first release, **Next** = second, **Later** = nice-to-have.
 1. **Scope of the first release:** is the "MVP" list in section 5 the right set for version 1, and should anything move earlier or later?
 2. **Which loader the game channels launch:** the existing `make_wad.py` channels launch CFG USB Loader. For the USB Loader GX standard, I'll check whether a direct-to-game forwarder exists that works the same way. If not, the channels launch through CFG USB Loader's FAT build, which works fine alongside USB Loader GX. Is that acceptable?
 3. **Dev testing:** can I copy one small game from the NAS for local testing (read-only on the NAS side), or should I only use synthetic test files?
+
+---
+
+## 9. Implementation status (2026-11-25)
+
+The decisions from the second review were applied: **build everything** (no MVP split), any loader is fine as long as the channels are self-contained, and launch-screen styles are cover, black or classic.
+
+**Built (all sections 5.1–5.8):** drive detection, health checks and fixes, the FAT32 formatter, starter-kit setup, the games library, drive install/remove/verify/copy-back/layout fixes, legacy WBFS-partition import, RVZ/WIA/NKit conversion, CleanRip joining, covers, cheats, game channels (3 styles), the brick blocklist, WAD inspection and staging with risk blocking, guarded NUS downloads (cIOS bases, 4.3, theme base), the Open Shop Channel browser, starter kit, wiiload, the save catalog and versioned backup/restore, `.gci` export, drive snapshots, diff/restore/clone, NAND archive/verify, the SD rescue kit, the SysCheck report, guides, Riivolution, themes, the USB Loader GX private-server setting, and the CLI. All screens are in the TUI.
+
+**Changed from the draft:**
+- WiiLink WFC isn't a USB Loader GX option. The loader setting offers Wiimmfi or AltWFC; WiiLink uses the WiiLink WFC Patcher app.
+- Cheats come from codes.rc24.xyz. The `wiidev/cheats` repo doesn't exist.
+
+**Not yet:**
+- Channels for GameCube games. CFG direct start only boots Wii games, so these would need a custom forwarder DOL built with devkitPPC.
+- Building `.csm` themes from `.mym`.
+- Ohneschwanzenegger-style stock NAND building.
+
+**Untested on real hardware:**
+- The launch-screen styles on an actual Wii. Cover and black are DOL patches; classic is byte-identical to the old make_wad.py output.
+- Formatting real devices, and anything on Windows or macOS. CI builds and tests on all three OSes, but nobody has used it by hand there yet.
