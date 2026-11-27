@@ -17,7 +17,6 @@ channels don't apply (Nintendont shows nothing while autobooting).
 from __future__ import annotations
 
 import hashlib
-import io
 import re
 import struct
 import zipfile
@@ -26,8 +25,8 @@ from pathlib import Path
 from typing import Optional
 
 from .disc import open_disc, parse_fst, parse_header
-from .forwarder import (BANNER_BRICK_IDS, ChannelInfo, ForwarderError, _asset, _pad, add_argv,
-                        aes_cbc_decrypt, aes_cbc_encrypt, cert_chain, common_key, fakesign, verify_wad)
+from .disc import DiscError
+from .forwarder import ChannelInfo, ForwarderError, _asset, add_argv, build_wad, save_channel
 
 NIN_MAGIC = 0x01070CF6
 NIN_CFG_VERSION = 0x0B                  # Nintendont v6.509+
@@ -46,6 +45,9 @@ IOS58 = 0x000000010000003A
 
 class NintendontMissing(ForwarderError):
     pass
+
+
+MAX_GC_BANNER = 1024 * 1024             # a real opening.bnr is 6.5-8 KiB
 
 
 def gc_channel_id(game_id: str) -> str:
@@ -185,7 +187,7 @@ def read_gc_banner(game_path: Path) -> Optional[GcBanner]:
         except Exception:
             return None
         f = next((x for x in files if x.path.lower() == "opening.bnr"), None)
-        if f is None or f.size < 0x1820:
+        if f is None or f.size < 0x1820 or f.size > MAX_GC_BANNER:     # size comes from the disc
             return None
         data = d.read(f.offset, f.size)
     if data[:3] != b"BNR":
@@ -304,8 +306,9 @@ def _image_on_black(rgba_img, w: int, h: int):
 
 
 def build_gc_banner(title: str, banner: GcBanner | None, *, publisher: str = "", year: str = "",
-                    game_id: str = "", synopsis: str = "", cover_png: bytes | None = None) -> bytes:
-    """Channel banner (content 0) for a GameCube game."""
+                    game_id: str = "", synopsis: str = "") -> bytes:
+    """Channel banner (content 0) for a GameCube game. Without a disc banner the
+    template's own picture is kept."""
     from PIL import Image
 
     tpl = bytearray(_asset("gc_banner_template.bnr"))
@@ -319,11 +322,7 @@ def build_gc_banner(title: str, banner: GcBanner | None, *, publisher: str = "",
         o, n = files_outer[name]
         return bytes(body[o:o + n])
 
-    pic = None
-    if banner is not None:
-        pic = Image.frombytes("RGBA", (96, 32), banner.rgba)
-    elif cover_png:
-        pic = Image.open(io.BytesIO(cover_png)).convert("RGBA")
+    pic = Image.frombytes("RGBA", (96, 32), banner.rgba) if banner is not None else None
 
     # --- banner.bin: picture + text slots
     raw = bytearray(_imd5_unwrap(part("banner.bin")))
@@ -364,51 +363,21 @@ def build_gc_banner(title: str, banner: GcBanner | None, *, publisher: str = "",
 
 
 # --------------------------------------------------------------------------- WAD
-def build_gc_wad(banner: bytes, dol: bytes, game_id: str) -> bytes:
-    ck = common_key(0)
-    nand = _asset("nand_loader.app")
-    contents = [banner, dol, nand]
-    chan_id = gc_channel_id(game_id)
-    tid = struct.pack(">I", 0x00010001) + chan_id.encode("ascii")
-
-    tik = bytearray(_asset("ticket_template.tik"))
-    tik[0x1DC:0x1E4] = tid
-    tkey = aes_cbc_decrypt(ck, tid + bytes(8), bytes(tik[0x1BF:0x1CF]))
-    tik = fakesign(bytes(tik), 0x1F1)
-
-    tmd = bytearray(_asset("tmd_template.tmd"))
-    struct.pack_into(">Q", tmd, 0x184, IOS58)
-    tmd[0x18C:0x194] = tid
-    struct.pack_into(">I", tmd, 0x1D8, TMD_ACCESS_AHB_DVD)
-    for i, data in enumerate(contents):
-        rec = 0x1E4 + 36 * i
-        tmd[rec + 8:rec + 16] = struct.pack(">Q", len(data))
-        tmd[rec + 16:rec + 36] = hashlib.sha1(data).digest()
-    tmd = fakesign(bytes(tmd), 0x1D4)
-
-    cert = cert_chain()
-    import time
-    trailer = _pad(b"CMiiUT" + str(int(time.time())).encode(), 0x40)
-    enc = []
-    for i, data in enumerate(contents):
-        iv = struct.pack(">H", i) + bytes(14)
-        enc.append(_pad(aes_cbc_encrypt(tkey, iv, _pad(data, 16)), 64))
-    blob = b"".join(enc)
-    hdr = struct.pack(">I2sHIIIIII", 0x20, b"Is", 0, len(cert), 0, len(tik), len(tmd), len(blob), len(trailer))
-    return _pad(hdr, 64) + _pad(cert, 64) + _pad(tik, 64) + _pad(tmd, 64) + blob + _pad(trailer, 64)
-
-
 def make_gc_channel(game_path: Path, drive_root: Path, out_dir: Path, *, title: str | None = None,
                     publisher: str = "", year: str = "", synopsis: str = "",
-                    cover_png: bytes | None = None, nintendont: bytes | None = None) -> ChannelInfo:
-    """Build a channel for a GameCube game that is already on the drive at ``game_path``."""
+                    nintendont: bytes | None = None) -> ChannelInfo:
+    """Build a channel for a GameCube game that is already on the drive at ``game_path``.
+
+    The banner comes from ReWii's template, not from the game, so the banner-brick
+    list for Wii channels does not apply here."""
     game_path, drive_root = Path(game_path), Path(drive_root)
-    with open_disc(game_path) as d:
-        gid, disc_title, plat, disc_no, _v = parse_header(d.read(0, 0x60))
+    try:
+        with open_disc(game_path) as d:
+            gid, disc_title, plat, disc_no, _v = parse_header(d.read(0, 0x60))
+    except DiscError as e:
+        raise ForwarderError(f"{game_path.name} can't be read: {e}") from e
     if plat != "gc":
         raise ForwarderError("not a GameCube game")
-    if gid[:3] in BANNER_BRICK_IDS:
-        raise ForwarderError(f"{BANNER_BRICK_IDS[gid[:3]]} is blocked")
     try:
         rel = "/" + game_path.resolve().relative_to(drive_root.resolve()).as_posix()
     except ValueError as e:
@@ -428,16 +397,8 @@ def make_gc_channel(game_path: Path, drive_root: Path, out_dir: Path, *, title: 
     nin = nintendont or get_nintendont_dol(drive_root)
     gct = drive_root / "codes" / f"{gid}.gct"
     dol = build_gc_dol(nin, rel, gid, base_cfg, f"/codes/{gid}.gct" if gct.is_file() else None)
-    banner = build_gc_banner(title, gb, publisher=publisher, year=year, game_id=gid, synopsis=synopsis,
-                             cover_png=cover_png)
-    wad = build_gc_wad(banner, dol, gid)
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    from .layout import safe_name
-    out = out_dir / f"{safe_name(title)} - {gc_channel_id(gid)} - {gid}.wad"
-    out.write_bytes(wad)
-    ok, msg = verify_wad(out)
-    if not ok:
-        out.unlink(missing_ok=True)
-        raise ForwarderError(f"built channel failed verification: {msg}")
-    return ChannelInfo(gid, title, gc_channel_id(gid), "gamecube", out, len(wad))
+    banner = build_gc_banner(title, gb, publisher=publisher, year=year, game_id=gid, synopsis=synopsis)
+    chan = gc_channel_id(gid)
+    wad = build_wad(banner, dol, gid, channel_id=chan, ios=IOS58, access_rights=TMD_ACCESS_AHB_DVD)
+    out = save_channel(wad, out_dir, title, chan, gid)
+    return ChannelInfo(gid, title, chan, "gamecube", out, len(wad))

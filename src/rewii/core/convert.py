@@ -2,8 +2,9 @@
 
 RVZ, WIA and GCZ are converted with ``nodtool`` (github.com/encounter/nod),
 which ReWii downloads on first use into ``cache_dir()/tools`` and verifies by
-SHA-256. A ``nodtool`` or ``DolphinTool`` the user installed on PATH is used as
-a fallback. CISO and WBFS files are expanded in pure Python. WDF needs
+SHA-256 (at download, and again before each use against the digest recorded
+then). A ``nodtool`` or ``DolphinTool`` the user installed on PATH is used as
+a fallback; the current folder is never searched for tools. CISO and WBFS files are expanded in pure Python. WDF needs
 Wiimms ISO Tools (``wit``) on PATH because nod doesn't read WDF.
 
 NKit ``.iso`` images (from the NKit tool) are refused: they have data removed
@@ -30,7 +31,7 @@ from typing import Optional
 
 from . import net
 from .config import cache_dir
-from .disc import CisoReader, DiscError, WbfsFileReader, sniff_format
+from .disc import NEEDS_CONVERSION, CisoReader, DiscError, WbfsFileReader, sniff_format
 from .progress import Cancelled, CancelToken, ProgressFn, Reporter
 
 #: Pinned nodtool release and the SHA-256 digests GitHub reports for its assets
@@ -57,10 +58,11 @@ NOD_ASSETS: dict[tuple[str, str], tuple[str, str]] = {
                        "efaa034f4d32a14856d5150c7eee45876ec38c07f75572cb6b4c33423c5850ce"),
 }
 
-#: Formats that need an external tool.
-TOOL_FORMATS = {"RVZ", "WIA", "GCZ", "WDF"}
-#: Formats this module converts to ISO (input side).
-CONVERTIBLE = {"RVZ", "WIA", "GCZ", "WDF", "CISO", "WBFS", "ISO"}
+#: Formats that need an external tool (everything consoles can't load, except
+#: NKit, which no tool can restore).
+TOOL_FORMATS = NEEDS_CONVERSION - {"NKIT"}
+#: Every format :func:`to_iso` accepts as input.
+INPUT_FORMATS = TOOL_FORMATS | {"CISO", "WBFS", "ISO"}
 
 POLL = 0.25
 
@@ -104,11 +106,53 @@ def cached_tool_path() -> Path:
 
 
 def _which(*names: str) -> Optional[Path]:
+    """Find a tool on PATH. On Windows ``shutil.which`` also looks in the current
+    folder first, which would run any ``nodtool.exe`` lying next to the user's
+    downloads, so PATH is searched by hand there."""
     for n in names:
-        p = shutil.which(n)
-        if p:
-            return Path(p)
+        if os.name == "nt":
+            exts = [e for e in os.environ.get("PATHEXT", ".EXE").split(os.pathsep) if e]
+            for d in os.environ.get("PATH", "").split(os.pathsep):
+                if not d or d == os.curdir:
+                    continue
+                for e in exts:
+                    c = Path(d) / (n + e.lower())
+                    if c.is_file():
+                        return c
+        else:
+            p = shutil.which(n)
+            if p:
+                return Path(p)
     return None
+
+
+def _digest_file(tool: Path) -> Path:
+    return tool.with_name(tool.name + ".sha256")
+
+
+_verified: dict[tuple[str, int, int], bool] = {}
+
+
+def _cached_tool_ok(tool: Path) -> bool:
+    """True if the cached nodtool still has the SHA-256 it had when it was
+    downloaded and verified (the pinned digest, or the one recorded next to it).
+    A changed or half-written file is not run; it gets downloaded again."""
+    try:
+        st = tool.stat()
+    except OSError:
+        return False
+    key = (str(tool), st.st_mtime_ns, st.st_size)
+    if key not in _verified:
+        want = {d for _a, d in NOD_ASSETS.values()}
+        try:
+            want.add(_digest_file(tool).read_text("ascii").strip().lower())
+        except (OSError, ValueError):
+            pass
+        try:
+            _verified[key] = _sha256(tool) in want
+        except OSError:
+            return False
+    return _verified[key]
 
 
 def find_tool(fmt: str = "RVZ") -> Optional[Tool]:
@@ -122,7 +166,7 @@ def find_tool(fmt: str = "RVZ") -> Optional[Tool]:
         p = _which("wit")
         return Tool("wit", p) if p else None
     c = cached_tool_path()
-    if c.is_file():
+    if c.is_file() and _cached_tool_ok(c):
         return Tool("nodtool", c)
     p = _which("nodtool")
     if p:
@@ -135,7 +179,8 @@ def find_tool(fmt: str = "RVZ") -> Optional[Tool]:
 
 def tool_available() -> bool:
     """True if nodtool is cached or on PATH (never downloads)."""
-    return cached_tool_path().is_file() or _which("nodtool") is not None
+    c = cached_tool_path()
+    return (c.is_file() and _cached_tool_ok(c)) or _which("nodtool") is not None
 
 
 def _sha256(path: Path) -> str:
@@ -167,7 +212,10 @@ def _asset_for_host(latest: bool) -> tuple[str, str, str]:
             dig = a.get("digest") or ""
             if not dig.startswith("sha256:"):
                 raise ConvertError("The converter download has no checksum to verify against.")
-            return a["browser_download_url"], dig.split(":", 1)[1], rel.get("tag_name", "")
+            url = str(a.get("browser_download_url") or "")
+            if not url.startswith("https://github.com/encounter/nod/releases/download/"):
+                raise ConvertError("The latest converter release points at an unexpected download address.")
+            return url, dig.split(":", 1)[1], rel.get("tag_name", "")
     raise ConvertError("The latest converter release has no build for this computer.")
 
 
@@ -175,8 +223,12 @@ def ensure_tool(progress: ProgressFn | None = None, cancel: CancelToken | None =
                 latest: bool = False) -> Path:
     """Return a usable nodtool, downloading the pinned build if needed.
 
-    The download is SHA-256 verified and made executable. ``latest=True``
-    fetches the newest release instead, verified with GitHub's asset digest.
+    The pinned build is verified against the SHA-256 built into ReWii.
+    ``latest=True`` fetches the newest release instead and replaces the cached
+    tool with it; that one can only be checked against the digest GitHub's API
+    reports for the asset, which guards against a corrupted download but comes
+    from the same place as the file itself. Either way the digest is recorded
+    next to the tool and re-checked before every use.
     """
     if not latest:
         t = find_tool("RVZ")
@@ -195,6 +247,7 @@ def ensure_tool(progress: ProgressFn | None = None, cancel: CancelToken | None =
             raise ConvertError("The downloaded converter failed its checksum and was deleted.")
         if os.name != "nt":
             tmp.chmod(0o755)
+        _digest_file(dest).write_text(digest.lower(), "ascii")
         os.replace(tmp, dest)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -300,25 +353,33 @@ def to_iso(src: Path | str, dest: Path | str, progress: ProgressFn | None = None
            cancel: CancelToken | None = None) -> Path:
     """Convert an RVZ/WIA/GCZ/WDF/CISO/WBFS image to a plain ``.iso`` at ``dest``.
 
-    Downloads nodtool if needed (RVZ/WIA/GCZ). Partial output is removed on
-    failure or cancellation. Returns ``dest``. Raises :class:`ConvertError`
-    (plain-language) or :class:`rewii.core.progress.Cancelled`.
+    Downloads nodtool if needed (RVZ/WIA/GCZ). The image is built under a
+    ``.rewii-tmp-`` name next to ``dest`` and renamed when complete; partial
+    output is removed on failure or cancellation. ``dest`` must not be the
+    source file. Returns ``dest``. Raises :class:`ConvertError` (plain-language)
+    or :class:`rewii.core.progress.Cancelled`.
     """
     src, dest = Path(src), Path(dest)
     if not src.is_file():
         raise ConvertError(f"{src.name} was not found")
+    try:
+        if dest.exists() and os.path.samefile(src, dest):
+            raise ConvertError("The converted image can't replace the file it is made from")
+    except OSError:
+        pass
     try:
         fmt = sniff_format(src)
     except OSError as e:
         raise ConvertError(f"Could not read {src.name}: {e}") from e
     if fmt == "NKIT":
         raise ConvertError(NKIT_MESSAGE)
-    if fmt not in CONVERTIBLE:
+    if fmt not in INPUT_FORMATS:
         raise ConvertError(f"{src.name} is not a Wii or GameCube disc image ReWii can convert")
     rep = Reporter(progress, cancel)
     expected = expected_iso_size(src, fmt)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    work = dest.with_name(dest.stem + ".part.iso")
+    # ReWii's own staging name (tools pick the output format from the ".iso" ending)
+    work = dest.with_name(f".rewii-tmp-{dest.stem}.iso")
     work.unlink(missing_ok=True)
     try:
         if fmt == "ISO":
@@ -348,6 +409,9 @@ def to_iso(src: Path | str, dest: Path | str, progress: ProgressFn | None = None
         if expected:
             rep.update(expected, "Done")
         os.replace(work, dest)
+    except DiscError as e:
+        work.unlink(missing_ok=True)
+        raise ConvertError(f"{src.name} can't be read: {e}") from e
     except BaseException:
         work.unlink(missing_ok=True)
         raise
@@ -355,6 +419,7 @@ def to_iso(src: Path | str, dest: Path | str, progress: ProgressFn | None = None
 
 
 __all__ = [
-    "ConvertError", "Tool", "NOD_VERSION", "NOD_ASSETS", "find_tool", "tool_available", "ensure_tool",
+    "ConvertError", "Tool", "NOD_VERSION", "NOD_ASSETS", "TOOL_FORMATS", "INPUT_FORMATS",
+    "find_tool", "tool_available", "ensure_tool",
     "to_iso", "expected_iso_size", "host_platform", "cached_tool_path",
 ]

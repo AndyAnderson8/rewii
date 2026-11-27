@@ -25,10 +25,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .disc import GC_MAGIC, WII_MAGIC
+from .disc import GC_DISC_SIZE, GC_MAGIC, VALID_DISC_SIZES, WII_DL_SIZE, WII_MAGIC, WII_SL_SIZE
 from .progress import CancelToken, ProgressFn, Reporter
 
 CHUNK = 4 * 1024 * 1024
+MIN_SPLIT = 1 << 30      # CleanRip's smallest chunk size; smaller "parts" are not judged by size
 _PART = re.compile(r"^(?P<base>.+)\.part(?P<n>\d+)\.iso$", re.IGNORECASE)
 
 
@@ -102,6 +103,21 @@ class CleanRipDump:
     def info(self) -> Optional[DumpInfo]:
         return parse_dumpinfo(self.dumpinfo) if self.dumpinfo else None
 
+    def size_problem(self) -> Optional[str]:
+        """Why a split dump can't be a whole disc, judging by its total size
+        (None if it is fine, or not split). A real disc is exactly 1.36, 4.38
+        or 7.93 GiB, so anything else means parts are missing or cut short."""
+        if not self.is_split:
+            return None
+        try:
+            size = self.size
+        except OSError as e:
+            return f"a part can't be read ({e})"
+        if size in VALID_DISC_SIZES:
+            return None
+        return (f"the parts add up to {size / 1e9:.2f} GB, which is not a whole disc - "
+                "the last part is probably missing or incomplete")
+
 
 def _ci_lookup(folder: Path) -> dict[str, Path]:
     return {p.name.lower(): p for p in folder.iterdir() if p.is_file()}
@@ -131,6 +147,8 @@ def find_dumps(folder: Path | str, *, recursive: bool = False) -> list[CleanRipD
                 continue
             top = max(parts)
             missing = [i for i in range(top + 1) if i not in parts]
+            if not missing:
+                missing = _missing_tail([parts[i] for i in sorted(parts)])
             out.append(CleanRipDump(
                 name=base, folder=d, parts=[parts[i] for i in sorted(parts)],
                 dumpinfo=files.get(f"{base}-dumpinfo.txt".lower()),
@@ -143,6 +161,28 @@ def find_dumps(folder: Path | str, *, recursive: bool = False) -> list[CleanRipD
                     out.append(CleanRipDump(name=base, folder=d, parts=[p], dumpinfo=info,
                                             bca=files.get(f"{base}.bca".lower())))
     return out
+
+
+def _missing_tail(parts: list[Path]) -> list[int]:
+    """Part numbers missing from the *end* of a split set, worked out from sizes.
+
+    Every part but the last has CleanRip's chunk size, and the whole disc has
+    one of three known sizes, so the number of parts a dump must have follows
+    from part 0. Only judged for real-sized chunks (>= 1 GiB)."""
+    try:
+        sizes = [p.stat().st_size for p in parts]
+        with open(parts[0], "rb") as f:
+            plat, _gid = _header_info(f.read(0x20))
+    except OSError:
+        return []
+    chunk, total = sizes[0], sum(sizes)
+    if chunk < MIN_SPLIT or plat is None or any(s != chunk for s in sizes[:-1]):
+        return []
+    expected = GC_DISC_SIZE if plat == "gc" else (WII_SL_SIZE if total <= WII_SL_SIZE else WII_DL_SIZE)
+    if total >= expected:
+        return []
+    need = -(-expected // chunk)
+    return list(range(len(parts), need)) if need > len(parts) else []
 
 
 # --------------------------------------------------------------------------- redump DAT
@@ -163,7 +203,11 @@ def load_dat(path: Path | str) -> dict[str, DatMatch]:
     for game in root.iter("game"):
         gname = game.get("name", "")
         for rom in game.iter("rom"):
-            m = DatMatch(gname, rom.get("name", ""), int(rom.get("size", "0") or 0))
+            try:
+                size = int(rom.get("size", "0") or 0)
+            except ValueError:
+                size = 0
+            m = DatMatch(gname, rom.get("name", ""), size)
             for attr in ("md5", "sha1", "crc"):
                 v = (rom.get(attr) or "").lower()
                 if v:
@@ -198,6 +242,7 @@ class VerifyResult:
     mismatches: list[str] = field(default_factory=list)
     redump_name: Optional[str] = None      # matched game in the DAT, if a DAT was used
     dat_checked: bool = False
+    dat_error: str = ""                    # the DAT could not be read (never fatal)
 
     @property
     def ok(self) -> bool:
@@ -219,9 +264,15 @@ def _compare(res: VerifyResult, info: Optional[DumpInfo]) -> None:
 
 
 def _check_dat(res: VerifyResult, dat: Optional[Path]) -> None:
+    """Look the dump up in a redump DAT. The DAT is optional extra information,
+    so a missing or broken one is noted in ``dat_error`` and never fails the job."""
     if dat is None:
         return
-    table = load_dat(dat)
+    try:
+        table = load_dat(dat)
+    except (CleanRipError, OSError, ValueError) as e:
+        res.dat_error = str(e)
+        return
     res.dat_checked = True
     m = table.get(f"md5:{res.md5}") or table.get(f"sha1:{res.sha1}") or table.get(f"crc:{res.crc32}")
     if m:
@@ -233,7 +284,7 @@ def _header_info(first: bytes) -> tuple[Optional[str], str]:
         return None, ""
     wii, gc = struct.unpack(">II", first[0x18:0x20])
     plat = "wii" if wii == WII_MAGIC else "gc" if gc == GC_MAGIC else None
-    gid = first[:6].decode("ascii", "replace") if plat else ""
+    gid = first[:6].decode("ascii") if plat and re.fullmatch(rb"[A-Z0-9]{6}", first[:6]) else ""
     return plat, gid
 
 
@@ -310,9 +361,3 @@ def verify_dump(dump: CleanRipDump, progress: ProgressFn | None = None,
     _compare(res, dump.info())
     _check_dat(res, Path(dat) if dat else (_dat_for(dump, res.platform) if use_dat else None))
     return res
-
-
-def delete_parts(dump: CleanRipDump) -> None:
-    """Remove a dump's ``.partN.iso`` files (call only after a successful, verified join)."""
-    for p in dump.parts:
-        p.unlink(missing_ok=True)
