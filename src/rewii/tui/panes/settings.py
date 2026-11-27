@@ -48,10 +48,12 @@ class SettingsPane(Pane):
                          "games play the same.", classes="explain")
             with Horizontal(classes="row"):
                 yield Label("Online play server")
-                yield Select([("WiiLink WFC", "wiilink"), ("Wiimmfi", "wiimmfi"), ("Off", "")],
-                             value=s.online_server, allow_blank=False, id="online")
-            yield Static("Set in USB Loader GX so online games (Mario Kart Wii…) connect to a "
-                         "replacement for Nintendo WFC.", classes="explain")
+                yield Select([("Wiimmfi", "wiimmfi"), ("AltWFC", "altwfc"), ("Off", "off")],
+                             value=s.online_server if s.online_server in ("wiimmfi", "altwfc", "off") else "wiimmfi",
+                             allow_blank=False, id="online")
+            yield Static("Written to USB Loader GX when you press Save (if a drive is selected), so online "
+                         "games (Mario Kart Wii…) use a replacement for Nintendo WFC. For WiiLink WFC, install "
+                         "the 'WiiLink WFC Patcher' app from Homebrew instead.", classes="explain")
             with Horizontal(classes="row"):
                 yield Label("Cover language")
                 yield Select([(x, x) for x in ("EN", "US", "FR", "DE", "ES", "IT", "NL", "JA", "KO", "ZH")],
@@ -100,4 +102,10 @@ class SettingsPane(Pane):
             self.app.notify(f"Can't use that library folder: {e}", severity="error")
             return
         s.save()
+        if self.layout_ and self.layout_.gx_config.parent.exists():
+            try:
+                from ...core.online import set_loader_private_server
+                set_loader_private_server(self.layout_, s.online_server)
+            except Exception as e:
+                self.app.notify(f"Couldn't update USB Loader GX settings: {e}", severity="warning")
         self.app.notify("Settings saved")

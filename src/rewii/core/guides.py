@@ -137,11 +137,13 @@ ReWii backs these up directly – nothing to do on the Wii.
         "online", "Play online again (WiiLink WFC / Wiimmfi)",
         "Nintendo's online service closed in 2014; these replacements bring it back.",
         """\
-ReWii sets USB Loader GX's **private server** option for you (Settings → Online play server).
-Then just start the game from USB Loader GX and use its online mode.
+**Wiimmfi:** ReWii sets USB Loader GX's **private server** option for you
+(Settings → Online play server). Start the game from USB Loader GX and use its online mode.
 
-For games launched from discs or channels, use Priiloader's hacks (*Wiimmfi patch*) or the
-WiiLink WFC patcher. For WiiConnect24 channels (Forecast, News, Check Mii Out…) see
+**WiiLink WFC:** install the **WiiLink WFC Patcher** app (Homebrew section) and run it from the
+Homebrew Channel; it patches your installed games and channels.
+
+For discs and game channels, Priiloader's *Wiimmfi patch* hack also works. For WiiConnect24 channels (Forecast, News, Check Mii Out…) see
 https://wiilink.ca.
 """, link="https://wii.hacks.guide/nintendowfc"),
     Guide(

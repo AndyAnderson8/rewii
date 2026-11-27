@@ -38,11 +38,11 @@ class Settings:
     # covers
     cover_lang: str = "EN"
     cover_types: list[str] = field(default_factory=lambda: ["cover3D", "cover", "disc", "coverfullHQ"])
-    # online: "" (none), "wiimmfi" or "wiilink" - written to USB Loader GX settings
-    online_server: str = "wiilink"
+    # online play server written to USB Loader GX: "off" | "wiimmfi" | "altwfc"
+    # (WiiLink WFC isn't a loader option - it uses the WiiLink WFC Patcher app)
+    online_server: str = "wiimmfi"
     last_drive: str = ""
     first_run_done: bool = False
-    dry_run: bool = False
 
     @property
     def library(self) -> Path:
