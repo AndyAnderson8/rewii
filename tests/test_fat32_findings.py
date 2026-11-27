@@ -109,14 +109,18 @@ def test_temp_cleanup_leaves_running_copies_and_foreign_files_alone(lay):
     fresh.write_bytes(b"x")
     old = aged(lay.wbfs / ".rewii-tmp-RSPE01.wbfs")
     mine = aged(lay.root / "Movies" / "holiday.avi.part")     # not ReWii's folder: maybe a download
-    old_save = aged(lay.private_saves / "RSBE" / "data.bin.rewii-old")   # the previous save: keep
+    # a save moved aside by a restore that never finished: the only copy, so it's put back
+    old_save = aged(lay.private_saves / "RSBE" / "data.bin.rewii-old")
     f = next(x for x in H.check(lay) if x.id == "temp_leftovers")
     assert "1 of them changed less than an hour ago" in f.message
-    assert f.data["paths"] == [str(old)]
-    # even a finding that (wrongly) names other files only ever deletes idle ReWii temp files
+    assert "can put them back" in f.message and "data.bin" in f.message
+    assert sorted(f.data["paths"]) == sorted([str(old), str(old_save)])
+    # even a finding that (wrongly) names other files only ever touches idle ReWii temp files
     f.data["paths"] = [str(fresh), str(mine), str(lay.root / "apps")]
-    H.fix(lay, f)
-    assert fresh.exists() and mine.exists() and old_save.exists() and not old.exists()
+    log = H.fix(lay, f)
+    assert fresh.exists() and mine.exists() and not old.exists()
+    assert not old_save.exists() and (lay.private_saves / "RSBE" / "data.bin").exists()
+    assert any(line.startswith("Recovered data.bin") for line in log)
     only_fresh = next(x for x in H.check(lay) if x.id == "temp_leftovers")
     assert not only_fresh.auto_fixable and only_fresh.fix_id is None
 
@@ -752,3 +756,86 @@ def test_network_errors_say_check_your_connection(tmp_path):
         msg = str(ei.value)
         assert msg.startswith("Couldn't connect — check your internet connection")
         assert "hbb1.oscwii.org" in msg and "Connection refused" in msg and "Errno" not in msg
+
+
+def test_swap_leftovers_folders_and_finished_swaps_are_cleaned(lay):
+    """Folders staged by save restores / mod copies, and the old copy of a swap that did
+    finish, are removed; a folder still being written is left alone."""
+    sg = lay.savegames / "0001000052534245"
+    aged(sg / "banner.bin")
+    stale_new = aged(lay.savegames / "0001000052534245.rewii-new" / "banner.bin").parent
+    for p in (stale_new, *stale_new.iterdir()):
+        os.utime(p, (time.time() - 7200, time.time() - 7200))
+    done_old = aged(lay.private_saves / "RMCE" / "data.bin.rewii-old")
+    (lay.private_saves / "RMCE" / "data.bin").write_bytes(b"current")     # the swap finished
+    busy = lay.savegames / "0001000053534145.rewii-new"
+    busy.mkdir(parents=True)
+    (busy / "banner.bin").write_bytes(b"being copied right now")
+    f = next(x for x in H.check(lay) if x.id == "temp_leftovers")
+    assert str(stale_new) in f.data["paths"] and str(busy) not in f.data["paths"]
+    H.fix(lay, f)
+    assert not stale_new.exists() and not done_old.exists() and busy.is_dir()
+    assert (lay.private_saves / "RMCE" / "data.bin").read_bytes() == b"current"
+    assert (sg / "banner.bin").exists()
+
+
+def test_library_purge_recovers_and_cleans_swap_leftovers(settings, monkeypatch):
+    """At start-up: half-built snapshots go; a mod library copy moved aside by an
+    update that never finished comes back."""
+    snap = settings.drive_backups_dir / "USB" / "20260101-000000.partial"
+    (snap / "files").mkdir(parents=True)
+    (snap / "files" / "a").write_bytes(b"x")
+    mod_old = settings.mods_dir / "Newer.rewii-old"
+    mod_old.mkdir(parents=True)
+    (mod_old / "riivolution.xml").write_bytes(b"<wiidisc/>")
+    long_ago = time.time() - 3 * 86400
+    for p in (snap, snap / "files", snap / "files" / "a", mod_old, mod_old / "riivolution.xml"):
+        os.utime(p, (long_ago, long_ago))
+    removed = G.purge_stale_temp(settings)
+    assert snap in removed and not snap.exists()
+    assert (settings.mods_dir / "Newer" / "riivolution.xml").exists() and not mod_old.exists()
+
+
+def test_health_fix_names_folders_with_the_proper_title(capsys, lay, tmp_path, monkeypatch):
+    """`rewii health --fix` and the app's "Fix" name moved games like adding them does."""
+    s = Settings(library_dir=str(tmp_path / "lib"))
+    monkeypatch.setattr(Settings, "load", classmethod(lambda cls, path=None: s))
+    monkeypatch.setattr(cli, "_titles", lambda settings: {"RHAE01": "Wii Play"}.get)
+    make_wii_iso(lay.wbfs / "loose.iso", "RHAE01", "PARTY PACK for REVOLUTION")
+    entry.main(["health", "--drive", str(lay.root), "--fix"])
+    assert (lay.wbfs / "Wii Play [RHAE01]" / "RHAE01.iso").is_file()
+    # core API: without a lookup the disc's own title is used; a broken lookup falls back too
+    make_gc_iso(lay.gc_games / "loose.iso", "GKYE01", "KIRBY AIR RIDE INTERNAL")
+    f = next(x for x in H.check(lay) if x.fix_id == "move_gc_game")
+
+    def broken(gid):
+        raise RuntimeError("database is corrupt")
+    H.fix(lay, f, lookup=broken)
+    assert (lay.gc_games / "KIRBY AIR RIDE INTERNAL [GKYE01]" / "game.iso").is_file()
+
+
+def test_windows_error_codes_get_plain_messages(lay):
+    for winerror, words in ((19, "write-protected"), (112, "is full"), (21, "stopped responding")):
+        e = OSError(errno.EINVAL, "Windows says something", str(lay.root / "x"))
+        e.winerror = winerror                     # what Windows puts on OSError
+        assert words in FO.explain_os_error(e, lay.root)
+
+
+def test_volume_read_only_reports_the_mount_flag(lay, monkeypatch):
+    if not hasattr(os, "statvfs"):
+        pytest.skip("POSIX path")
+    assert FO.volume_read_only(lay.root) is False
+    real = os.statvfs
+
+    class RO:
+        def __init__(self, st):
+            self.st = st
+
+        def __getattr__(self, n):
+            return getattr(self.st, n)
+
+        @property
+        def f_flag(self):
+            return self.st.f_flag | os.ST_RDONLY
+    monkeypatch.setattr(os, "statvfs", lambda p: RO(real(p)))
+    assert FO.volume_read_only(lay.root) is True

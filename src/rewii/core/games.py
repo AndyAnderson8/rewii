@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import re
 import shutil
 import tempfile
@@ -22,6 +23,7 @@ from .disc import (FAT32_SPLIT, GC_DRIVE_EXTS, INCOMPLETE, LIBRARY_EXTS, WII_DRI
                    WII_SECTOR, DiscError, aes_cbc_decrypt, incomplete_reason,
                    open_disc, parse_header, region_of, sniff_format, split_parts, used_sectors,
                    wii_partitions, wii_usage_table)
+from . import fileops
 from .fileops import (TEMP_PREFIX as TMP_PREFIX, DriveNotConnected, explain_os_error, is_temp_name,
                       remove_quietly, rename_path, same_file, same_spelling)
 from .ids import is_disc_id, platform_guess
@@ -155,6 +157,26 @@ def _is_stale(p: Path) -> bool:
         return False
 
 
+_SWAP_SUFFIXES = (fileops.PARTIAL_DIR_SUFFIX, fileops.NEW_SUFFIX, fileops.OLD_SUFFIX)
+
+
+def _swap_leftovers(base: Path) -> list[Path]:
+    """Staging/swap leftovers under ``base``; a leftover folder isn't looked into."""
+    out: list[Path] = []
+    if not base.is_dir():
+        return out
+    for dirpath, dirnames, filenames in os.walk(base):
+        keep: list[str] = []
+        for d in dirnames:
+            if d.lower().endswith(_SWAP_SUFFIXES):
+                out.append(Path(dirpath) / d)
+            else:
+                keep.append(d)
+        dirnames[:] = keep
+        out += [Path(dirpath) / f for f in filenames if f.lower().endswith(_SWAP_SUFFIXES)]
+    return out
+
+
 def purge_stale_temp(settings: Settings | None = None, layout: DriveLayout | None = None) -> list[Path]:
     """Delete what an interrupted copy or conversion left behind, and return what was removed.
 
@@ -184,6 +206,19 @@ def purge_stale_temp(settings: Settings | None = None, layout: DriveLayout | Non
                     removed.append(p)
                 except OSError:
                     pass
+    # library: snapshot/NAND staging folders, save and mod swaps (``*.partial``,
+    # ``*.rewii-new``, ``*.rewii-old``). A ``*.rewii-old`` whose original is missing is
+    # put back instead of deleted - it is the only copy left.
+    if settings is not None:
+        for base in (settings.saves_dir, settings.mods_dir, settings.drive_backups_dir,
+                     settings.nand_backups_dir):
+            for p in _swap_leftovers(base):
+                if fileops.idle_for(p, STALE_TMP_AGE):
+                    try:
+                        if fileops.settle_leftover(p):
+                            removed.append(p)
+                    except OSError:
+                        pass
     try:
         work = _config.cache_dir() / WORK_DIR_NAME
         jobs = list(work.iterdir()) if work.is_dir() else []

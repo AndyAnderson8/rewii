@@ -309,11 +309,13 @@ def cmd_health(a: Any) -> int:
         print("Everything looks good.")
     failed = 0
     if a.fix and any(f.auto_fixable for f in findings):
+        look = _titles(Settings.load()) if any(
+            f.fix_id in (health.Fix.MOVE_WII_GAME, health.Fix.MOVE_GC_GAME) for f in findings) else None
         for f in findings:
             if not f.auto_fixable:
                 continue
             try:
-                for line in health.fix(lay, f):
+                for line in health.fix(lay, f, lookup=look):
                     if line.startswith(health.NOT_FIXED):
                         failed += 1
                         print(" ", line, file=sys.stderr)
