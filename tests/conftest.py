@@ -73,6 +73,9 @@ def _disk_guard(tmp_path, request):
     yield
     after = _sh.disk_usage(tmp_path).free
     used = before - after
-    if used > 3 * 1024 ** 3 or after < 2 * 1024 ** 3:
-        pytest.exit(f"{request.node.nodeid} used {used / 1e9:.1f} GB of temp space "
-                    f"({after / 1e9:.1f} GB left) - a test file is not sparse here", returncode=3)
+    msg = (f"{request.node.nodeid} used {used / 1e9:.1f} GB of temp space "
+           f"({after / 1e9:.1f} GB left) - a test file is not sparse here")
+    if after < 2 * 1024 ** 3:
+        pytest.exit(msg, returncode=3)
+    if used > 3 * 1024 ** 3:
+        pytest.fail(msg, pytrace=False)

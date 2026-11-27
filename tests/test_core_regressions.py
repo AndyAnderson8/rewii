@@ -13,6 +13,7 @@ import pytest
 import fakedisc
 from fakedisc import DATA_REL, PART_OFF, make_ciso, make_gc_iso, make_wii_iso
 from rewii.core import channels as CH
+from rewii.core import fileops
 from rewii.core import cleanrip as C
 from rewii.core import convert
 from rewii.core import disc as D
@@ -198,7 +199,8 @@ def test_ciso_reader_reports_missing_data(wii, tmp_path):
 def _sparse_part(path, size, header=b""):
     with open(path, "wb") as f:
         f.write(header)
-        f.truncate(size)
+        fileops.make_sparse(f)
+        fileops.set_length(f, size)
 
 
 def test_cleanrip_detects_missing_last_part_from_sizes(tmp_path):
