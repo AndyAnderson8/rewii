@@ -1,22 +1,23 @@
 """Settings."""
 from __future__ import annotations
 
-from pathlib import Path
+from typing import Any
+from collections.abc import Callable
 
-from textual import on, work
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Button, Input, Label, Select, Static, Switch
 
-from ...core.config import CONSOLE_TYPES, REGIONS
-from ..base import Pane
+from ...core.config import (CONSOLE_TYPES, COVER_LANGS, FORWARDER_STYLES, ONLINE_SERVERS, REGIONS,
+                            check_library_path)
+from ..base import FAILED, Pane
 
 CONSOLE_LABELS = {"wii": "Wii (original)", "vwii": "Wii U (vWii)", "mini": "Wii mini",
                   "family": "Wii Family Edition"}
 
 
 class SettingsPane(Pane):
-    TITLE = "Settings"
     DEFAULT_CSS = """
     SettingsPane .row { height: auto; margin-bottom: 1; }
     SettingsPane .row Label { width: 30; padding-top: 1; }
@@ -37,7 +38,8 @@ class SettingsPane(Pane):
             with Horizontal(classes="row"):
                 yield Label("Channel launch screen")
                 yield Select([("Cover art while loading", "cover"), ("Black screen", "black"),
-                              ("Classic loader screen", "classic")], value=s.forwarder_style,
+                              ("Classic loader screen", "classic")],
+                             value=s.forwarder_style if s.forwarder_style in FORWARDER_STYLES else "cover",
                              allow_blank=False, id="style")
             yield Static("What you see after opening a game's channel, until the game starts. "
                          "Applies to channels made from now on.", classes="explain")
@@ -49,15 +51,16 @@ class SettingsPane(Pane):
             with Horizontal(classes="row"):
                 yield Label("Online play server")
                 yield Select([("Wiimmfi", "wiimmfi"), ("AltWFC", "altwfc"), ("Off", "off")],
-                             value=s.online_server if s.online_server in ("wiimmfi", "altwfc", "off") else "wiimmfi",
+                             value=s.online_server if s.online_server in ONLINE_SERVERS else "wiimmfi",
                              allow_blank=False, id="online")
             yield Static("Written to USB Loader GX when you press Save (if a drive is selected), so online "
                          "games (Mario Kart Wii…) use a replacement for Nintendo WFC. For WiiLink WFC, install "
                          "the 'WiiLink WFC Patcher' app from Homebrew instead.", classes="explain")
             with Horizontal(classes="row"):
                 yield Label("Cover language")
-                yield Select([(x, x) for x in ("EN", "US", "FR", "DE", "ES", "IT", "NL", "JA", "KO", "ZH")],
-                             value=s.cover_lang if s.cover_lang else "EN", allow_blank=False, id="lang")
+                yield Select([(x, x) for x in COVER_LANGS],
+                             value=s.cover_lang if s.cover_lang in COVER_LANGS else "EN",
+                             allow_blank=False, id="lang")
             yield Label("Console (only for system features)", classes="title")
             yield Static("Games, homebrew and saves don't care which Wii you have. This is only used to "
                          "pick the right system files (cIOS, updates, themes) - wrong ones can brick a Wii.",
@@ -65,14 +68,43 @@ class SettingsPane(Pane):
             with Horizontal(classes="row"):
                 yield Label("Console type")
                 yield Select([(CONSOLE_LABELS[c], c) for c in CONSOLE_TYPES],
-                             value=s.console_type or Select.NULL, prompt="Not set", id="ctype")
+                             value=s.console_type if s.console_type in CONSOLE_TYPES else Select.NULL,
+                             prompt="Not set", id="ctype")
             with Horizontal(classes="row"):
                 yield Label("Region")
-                yield Select([(r, r) for r in REGIONS], value=s.console_region or Select.NULL,
+                yield Select([(r, r) for r in REGIONS],
+                             value=s.console_region if s.console_region in REGIONS else Select.NULL,
                              prompt="Not set", id="region")
             with Horizontal(classes="toolbar"):
                 yield Button("Save", id="save", variant="primary")
                 yield Button("USB Loader GX settings on the drive…", id="gx")
+
+    def button_actions(self) -> dict[str, Callable[[], Any]]:
+        return {"browse": self._browse, "gx": self._gx_edit, "save": self._save}
+
+    def focus_main(self) -> None:
+        self.query_one("#library", Input).focus()
+
+    def reload(self) -> None:
+        """Show the current settings - they can change elsewhere (SysCheck sets the console,
+        'Send to Wii' remembers the address), and Save must never write stale values back."""
+        s = self.settings
+        self.query_one("#library", Input).value = s.library_dir
+        self.query_one("#scrub", Switch).value = bool(s.scrub_games)
+        fixed: list[tuple[str, str, tuple[str, ...]]] = [
+            ("#style", s.forwarder_style, FORWARDER_STYLES), ("#online", s.online_server, ONLINE_SERVERS),
+            ("#lang", s.cover_lang, COVER_LANGS)]
+        for wid, value, allowed in fixed:
+            if value in allowed:
+                self.query_one(wid, Select).value = value
+        optional: list[tuple[str, str, tuple[str, ...]]] = [
+            ("#ctype", s.console_type, CONSOLE_TYPES), ("#region", s.console_region, REGIONS)]
+        for wid, value, allowed in optional:
+            sel = self.query_one(wid, Select)
+            if value in allowed:
+                sel.value = value
+            else:
+                sel.clear()
 
     @work(exclusive=True, group="settings")
     async def _browse(self) -> None:
@@ -80,21 +112,16 @@ class SettingsPane(Pane):
         if p:
             self.query_one("#library", Input).value = str(p[0])
 
-    @on(Button.Pressed, "#browse")
-    def _b(self) -> None:
-        self._browse()
-
-    @on(Button.Pressed, "#gx")
-    def _gx(self) -> None:
-        self._gx_edit()
-
     @work(exclusive=True, group="settings")
     async def _gx_edit(self) -> None:
-        if not self.need_drive():
+        lay = self.need_drive()
+        if lay is None:
             return
         from ...core import online
         from ..widgets import ChoiceForm
-        cur = online.read_gx_config(self.layout_)
+        cur = await self.bg("Reading USB Loader GX's settings", lambda: online.read_gx_config(lay))
+        if cur is FAILED:
+            return
         fields = []
         for key, opt in online.GX_OPTIONS.items():
             if not opt.choices or key == "PrivateServer":
@@ -104,35 +131,55 @@ class SettingsPane(Pane):
             "USB Loader GX settings", "Saved into apps/usbloader_gx/GXGlobal.cfg on the drive. "
             "Everything else can be changed in USB Loader GX itself.", fields))
         if res:
-            try:
-                online.write_gx_config(self.layout_, res)
+            if await self.bg("Saving USB Loader GX's settings",
+                             lambda: online.write_gx_config(lay, res)) is not FAILED:
                 self.app.notify("USB Loader GX settings saved")
-            except Exception as e:
-                self.app.notify(f"Couldn't save: {e}", severity="error")
 
-    @on(Button.Pressed, "#save")
+    @staticmethod
+    def _choice(sel: Select, allowed: tuple[str, ...], blank_ok: bool = False) -> str | None:
+        """The dropdown's value as a setting, or None when it isn't a valid one."""
+        v = sel.value
+        if isinstance(v, str) and v in allowed:
+            return v
+        return "" if blank_ok else None
+
     def _save(self) -> None:
         s = self.settings
-        lib = Path(self.query_one("#library", Input).value.strip()).expanduser()
+        # read and check everything first; settings are only touched once it is all valid
+        try:
+            lib = check_library_path(self.query_one("#library", Input).value)
+        except ValueError as e:
+            self.app.notify(str(e), severity="error")
+            return
+        style = self._choice(self.query_one("#style", Select), FORWARDER_STYLES)
+        online_server = self._choice(self.query_one("#online", Select), ONLINE_SERVERS)
+        lang = self._choice(self.query_one("#lang", Select), COVER_LANGS)
+        ctype = self._choice(self.query_one("#ctype", Select), CONSOLE_TYPES, blank_ok=True)
+        region = self._choice(self.query_one("#region", Select), REGIONS, blank_ok=True)
+        if style is None or online_server is None or lang is None or ctype is None or region is None:
+            self.app.notify("Pick a value for every setting first", severity="error")
+            return
+        old_lib = s.library_dir
         s.library_dir = str(lib)
-        s.forwarder_style = self.query_one("#style", Select).value  # type: ignore[assignment]
-        s.scrub_games = self.query_one("#scrub", Switch).value
-        s.online_server = self.query_one("#online", Select).value  # type: ignore[assignment]
-        s.cover_lang = self.query_one("#lang", Select).value  # type: ignore[assignment]
-        ct = self.query_one("#ctype", Select).value
-        rg = self.query_one("#region", Select).value
-        s.console_type = "" if ct is Select.NULL else str(ct)
-        s.console_region = "" if rg is Select.NULL else str(rg)
         try:
             s.ensure_library()
         except OSError as e:
+            s.library_dir = old_lib
             self.app.notify(f"Can't use that library folder: {e}", severity="error")
             return
-        s.save()
-        if self.layout_ and self.layout_.gx_config.parent.exists():
+        s.forwarder_style, s.online_server, s.cover_lang = style, online_server, lang
+        s.scrub_games = self.query_one("#scrub", Switch).value
+        s.console_type, s.console_region = ctype, region
+        if not self.rapp.save_settings():
+            return
+        if str(lib) != old_lib:
+            self.app.notify(f"The library is now {lib}. Files in the old folder ({old_lib}) were not moved.",
+                            timeout=10)
+        lay = self.layout_
+        if lay and lay.gx_config.parent.exists():
             try:
                 from ...core.online import set_loader_private_server
-                set_loader_private_server(self.layout_, s.online_server)
-            except Exception as e:
+                set_loader_private_server(lay, s.online_server)
+            except Exception as e:  # noqa: BLE001 - reported
                 self.app.notify(f"Couldn't update USB Loader GX settings: {e}", severity="warning")
         self.app.notify("Settings saved")

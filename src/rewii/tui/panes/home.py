@@ -1,7 +1,10 @@
 """Home: what's going on, and the first-run setup wizard."""
 from __future__ import annotations
 
-from textual import on, work
+from typing import Any
+from collections.abc import Callable
+
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Button, Label, Markdown
@@ -26,7 +29,6 @@ On the Wii, plug the drive into the **back USB port closest to the edge**.
 
 
 class HomePane(Pane):
-    TITLE = "Home"
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
@@ -52,10 +54,10 @@ class HomePane(Pane):
                                     "not set (only needed for system features - see Settings)"))
         self.query_one("#status", Label).update("\n".join(lines))
 
-    @on(Button.Pressed)
-    def _go(self, ev: Button.Pressed) -> None:
-        if ev.button.id and ev.button.id.startswith("go-"):
-            self.rapp.action_section(ev.button.id[3:])
+    def button_actions(self) -> dict[str, Callable[[], Any]]:
+        def go(key: str) -> Callable[[], Any]:
+            return lambda: self.rapp.action_section(key)
+        return {f"go-{k}": go(k) for k in ("drive", "games", "homebrew", "backups", "system")}
 
     @work(exclusive=True, group="home")
     async def first_run(self) -> None:
@@ -66,5 +68,5 @@ class HomePane(Pane):
             f"in:\n\n  {s.library}\n\nYou can change that in Settings. Next, pick your Wii's USB drive "
             "in the Drive section.\n\nNothing is ever written to a drive without asking you first.")
         s.first_run_done = True
-        s.save()
+        self.rapp.save_settings()
         self.rapp.action_section("drive")

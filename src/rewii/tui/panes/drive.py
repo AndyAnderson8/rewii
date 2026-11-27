@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from typing import Any
+from collections.abc import Callable
 
-from textual import on, work
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal
 from textual.widgets import Button, DataTable, Label, Static
@@ -13,20 +15,19 @@ from textual.widgets import Button, DataTable, Label, Static
 from ...core import drives as DR
 from ...core import formatting as FM
 from ...core import health as H
-from ..base import Pane
-from ..widgets import human_size
+from ..base import FAILED, Pane, kit_lines
+from ..widgets import cursor_key, human_size
 
 SEV = {"error": "✖", "warn": "!", "info": "i"}
 
 
 class DrivePane(Pane):
-    TITLE = "Drive"
     DEFAULT_CSS = """
     DrivePane #drives { height: 10; }
     DrivePane #findings { height: 1fr; }
     """
 
-    def __init__(self, **kw) -> None:
+    def __init__(self, **kw: Any) -> None:
         super().__init__(**kw)
         self.drives: list[DR.Drive] = []
         self.findings: list[H.Finding] = []
@@ -65,22 +66,28 @@ class DrivePane(Pane):
             ds = DR.list_drives()
         except Exception:
             ds = []
-        self.app.call_from_thread(self._fill_drives, ds)
+        self.from_thread(self._fill_drives, ds)
 
     def _fill_drives(self, ds: list[DR.Drive]) -> None:
         t = self.query_one("#drives", DataTable)
         before = self._cur_drive()
         self.drives = ds
         t.clear()
-        for i, d in enumerate(ds):
+        seen: set[str] = set()
+        for d in ds:
+            if d.id in seen:        # two listings of one device must not crash the table
+                continue
+            seen.add(d.id)
             t.add_row(d.display_name, human_size(d.size), d.filesystem or "?", d.partition_style or "?",
                       d.mount_point or "(not mounted)", human_size(d.free) if d.free else "-",
                       ", ".join(d.notes), key=d.id)
+        ds = [d for d in ds if d.id in seen]
         # keep the highlight on the same physical drive across rescans (never silently jump to row 0)
-        want = before.id if before else (self._current_listed().id if self._current_listed() else None)
-        for i, d in enumerate(ds):
-            if d.id == want:
-                t.move_cursor(row=i)
+        keep = before or self._current_listed()
+        want = keep.id if keep else None
+        ids = [r.key.value for r in t.ordered_rows]
+        if want in ids:
+            t.move_cursor(row=ids.index(want))
         cur = self.layout_
         self.query_one("#current", Label).update(
             f"Current drive: [b]{cur.root}[/b]" if cur else
@@ -89,10 +96,7 @@ class DrivePane(Pane):
 
     def _cur_drive(self) -> DR.Drive | None:
         """The drive highlighted in the list."""
-        t = self.query_one("#drives", DataTable)
-        if not t.row_count:
-            return None
-        key = t.coordinate_to_cell_key(t.cursor_coordinate).row_key.value
+        key = cursor_key(self.query_one("#drives", DataTable))
         return next((d for d in self.drives if d.id == key), None)
 
     def _current_listed(self) -> DR.Drive | None:
@@ -113,11 +117,10 @@ class DrivePane(Pane):
                     continue
         return None
 
-    @on(Button.Pressed)
-    def _b(self, ev: Button.Pressed) -> None:
-        {"use": self.action_use, "folder": self.action_folder, "format": self.action_format_selected,
-         "setup": self.action_setup, "rescan": self._scan, "check": self._check,
-         "fix": self.action_fix, "fixall": self.action_fixall}[ev.button.id]()
+    def button_actions(self) -> dict[str, Callable[[], Any]]:
+        return {"use": self.action_use, "folder": self.action_folder, "format": self.action_format_selected,
+                "setup": self.action_setup, "rescan": self._scan, "check": self._check,
+                "fix": self.action_fix, "fixall": self.action_fixall}
 
     def action_use(self) -> None:
         d = self._cur_drive()
@@ -135,22 +138,26 @@ class DrivePane(Pane):
     async def action_folder(self) -> None:
         p = await self.pick("Choose the drive (or any folder to use as one)", folder=True)
         if p:
-            self.rapp.set_drive(p[0], DR.drive_for_path(p[0]))
+            root = p[0]
+            info = await self.bg("Looking at that folder", lambda: DR.drive_for_path(root))
+            self.rapp.set_drive(root, None if info is FAILED else info)
             self.reload()
 
     # ------------------------------------------------------------------ health
     @work(thread=True, exclusive=True, group="drv-check")
     def _check(self) -> None:
-        lay = self.layout_
-        if not lay:
-            self.app.call_from_thread(self._fill_findings, [])
+        try:
+            lay = self.layout_
+            if not lay:
+                fs: list[H.Finding] = []
+            elif not lay.root.exists():
+                fs = [H.Finding("gone", H.ERROR, "The drive isn't connected.", None)]
+            else:
+                fs = H.check(lay, self.rapp.drive_info or DR.drive_for_path(lay.root))
+        except Exception as e:  # noqa: BLE001 - an unreadable drive must not close the app
+            self.scan_failed("Checking the drive", e)
             return
-        if not lay.root.exists():
-            self.app.call_from_thread(self._fill_findings, [H.Finding(
-                "gone", "error", "The drive isn't connected.", None)])
-            return
-        info = self.rapp.drive_info or DR.drive_for_path(lay.root)
-        self.app.call_from_thread(self._fill_findings, H.check(lay, info))
+        self.from_thread(self._fill_findings, fs)
 
     def _fill_findings(self, fs: list[H.Finding]) -> None:
         self.findings = fs
@@ -165,11 +172,8 @@ class DrivePane(Pane):
             t.add_row(SEV.get(f.severity, "?"), f.message, fix, key=str(i))
 
     def _sel_finding(self) -> H.Finding | None:
-        t = self.query_one("#findings", DataTable)
-        if not t.row_count:
-            return None
-        k = t.coordinate_to_cell_key(t.cursor_coordinate).row_key.value
-        return self.findings[int(k)] if k != "ok" else None
+        i = self.cursor_index("#findings")
+        return self.findings[i] if i is not None and i < len(self.findings) else None
 
     @work(exclusive=True, group="drv")
     async def action_fix(self) -> None:
@@ -207,19 +211,21 @@ class DrivePane(Pane):
             await self._apply(fs)
 
     async def _apply(self, fs: list[H.Finding]) -> None:
-        lay = self.layout_
+        lay = self.need_drive()
+        if lay is None:
+            return
 
-        def run(progress, cancel):
-            log = []
+        def run(progress: Any, cancel: Any) -> list[str]:
+            log: list[str] = []
             for f in fs:
                 try:
                     log += H.fix(lay, f, progress, cancel)
-                except H.FixError as e:
+                except (H.FixError, OSError) as e:
                     log.append(f"couldn't fix: {e}")
             return log
 
         log = await self.job("Fixing", run)
-        if log:
+        if log is not FAILED and log:
             await self.message("Done", "\n".join(log))
         self._check()
 
@@ -250,7 +256,7 @@ class DrivePane(Pane):
                                   type_to_confirm=word):
             return
 
-        def run(progress, cancel):
+        def run(progress: Any, cancel: Any) -> Any:
             if plan.is_image or not plan.requires_admin or FM.is_admin():
                 if plan.is_image:
                     return FM.execute_plan(plan, d.id, progress, cancel)
@@ -267,7 +273,7 @@ class DrivePane(Pane):
             return True
 
         res = await self.job("Formatting", run, cancellable=plan.is_image or FM.is_admin())
-        if res is None:
+        if res is FAILED:
             return
         # find the freshly mounted volume
         new = None
@@ -278,7 +284,7 @@ class DrivePane(Pane):
                     new = x
             if new:
                 break
-        if new:
+        if new and new.mount_point:
             self.rapp.set_drive(Path(new.mount_point), new)
             if await self.confirm("Formatted", f"{new.display_name} is ready. Install the essential apps now?",
                                   yes="Set up", no="Later"):
@@ -291,35 +297,40 @@ class DrivePane(Pane):
     # ------------------------------------------------------------------ set up
     @work(exclusive=True, group="drv")
     async def action_setup(self) -> None:
-        if not self.need_drive():
+        lay = self.need_drive()
+        if lay is None:
             return
         from ...core import osc
-        plat = self.settings.console_type
+        s = self.settings
+        plat = s.console_type
         ess = osc.starter_kit(plat, "essential")
         if not await self.confirm("Set up the drive",
-                                  "Creates the ReWii folders and installs:\n  " +
+                                  f"Creates the ReWii folders on {lay.root} and installs:\n  " +
                                   "\n  ".join(f"{x.slug} – {x.why}" for x in ess) +
-                                  "\n\nand sets USB Loader GX's online server."):
+                                  "\n\nand sets USB Loader GX's online server.", yes="Set up"):
             return
-        lay, s = self.layout_, self.settings
 
-        def run(progress, cancel):
+        def run(progress: Any, cancel: Any) -> tuple[Any, str]:
             lay.ensure_dirs()
             lay.write_manifest({"created_by": "ReWii", "updated": time.strftime("%Y-%m-%d %H:%M")})
             rep = osc.install_starter_kit(lay, plat, "essential", progress, cancel)
+            note = ""
             try:
                 from ...core.online import set_loader_private_server
-                set_loader_private_server(lay, s.online_server)
-            except Exception:
-                pass
-            return rep
+                if lay.gx_config.parent.exists():
+                    set_loader_private_server(lay, s.online_server)
+            except Exception as e:  # noqa: BLE001 - reported, the apps are installed anyway
+                note = f"USB Loader GX's online server wasn't set: {e}"
+            return rep, note
 
-        rep = await self.job("Setting up the drive", run)
-        if rep is not None:
-            lines = [f"Installed: {', '.join(rep.installed) or 'already up to date'}"]
-            if rep.failed:
-                lines.append("Failed: " + ", ".join(dict(rep.failed)))
-            lines.append("\nNext: on the Wii, back up the NAND, install Priiloader and the cIOS "
+        res = await self.job("Setting up the drive", run, quiet=True)
+        if res is not FAILED:
+            rep, note = res
+            lines, bad = kit_lines(rep)
+            if note:
+                lines.append(note)
+            lines.append("Next: on the Wii, back up the NAND, install Priiloader and the cIOS "
                          "(System & Guides).")
-            await self.message("Drive set up", "\n".join(lines))
+            await self.message("Drive set up" if not bad else "Drive set up - with problems",
+                               "\n\n".join(lines), error=bad)
         self.reload()

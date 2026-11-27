@@ -448,6 +448,9 @@ def prepare_cios_files(layout: DriveLayout, settings: Settings, progress: Progre
 def update_43_entries(settings: Settings) -> list[CatalogEntry]:
     """System Menu 4.3 for the console's region + IOS80 + IOS58 (original Wii only)."""
     require_profile(settings, ("wii", "family"), "the Wii Menu 4.3 update")
+    if getattr(settings, "korean_region_changed", False):
+        raise Refused("This Wii was made for Korea and later changed to another region. Updating its "
+                      "Wii Menu to 4.2 or newer bricks it (Error 003), so ReWii won't prepare this update.")
     if settings.console_region not in SYSTEM_MENU_43:
         raise Refused(f"Unknown console region {settings.console_region!r}.")
     return [*UPDATE_43_IOS, system_menu_43(settings.console_region)]

@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import logging
-import threading
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -15,6 +14,11 @@ from textual.widgets import ContentSwitcher, Footer, Header, ListItem, ListView,
 from .. import __version__
 from ..core.config import Settings, config_dir
 from ..core.layout import DriveLayout
+
+if TYPE_CHECKING:
+    from ..core.drives import Drive
+    from ..core.gametdb import GameInfo, TitleDB
+    from .base import Pane
 
 log = logging.getLogger("rewii")
 
@@ -31,7 +35,7 @@ SECTIONS = [
 ]
 
 
-def _make_pane(key: str):
+def _make_pane(key: str) -> Pane:
     from .panes import backups, channels, drive, games, home, homebrew, saves, settings, system
     return {
         "home": home.HomePane, "drive": drive.DrivePane, "games": games.GamesPane,
@@ -61,13 +65,24 @@ class ReWiiApp(App):
         super().__init__()
         self.settings = settings or Settings.load()
         self.drive_layout: Optional[DriveLayout] = None
-        self.drive_info = None          # rewii.core.drives.Drive when known
-        self._titles = None
-        self._titles_lock = threading.Lock()
+        self.drive_info: Optional[Drive] = None
+        self._titles: Optional[TitleDB] = None
+        self.startup_problems: list[str] = []
         start = drive or (Path(self.settings.last_drive) if self.settings.last_drive else None)
-        if start and start.exists():
-            self.drive_layout = DriveLayout(start)
-        self.settings.ensure_library()
+        try:
+            if start and start.is_dir():
+                self.drive_layout = DriveLayout(start)
+            elif drive is not None:
+                self.startup_problems.append(f"The drive {drive} isn't there - choose a drive in the Drive section.")
+        except OSError:
+            pass
+        try:
+            self.settings.ensure_library()
+        except OSError as e:
+            # keep running so the user can pick another folder in Settings
+            self.startup_problems.append(
+                f"The library folder {self.settings.library} can't be used ({e.strerror or e}). "
+                "Reconnect its disk, or choose another folder in Settings.")
 
     # ------------------------------------------------------------------ layout
     def compose(self) -> ComposeResult:
@@ -83,9 +98,15 @@ class ReWiiApp(App):
         self._update_subtitle()
         self.load_titles()
         self.check_update()
-        self.query_one("#home").reload()
+        self.pane("home").reload()
+        for msg in self.startup_problems:
+            self.notify(msg, severity="error", timeout=30)
         if not self.settings.first_run_done:
-            self.call_after_refresh(self.query_one("#home").first_run)  # type: ignore[attr-defined]
+            self.call_after_refresh(self.pane("home").first_run)  # type: ignore[attr-defined]
+
+    def pane(self, key: str) -> Pane:
+        from .base import Pane
+        return self.query_one(f"#{key}", Pane)
 
     def _update_subtitle(self) -> None:
         d = self.drive_layout
@@ -97,39 +118,66 @@ class ReWiiApp(App):
         self.action_section(key)
 
     def action_section(self, key: str) -> None:
+        keys = [k for k, _ in SECTIONS]
+        if key not in keys:
+            return
         sw = self.query_one(ContentSwitcher)
         sw.current = key
-        pane = self.query_one(f"#{key}")
-        pane.reload()  # type: ignore[attr-defined]
+        pane = self.pane(key)
+        pane.reload()
         lv = self.query_one("#sidebar", ListView)
-        idx = [k for k, _ in SECTIONS].index(key)
+        idx = keys.index(key)
         if lv.index != idx:
             lv.index = idx
+        # move the keyboard into the section so its shortcuts (shown in the footer) work
+        self.call_after_refresh(pane.focus_main)
 
     def action_reload(self) -> None:
         sw = self.query_one(ContentSwitcher)
         if sw.current:
-            self.query_one(f"#{sw.current}").reload()  # type: ignore[attr-defined]
+            pane = self.pane(sw.current)
+            getattr(pane, "refresh_data", pane.reload)()
 
     # ------------------------------------------------------------------ state
-    def set_drive(self, root: Path | None, info=None) -> None:
+    def set_drive(self, root: Path | None, info: Optional[Drive] = None) -> None:
         self.drive_layout = DriveLayout(root) if root else None
         self.drive_info = info
         self.settings.last_drive = str(root) if root else ""
-        self.settings.save()
+        self.save_settings()
         self._update_subtitle()
         self.notify(f"Using drive {root}" if root else "No drive selected")
 
+    def save_settings(self) -> bool:
+        """Save settings; a read-only config folder is reported, not fatal."""
+        try:
+            self.settings.save()
+            return True
+        except OSError as e:
+            self.notify(f"Couldn't save settings: {e}", severity="error")
+            return False
+
     @work(thread=True, exclusive=True, group="titles")
     def load_titles(self) -> None:
+        db: Optional[TitleDB]
         try:
             from ..core.gametdb import TitleDB
             db = TitleDB.load(self.settings)
         except Exception as e:  # offline and no cache: titles come from the discs
             log.info("title database unavailable: %s", e)
             db = None
-        with self._titles_lock:
-            self._titles = db
+        self._titles = db
+        if db is not None:
+            try:
+                self.call_from_thread(self._titles_ready)
+            except RuntimeError:
+                pass
+
+    def _titles_ready(self) -> None:
+        """Lists read before the title database arrived show raw disc titles: read them again."""
+        try:
+            self.pane("games").titles_ready()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - pane not mounted yet
+            pass
 
     @work(thread=True, exclusive=True, group="update")
     def check_update(self) -> None:
@@ -139,7 +187,10 @@ class ReWiiApp(App):
         except Exception:
             return
         if info and info.newer:
-            self.call_from_thread(self.notify, f"ReWii {info.latest} is available: {info.url}", timeout=15)
+            try:
+                self.call_from_thread(self.notify, f"ReWii {info.latest} is available: {info.url}", timeout=15)
+            except RuntimeError:
+                pass
 
     def title_lookup(self, game_id: str) -> Optional[str]:
         db = self._titles
@@ -151,7 +202,7 @@ class ReWiiApp(App):
         except Exception:
             return None
 
-    def game_info(self, game_id: str):
+    def game_info(self, game_id: str) -> Optional[GameInfo]:
         """GameTDB entry (publisher, year, synopsis…) or None."""
         db = self._titles
         try:
@@ -159,7 +210,7 @@ class ReWiiApp(App):
         except Exception:
             return None
 
-    def log_error(self, what: str, failure) -> None:
+    def log_error(self, what: str, failure: object) -> None:
         log.error("%s failed: %s\n%s", what, failure, getattr(failure, "tb", ""))
 
 

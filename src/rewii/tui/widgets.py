@@ -1,4 +1,5 @@
-"""Reusable dialogs: confirm, message, job progress (with cancel), file/folder picker, text prompt."""
+"""Reusable dialogs and widgets: confirm, either/or choice, message, job progress (with
+cancel), file/folder picker, text prompt, and the markable table the list panes share."""
 from __future__ import annotations
 
 import os
@@ -8,18 +9,22 @@ import threading
 import traceback
 from pathlib import Path
 from typing import Any, Optional
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 
 from textual import on
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.message import Message as TMessage
 from textual.screen import ModalScreen
-from textual.widgets import Button, DirectoryTree, Input, Label, ProgressBar, Static
+from textual.widgets import (Button, DataTable, DirectoryTree, Input, Label, ProgressBar,
+                             SelectionList, Static)
 
 from ..core.progress import Cancelled, CancelToken, ProgressEvent
 
 
-def human_size(n: float) -> str:
+def human_size(n: float | None) -> str:
+    n = float(n or 0)
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if abs(n) < 1000 or unit == "TB":
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
@@ -27,14 +32,92 @@ def human_size(n: float) -> str:
     return str(n)
 
 
-class Confirm(ModalScreen[bool]):
-    """Yes/No dialog. If ``type_to_confirm`` is set the user must type it first."""
+def cursor_key(table: DataTable) -> Optional[str]:
+    """Row key under the cursor of a row-cursor table, or None when it is empty."""
+    if not table.row_count:
+        return None
+    try:
+        return table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+    except Exception:  # noqa: BLE001 - cursor briefly out of range while a table refills
+        return None
+
+
+class MarkTable(DataTable):
+    """A row table whose rows can be ticked with Space.
+
+    ``selected_keys()`` is what actions work on: the ticked rows that are
+    *currently shown*, in the order shown - or the highlighted row when nothing
+    is ticked. Rows that are filtered out are never part of it.
+    """
+
+    BINDINGS = [Binding("space", "toggle_mark", "Mark")]
+
+    def __init__(self, **kw: Any) -> None:
+        kw.setdefault("cursor_type", "row")
+        kw.setdefault("zebra_stripes", True)
+        super().__init__(**kw)
+        self.marked: set[str] = set()
+        self._mark_col: Any = None
+
+    def set_columns(self, *labels: str) -> None:
+        self._mark_col = self.add_columns(" ", *labels)[0]
+
+    def row_keys(self) -> list[str]:
+        return [str(r.key.value) for r in self.ordered_rows]
+
+    def current_key(self) -> Optional[str]:
+        return cursor_key(self)
+
+    def fill(self, rows: Iterable[tuple[str, Sequence[Any]]]) -> None:
+        """Replace the rows with ``(key, cells)`` pairs, keeping the highlight on the
+        same row where possible. Ticks on rows that are no longer shown are dropped."""
+        keep, keep_row = self.current_key(), self.cursor_row
+        self.clear()
+        keys: list[str] = []
+        for key, cells in rows:
+            if key in keys:
+                continue       # never crash on a repeated key
+            keys.append(key)
+            self.add_row("✔" if key in self.marked else "", *cells, key=key)
+        self.marked &= set(keys)
+        if keys:
+            self.move_cursor(row=keys.index(keep) if keep in keys else min(keep_row, len(keys) - 1))
+
+    def selected_keys(self) -> list[str]:
+        keys = self.row_keys()
+        picked = [k for k in keys if k in self.marked]
+        if picked:
+            return picked
+        cur = self.current_key()
+        return [cur] if cur is not None else []
+
+    def clear_marks(self) -> None:
+        for k in self.row_keys():
+            if k in self.marked:
+                self.update_cell(k, self._mark_col, "")
+        self.marked.clear()
+
+    def action_toggle_mark(self) -> None:
+        key = self.current_key()
+        if key is None:
+            return
+        self.marked.symmetric_difference_update({key})
+        self.update_cell(key, self._mark_col, "✔" if key in self.marked else "")
+        if self.cursor_row + 1 < self.row_count:
+            self.move_cursor(row=self.cursor_row + 1)
+
+
+class Confirm(ModalScreen[Optional[bool]]):
+    """Yes/No dialog: True for yes, False for the "no" button, None for Escape.
+
+    If ``type_to_confirm`` is set the user must type it first.
+    """
 
     DEFAULT_CSS = """
     Confirm { align: center middle; }
-    Confirm > Vertical { width: 72; max-width: 95%; height: auto; border: thick $warning; background: $surface; padding: 1 2; }
+    Confirm > Vertical { width: 72; max-width: 95%; height: auto; max-height: 95%; border: thick $warning; background: $surface; padding: 1 2; }
     Confirm.danger > Vertical { border: thick $error; }
-    Confirm #body { margin-bottom: 1; }
+    Confirm VerticalScroll { height: auto; max-height: 30; margin-bottom: 1; }
     Confirm Horizontal { height: auto; align-horizontal: right; }
     Confirm Button { margin-left: 1; }
     """
@@ -49,9 +132,11 @@ class Confirm(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         with Vertical():
             yield Label(f"[b]{self.t}[/b]")
-            yield Static(self.body, id="body")
+            with VerticalScroll():
+                yield Static(self.body, id="body", markup=False)
             if self.ttc:
-                yield Label(f"Type [b]{self.ttc}[/b] to confirm:")
+                yield Label("Type the text below to confirm:")
+                yield Static(self.ttc, markup=False)
                 yield Input(id="ttc")
             with Horizontal():
                 yield Button(self.no, id="no")
@@ -67,7 +152,40 @@ class Confirm(ModalScreen[bool]):
         self.dismiss(ev.button.id == "yes")
 
     def key_escape(self) -> None:
-        self.dismiss(False)
+        self.dismiss(None)
+
+
+class Choice(ModalScreen[Optional[str]]):
+    """Either/or question with a real way out: returns "a", "b", or None (Cancel/Escape)."""
+
+    DEFAULT_CSS = """
+    Choice { align: center middle; }
+    Choice > Vertical { width: 76; max-width: 95%; height: auto; max-height: 95%; border: thick $primary; background: $surface; padding: 1 2; }
+    Choice VerticalScroll { height: auto; max-height: 30; margin-bottom: 1; }
+    Choice Horizontal { height: auto; align-horizontal: right; }
+    Choice Button { margin-left: 1; }
+    """
+
+    def __init__(self, title: str, body: str, a: str, b: str, cancel: str = "Cancel") -> None:
+        super().__init__()
+        self.t, self.body, self.a, self.b, self.cancel = title, body, a, b, cancel
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(f"[b]{self.t}[/b]")
+            with VerticalScroll():
+                yield Static(self.body, id="body", markup=False)
+            with Horizontal():
+                yield Button(self.cancel, id="cancel")
+                yield Button(self.b, id="b")
+                yield Button(self.a, id="a", variant="primary")
+
+    @on(Button.Pressed)
+    def _pressed(self, ev: Button.Pressed) -> None:
+        self.dismiss(ev.button.id if ev.button.id in ("a", "b") else None)
+
+    def key_escape(self) -> None:
+        self.dismiss(None)
 
 
 class Message(ModalScreen[None]):
@@ -106,15 +224,15 @@ class Prompt(ModalScreen[Optional[str]]):
     Prompt Button { margin-left: 1; }
     """
 
-    def __init__(self, title: str, label: str, value: str = "", password: bool = False) -> None:
+    def __init__(self, title: str, label: str, value: str = "") -> None:
         super().__init__()
-        self.t, self.label, self.value, self.password = title, label, value, password
+        self.t, self.label, self.value = title, label, value
 
     def compose(self) -> ComposeResult:
         with Vertical():
             yield Label(f"[b]{self.t}[/b]")
-            yield Label(self.label)
-            yield Input(self.value, id="val", password=self.password)
+            yield Static(self.label, markup=False)
+            yield Input(self.value, id="val")
             with Horizontal():
                 yield Button("Cancel", id="no")
                 yield Button("OK", id="yes", variant="primary")
@@ -165,7 +283,10 @@ class Job(ModalScreen[Any]):
         threading.Thread(target=self._run, daemon=True).start()
 
     def _progress(self, ev: ProgressEvent) -> None:
-        self.app.call_from_thread(self._update, ev)
+        try:
+            self.app.call_from_thread(self._update, ev)
+        except RuntimeError:       # the app is closing; let the worker finish quietly
+            pass
 
     def _update(self, ev: ProgressEvent) -> None:
         bar = self.query_one("#bar", ProgressBar)
@@ -178,13 +299,17 @@ class Job(ModalScreen[Any]):
             self.query_one("#msg", Static).update(ev.message + extra)
 
     def _run(self) -> None:
+        result: Any
         try:
             result = self.fn(self._progress, self.token)
         except Cancelled:
             result = Cancelled()
         except BaseException as e:  # noqa: BLE001 - shown to the user
             result = JobFailed(e, traceback.format_exc())
-        self.app.call_from_thread(self.dismiss, result)
+        try:
+            self.app.call_from_thread(self.dismiss, result)
+        except Exception:  # noqa: BLE001 - the app is closing
+            pass
 
     @on(Button.Pressed, "#cancel")
     def _cancel(self) -> None:
@@ -205,7 +330,7 @@ class JobFailed:
 def _roots() -> list[Path]:
     if sys.platform == "win32":
         return [Path(f"{d}:\\") for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
-    roots = [Path.home(), Path("/")]
+    roots: list[Path] = [Path.home(), Path("/")]
     for base in ("/media", "/run/media", "/mnt", "/Volumes"):
         b = Path(base)
         if b.exists():
@@ -221,10 +346,21 @@ def _roots() -> list[Path]:
 
 
 class _FilteredTree(DirectoryTree):
-    def __init__(self, path: Path, exts: set[str] | None, dirs_only: bool, **kw) -> None:
+    """Directory tree with a file filter. Space asks the picker to tick the
+    highlighted file (the stock tree uses Space to expand/collapse, which hid it)."""
+
+    BINDINGS = [Binding("space", "mark", "Mark/unmark")]
+
+    class MarkRequested(TMessage):
+        pass
+
+    def __init__(self, path: Path, exts: set[str] | None, dirs_only: bool, **kw: Any) -> None:
         super().__init__(path, **kw)
         self.exts = exts
         self.dirs_only = dirs_only
+
+    def action_mark(self) -> None:
+        self.post_message(self.MarkRequested())
 
     def filter_paths(self, paths: Iterable[Path]) -> Iterable[Path]:
         out = []
@@ -239,8 +375,18 @@ class _FilteredTree(DirectoryTree):
         return out
 
 
+def _clean_path(text: str) -> Path:
+    return Path(text.strip().strip('"')).expanduser()
+
+
 class PickPath(ModalScreen[Optional[list[Path]]]):
-    """File or folder picker. Type a path or browse. Space marks multiple files."""
+    """File or folder picker. Type a path or browse.
+
+    Modes: a single file (default); ``multiple`` files (Space ticks them);
+    ``folder``; ``either`` a matching file or a folder; ``any_path`` - anything
+    that exists and isn't a folder, including device nodes such as ``/dev/sdb``
+    or ``\\\\.\\PhysicalDrive2`` that can only be typed.
+    """
 
     DEFAULT_CSS = """
     PickPath { align: center middle; }
@@ -253,27 +399,43 @@ class PickPath(ModalScreen[Optional[list[Path]]]):
     PickPath #btns Button { margin-left: 1; }
     """
 
-    BINDINGS = [("space", "mark", "Mark/unmark"), ("escape", "cancel", "Cancel")]
+    BINDINGS = [("escape", "cancel", "Cancel")]
 
     def __init__(self, title: str, start: Path | None = None, exts: set[str] | None = None,
-                 folder: bool = False, multiple: bool = False) -> None:
+                 folder: bool = False, multiple: bool = False, either: bool = False,
+                 any_path: bool = False) -> None:
         super().__init__()
         self.t = title
-        self.start = start if start and start.exists() else Path.home()
+        try:
+            ok = bool(start and start.is_dir())
+        except OSError:
+            ok = False
+        self.start = start if ok and start else Path.home()
         self.exts = exts
         self.folder = folder
-        self.multiple = multiple
+        self.multiple = multiple and not folder
+        self.either = either
+        self.any_path = any_path
         self.marked: list[Path] = []
         self.current: Path | None = None
+        self._root_paths: list[Path] = []
 
     def compose(self) -> ComposeResult:
-        hint = "Choose a folder, then press Select." if self.folder else (
-            "Enter opens folders. Space marks files (pick several), then press Select."
-            if self.multiple else "Pick a file, then press Select.")
+        if self.folder:
+            hint = "Choose a folder, then press Select."
+        elif self.multiple:
+            hint = "Enter opens folders. Space ticks files (pick several), then press Select."
+        elif self.either:
+            hint = "Pick a file or a folder, then press Select."
+        elif self.any_path:
+            hint = "Pick a file, or type a device path, then press Select."
+        else:
+            hint = "Pick a file, then press Select."
+        self._root_paths = _roots()[:8]
         with Vertical():
             yield Label(f"[b]{self.t}[/b]  [dim]{hint}[/dim]")
             with Horizontal(id="roots"):
-                for i, r in enumerate(_roots()[:8]):
+                for i, r in enumerate(self._root_paths):
                     yield Button(str(r) if len(str(r)) < 18 else r.name, id=f"root{i}", classes="root")
             yield Input(str(self.start), id="path", placeholder="Type or paste a path")
             yield _FilteredTree(self.start, self.exts, self.folder, id="tree")
@@ -281,12 +443,13 @@ class PickPath(ModalScreen[Optional[list[Path]]]):
             with Horizontal(id="btns"):
                 yield Button("Cancel", id="cancel")
                 yield Button("Select", id="select", variant="primary")
-        self._roots = _roots()[:8]
+
+    def on_mount(self) -> None:
+        self.query_one("#tree", _FilteredTree).focus()
 
     @on(Button.Pressed, ".root")
     def _root(self, ev: Button.Pressed) -> None:
-        i = int(ev.button.id[4:])
-        self._goto(self._roots[i])
+        self._goto(self._root_paths[int((ev.button.id or "root0")[4:])])
 
     def _goto(self, p: Path) -> None:
         tree = self.query_one("#tree", _FilteredTree)
@@ -294,13 +457,30 @@ class PickPath(ModalScreen[Optional[list[Path]]]):
         self.query_one("#path", Input).value = str(p)
         self.current = p
 
+    def _is_file(self, p: Path) -> bool:
+        try:
+            if self.any_path:
+                return p.exists() and not p.is_dir()
+            return p.is_file()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _is_dir(p: Path) -> bool:
+        try:
+            return p.is_dir()
+        except OSError:
+            return False
+
     @on(Input.Submitted, "#path")
     def _typed(self, ev: Input.Submitted) -> None:
-        p = Path(ev.value.strip().strip('"')).expanduser()
-        if p.is_dir():
+        p = _clean_path(ev.value)
+        if self._is_dir(p):
             self._goto(p)
-        elif p.is_file():
+        elif self._is_file(p) and not self.folder:
             self.dismiss([p])
+        else:
+            self.app.notify("Nothing found at that path", severity="warning")
 
     @on(DirectoryTree.DirectorySelected)
     def _dir(self, ev: DirectoryTree.DirectorySelected) -> None:
@@ -311,23 +491,32 @@ class PickPath(ModalScreen[Optional[list[Path]]]):
     def _file(self, ev: DirectoryTree.FileSelected) -> None:
         self.current = ev.path
         self.query_one("#path", Input).value = str(ev.path)
-        if not self.multiple and not self.folder:
+        if not self.multiple and not self.folder and not self.either:
             self.dismiss([ev.path])
 
+    @on(_FilteredTree.MarkRequested)
+    def _mark_requested(self) -> None:
+        self.action_mark()
+
     def action_mark(self) -> None:
+        if not self.multiple:
+            return
         tree = self.query_one("#tree", _FilteredTree)
         node = tree.cursor_node
         if not node or not node.data:
             return
         p = Path(node.data.path)
-        if p.is_dir() and not self.folder:
+        if self._is_dir(p):
+            if node.allow_expand:
+                node.toggle()
             return
         if p in self.marked:
             self.marked.remove(p)
         else:
             self.marked.append(p)
         self.query_one("#picked", Static).update(
-            f"Marked ({len(self.marked)}): " + ", ".join(x.name for x in self.marked))
+            (f"Ticked ({len(self.marked)}): " + ", ".join(x.name for x in self.marked)) if self.marked else "")
+        tree.action_cursor_down()
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -336,32 +525,47 @@ class PickPath(ModalScreen[Optional[list[Path]]]):
     def _cancel(self) -> None:
         self.dismiss(None)
 
+    def _matching_files(self, folder: Path) -> list[Path]:
+        try:
+            return sorted(x for x in folder.iterdir()
+                          if x.is_file() and x.suffix.lower() in (self.exts or set()))
+        except OSError:
+            return []
+
     @on(Button.Pressed, "#select")
     def _select(self) -> None:
         if self.marked:
             self.dismiss(list(self.marked))
             return
-        p = Path(self.query_one("#path", Input).value.strip().strip('"')).expanduser()
+        p = _clean_path(self.query_one("#path", Input).value)
         if self.folder:
-            if p.is_dir():
+            if self._is_dir(p):
                 self.dismiss([p])
             else:
                 self.app.notify("Choose a folder", severity="warning")
-        else:
-            if p.is_file():
+        elif self.either:
+            if self._is_dir(p) or (self._is_file(p) and (not self.exts or p.suffix.lower() in self.exts)):
                 self.dismiss([p])
-            elif p.is_dir() and self.multiple and self.exts:
-                files = sorted(x for x in p.iterdir() if x.is_file() and x.suffix.lower() in self.exts)
-                if files:
-                    self.dismiss(files)
-                else:
-                    self.app.notify("No matching files in this folder", severity="warning")
             else:
-                self.app.notify("Choose a file", severity="warning")
+                self.app.notify("Choose a folder or a matching file", severity="warning")
+        elif self._is_file(p):
+            self.dismiss([p])
+        elif self._is_dir(p) and self.multiple and self.exts:
+            files = self._matching_files(p)
+            if files:
+                self.dismiss(files)
+            else:
+                self.app.notify("No matching files in this folder", severity="warning")
+        else:
+            self.app.notify("Choose a file or type a device path" if self.any_path else "Choose a file",
+                            severity="warning")
 
 
 class CheatPicker(ModalScreen[Optional[tuple[list[int], dict[str, dict[str, str]]]]]):
-    """Tick cheats for one game. Returns (selected indexes, placeholder values) or None."""
+    """Tick cheats for one game. Returns (selected indexes, placeholder values) or None.
+
+    Values are keyed by cheat name, which is how ``cheats.build_gct`` looks them up.
+    """
 
     DEFAULT_CSS = """
     CheatPicker { align: center middle; }
@@ -378,42 +582,64 @@ class CheatPicker(ModalScreen[Optional[tuple[list[int], dict[str, dict[str, str]
         self.t = title
         self.cheats = cheats
         self.pre = set(preselected)
+        self._typed: dict[tuple[int, str], str] = {}     # (cheat index, placeholder) -> text
+        self._shown: list[tuple[int, str]] = []
+
+    @staticmethod
+    def _vid(i: int, letter: str) -> str:
+        return f"v{i}_{ord(letter[:1] or '?')}"       # placeholders can be any character
 
     def compose(self) -> ComposeResult:
-        from textual.widgets import SelectionList
         with Vertical():
-            yield Label(f"[b]Cheats – {self.t}[/b]  [dim]Space ticks a cheat. Cheats marked ✎ need a value.[/dim]")
+            yield Label(f"[b]Cheats – {self.t}[/b]  [dim]Space ticks a cheat. Cheats marked ✎ need a value.[/dim]",
+                        markup=True)
             yield SelectionList(*[((("✎ " if c.needs_values else "") + c.name), i, i in self.pre)
                                   for i, c in enumerate(self.cheats)], id="list")
             yield Static("", id="info", markup=False)
             yield VerticalScroll(id="vals")
             with Horizontal(id="btns"):
                 yield Button("Cancel", id="cancel")
-                yield Button("None", id="none")
+                yield Button("No cheats", id="none")
                 yield Button("Save", id="save", variant="primary")
 
-    def on_mount(self) -> None:
-        self._refresh_values()
+    async def on_mount(self) -> None:
+        await self._refresh_values()
 
-    def on_selection_list_selection_highlighted(self, ev) -> None:
+    def on_selection_list_selection_highlighted(self, ev: SelectionList.SelectionHighlighted) -> None:
         c = self.cheats[ev.selection.value]
         codes = "\n".join(f"{a} {b}" for a, b in c.codes[:4]) + ("\n…" if len(c.codes) > 4 else "")
         self.query_one("#info", Static).update((c.comment or "") + "\n" + codes)
 
-    def on_selection_list_selected_changed(self) -> None:
-        self._refresh_values()
+    async def on_selection_list_selected_changed(self) -> None:
+        await self._refresh_values()
 
-    def _refresh_values(self) -> None:
-        from textual.widgets import SelectionList
-        sel = self.query_one("#list", SelectionList).selected
+    def _remember(self) -> None:
+        for i, letter in self._shown:
+            try:
+                self._typed[(i, letter)] = self.query_one("#" + self._vid(i, letter), Input).value
+            except Exception:  # noqa: BLE001 - not mounted (yet)
+                pass
+
+    async def _refresh_values(self) -> None:
+        """Show one value box per placeholder of the ticked cheats, keeping what was typed."""
+        sel = sorted(self.query_one("#list", SelectionList).selected)
+        want = [(i, letter) for i in sel for letter in self.cheats[i].placeholders]
+        if want == self._shown:
+            return
+        self._remember()
         box = self.query_one("#vals", VerticalScroll)
-        box.remove_children()
-        for i in sel:
+        await box.remove_children()
+        self._shown = []
+        widgets: list[Any] = []
+        for i, letter in want:
             c = self.cheats[i]
-            for letter, width in c.placeholders.items():
-                box.mount(Label(f"{c.name}: value for {letter} ({width} hex digits)"))
-                box.mount(Input(placeholder="0" * width, id=f"v{i}_{letter}", restrict=r"[0-9a-fA-F]*",
-                                max_length=width))
+            width = c.placeholders[letter]
+            widgets.append(Label(f"{c.name}: value for {letter} ({width} hex digits)", markup=False))
+            widgets.append(Input(self._typed.get((i, letter), ""), placeholder="0" * width,
+                                 id=self._vid(i, letter), restrict=r"[0-9a-fA-F]*", max_length=width))
+        if widgets:
+            await box.mount(*widgets)
+        self._shown = want
 
     @on(Button.Pressed, "#cancel")
     def _c(self) -> None:
@@ -425,13 +651,13 @@ class CheatPicker(ModalScreen[Optional[tuple[list[int], dict[str, dict[str, str]
 
     @on(Button.Pressed, "#save")
     def _s(self) -> None:
-        from textual.widgets import SelectionList
+        self._remember()
         sel = sorted(self.query_one("#list", SelectionList).selected)
         values: dict[str, dict[str, str]] = {}
         for i in sel:
             c = self.cheats[i]
             for letter in c.placeholders:
-                v = self.query_one(f"#v{i}_{letter}", Input).value.strip()
+                v = self._typed.get((i, letter), "").strip()
                 if not v:
                     self.app.notify(f"Enter a value for {c.name}", severity="warning")
                     return
