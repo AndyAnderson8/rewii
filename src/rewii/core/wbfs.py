@@ -14,6 +14,7 @@ from typing import BinaryIO, Optional
 from . import fileops
 from .disc import (FAT32_SPLIT, WII_DL_SECTORS, WII_SECTOR, DiscError, DiscReader,
                    WbfsFileReader, incomplete_reason, parse_header, used_sectors, wii_usage_table)
+from .fileops import make_sparse
 from .progress import CancelToken, ProgressFn, Reporter
 
 WBFS_SEC_S = 21                    # 2 MiB WBFS blocks, what WBM/wit use for files
@@ -44,7 +45,9 @@ class SplitWriter:
         while len(self.files) <= i:
             p = self._name(len(self.files))
             self.paths.append(p)
-            self.files.append(open(p, "w+b"))
+            f = open(p, "w+b")
+            make_sparse(f)        # unwritten (scrubbed) ranges take no space on NTFS either
+            self.files.append(f)
         return self.files[i]
 
     def write_at(self, off: int, data: bytes) -> None:
