@@ -118,3 +118,42 @@ def test_clone_and_cancel(tmp_path: Path, settings: Settings) -> None:
         B.create_snapshot(src, settings, "c", cancel=tok)
     assert B.list_snapshots(settings, "c") == []
     assert not any((settings.drive_backups_dir / "c").glob("*.partial"))
+
+
+def test_safe_join_rejects_windows_escapes(tmp_path):
+    from rewii.core.fileops import UnsafePath, safe_join
+    for bad in ("../x", "a/../../x", "/abs", "C:/Windows/x", "..\\..\\x", "a\\b", ""):
+        with pytest.raises(UnsafePath):
+            safe_join(tmp_path, bad)
+    assert safe_join(tmp_path, "apps/x/boot.dol") == tmp_path / "apps" / "x" / "boot.dol"
+
+
+def test_mirror_delete_is_case_insensitive(tmp_path):
+    from rewii.core import backup as BK
+    from rewii.core.backup import CopyReport
+    (tmp_path / "apps" / "wiixplorer").mkdir(parents=True)
+    (tmp_path / "apps" / "wiixplorer" / "boot.dol").write_bytes(b"x")
+    rep = CopyReport()
+    BK._mirror_delete(tmp_path, {"apps/WiiXplorer/boot.dol"}, True, None, rep)
+    assert (tmp_path / "apps" / "wiixplorer" / "boot.dol").exists() and not rep.deleted
+
+
+def test_clone_refuses_overlap(tmp_path):
+    from rewii.core import backup as BK
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "f").write_bytes(b"x")
+    with pytest.raises(BK.BackupError):
+        BK.clone_drive(tmp_path / "sub", tmp_path, mirror=True)
+    assert (tmp_path / "sub" / "f").exists()
+
+
+def test_snapshot_skips_library_inside_source(tmp_path):
+    from rewii.core import backup as BK
+    from rewii.core.config import Settings
+    src = tmp_path / "drive"
+    (src / "apps").mkdir(parents=True)
+    (src / "apps" / "a.txt").write_bytes(b"1")
+    s = Settings(library_dir=str(src / "ReWii"))
+    BK.create_snapshot(src, s, "self")
+    snap = BK.create_snapshot(src, s, "self")
+    assert [e.path for e in snap.files] == ["apps/a.txt"]

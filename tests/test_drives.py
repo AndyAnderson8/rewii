@@ -405,3 +405,26 @@ def test_display_name_and_human_size():
               volumes=[Volume("/dev/sdb1", 1, mount_points=["/media/x"])])
     assert d.display_name == "Ultra Fit 64.0 GB (/media/x)"
     assert dr.human_size(None) == "?"
+
+
+def test_linux_internal_member_and_var_mounts_are_system():
+    from rewii.core.drives import parse_lsblk
+    doc = {"blockdevices": [
+        {"name": "nvme1n1", "path": "/dev/nvme1n1", "size": 10**12, "type": "disk", "tran": "nvme", "rm": False,
+         "children": [{"name": "nvme1n1p1", "type": "part", "fstype": "zfs_member", "size": 10**12}]},
+        {"name": "sda", "path": "/dev/sda", "size": 10**12, "type": "disk", "tran": "sata", "rm": False,
+         "children": [{"name": "sda1", "type": "part", "fstype": "ext4", "size": 10**12,
+                       "mountpoints": ["/var/lib/docker"]}]},
+        {"name": "sdb", "path": "/dev/sdb", "size": 64 * 10**9, "type": "disk", "tran": "usb", "rm": True,
+         "children": [{"name": "sdb1", "type": "part", "fstype": "vfat", "size": 64 * 10**9,
+                       "mountpoints": ["/media/u/WII"]}]},
+    ]}
+    d = {x.device: x for x in parse_lsblk(doc)}
+    assert d["/dev/nvme1n1"].is_system and d["/dev/sda"].is_system and not d["/dev/sdb"].is_system
+
+
+def test_macos_disk_without_info_is_system():
+    from rewii.core.drives import parse_diskutil
+    lst = {"AllDisksAndPartitions": [{"DeviceIdentifier": "disk0", "Size": 10**12, "Partitions": []}]}
+    (d,) = parse_diskutil(lst, {}, ())
+    assert d.is_system

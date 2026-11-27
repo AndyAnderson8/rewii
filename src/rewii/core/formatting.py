@@ -9,7 +9,7 @@ The flow the UI follows::
     execute_plan(plan, confirm_token=drive.id, progress=..., cancel=...)
 
 ``execute_plan`` only touches a device when ``confirm_token`` equals the
-drive's id, which the UI only passes after the user typed the drive name.
+drive's id, which the UI only passes after the user typed that drive's label or size.
 Before writing, the drive list is re-read and the drive must still be present
 with the same id and must not be a system disk.
 
@@ -80,6 +80,7 @@ class FormatPlan:
     warnings: list[str] = field(default_factory=list)
     requires_admin: bool = True
     is_image: bool = False
+    forced: bool = False       # caller explicitly allowed a non-USB (internal) disk
 
     @property
     def summary(self) -> str:
@@ -285,7 +286,7 @@ def plan_format(drive: Drive, label: str = DEFAULT_LABEL, cluster_size: int = DE
                                     ["udisksctl", "mount", "--no-user-interaction", "-b",
                                      _linux_part1(drive.device)]))
     return FormatPlan(drive, plat, lab, geo.cluster_size, size, raw, steps, warnings,
-                      requires_admin=True)
+                      requires_admin=True, forced=force)
 
 
 def _win_disk_number(device: str) -> int:
@@ -337,6 +338,8 @@ def execute_plan(plan: FormatPlan, confirm_token: str,
         raise FormatRefused("The drive is no longer connected (or has changed). Nothing was changed.")
     if match[0].is_system:
         raise FormatRefused("Refusing to erase a system disk.")
+    if not (match[0].removable or match[0].is_usb) and not plan.forced:
+        raise FormatRefused("Refusing to erase an internal (non-USB) disk.")
     if not is_admin() and (plan.platform == "win32" or not os.access(plan.raw_device, os.W_OK)):
         raise FormatRefused("Erasing a drive needs administrator rights.")
     if cancel is not None:
@@ -347,18 +350,25 @@ def execute_plan(plan: FormatPlan, confirm_token: str,
 
     for step in plan.steps:
         if step.kind == "unmount" and step.command:
-            r = runner(step.command)
-            if r.returncode != 0 and step.command[0] == "udisksctl":
-                r = runner(["umount", step.command[-1]])   # retry with plain umount <device>
+            try:
+                r = runner(step.command)
+                if r.returncode != 0 and step.command[0] == "udisksctl":
+                    r = runner(["umount", step.command[-1]])   # retry with plain umount <device>
+            except (OSError, subprocess.SubprocessError) as e:
+                raise FormatFailed(f"Couldn't unmount the drive ({e}).") from e
             if r.returncode != 0:
                 raise FormatFailed(f"Couldn't unmount the drive ({_err(r)}). Close any programs "
                                    "using it and try again.")
     result = _write(plan, progress, cancel)
+    # The drive is formatted now; a failed rescan/mount only means "replug the drive".
     for step in plan.steps:
         if step.kind in ("rescan", "mount") and step.command:
-            r = runner(step.command)
-            if r.returncode != 0 and step.kind == "rescan" and shutil.which("partprobe"):
-                runner(["partprobe", drive.device])
+            try:
+                r = runner(step.command)
+                if r.returncode != 0 and step.kind == "rescan" and shutil.which("partprobe"):
+                    runner(["partprobe", drive.device])
+            except (OSError, subprocess.SubprocessError):
+                pass
     return result
 
 
@@ -373,8 +383,12 @@ def _write(plan: FormatPlan, progress: Optional[ProgressFn],
     except OSError as e:
         raise FormatFailed(f"Couldn't open {plan.raw_device} for writing: {e.strerror}") from e
     with os.fdopen(fd, "r+b", buffering=0) as f:
-        return format_fat32(f, plan.size_bytes, plan.label, plan.cluster_size, partition=True,
-                            progress=progress, cancel=cancel)
+        try:
+            return format_fat32(f, plan.size_bytes, plan.label, plan.cluster_size, partition=True,
+                                progress=progress, cancel=cancel)
+        except (OSError, Fat32Error) as e:
+            raise FormatFailed(f"Writing to the drive failed part-way ({e}). The drive is not usable "
+                               "until it is formatted again.") from e
 
 
 # --------------------------------------------------------------------------- Windows internals
@@ -412,6 +426,9 @@ def _execute_windows(plan: FormatPlan, progress: Optional[ProgressFn],
             path = v.device if v.device.startswith("\\\\") else f"\\\\.\\{v.device.rstrip(':')}:"
             h = k32.CreateFileW(path, GENERIC_RW, SHARE_RW, None, OPEN_EXISTING, 0, None)
             if h == INVALID or h is None:
+                if v.mount_points:
+                    raise FormatFailed(f"Couldn't lock {v.mount_points[0]}. Close programs using the "
+                                       "drive and try again.")
                 continue  # volume without a mountable path (e.g. raw WBFS): nothing to lock
             locked.append(h)
             ok = False
@@ -436,7 +453,10 @@ def _execute_windows(plan: FormatPlan, progress: Optional[ProgressFn],
             k32.CloseHandle(h)
     for step in plan.steps:
         if step.kind == "rescan" and step.command:
-            runner(step.command)
+            try:
+                runner(step.command)
+            except (OSError, subprocess.SubprocessError):
+                pass
     return result
 
 

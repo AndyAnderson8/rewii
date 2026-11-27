@@ -116,7 +116,9 @@ class BackupsPane(Pane):
         target = self.layout_.root
         if not await self.confirm(
                 "Restore backup", f"Copy the files from the {snap.created[:16]} backup to {target}?\n\n"
-                "Files that are already the same are skipped. Nothing on the drive is deleted."):
+                "Files that are already the same are skipped. Files that changed since the backup "
+                "(saves, settings) are REPLACED with the older backed-up version. Files that are only "
+                "on the drive are left alone.", yes="Restore"):
             return
         res = await self.job("Restoring", lambda p, c: BK.restore_snapshot(snap, target, progress=p, cancel=c))
         if res is not None:
@@ -277,8 +279,12 @@ class BackupsPane(Pane):
                 dl, progress=p, cancel=c))
             if bootmii_dir is None:
                 return
+        # a keys.bin already on the card tells us which Wii the card belongs to: let the
+        # kit builder refuse if it is a different console than this backup
+        tk = target / "keys.bin"
         kit = await self.job("Making rescue kit", lambda p, c: NA.build_rescue_kit(
-            a, target, bootmii_dir=bootmii_dir, progress=p, cancel=c))
+            a, target, bootmii_dir=bootmii_dir, target_keys=tk if tk.is_file() else None,
+            progress=p, cancel=c))
         if kit is not None:
             await self.message("Rescue kit ready", "\n".join(str(f) for f in kit.files) + "\n\n" +
                                "\n".join(kit.warnings) + "\n\nSee System & Guides → If something goes wrong.")

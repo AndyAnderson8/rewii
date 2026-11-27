@@ -181,3 +181,25 @@ def test_elevation_commands(monkeypatch):
     method, argv = relaunch_elevated_command(["x"], platform="linux")
     assert method == "pkexec" and argv[-1] == "x"
     assert isinstance(fm.is_admin(), bool)
+
+
+def test_execute_refuses_internal_disk_unless_plan_was_forced(monkeypatch):
+    monkeypatch.setattr(fm, "_write", lambda *a: pytest.fail("must not write"))
+    plan = plan_format(usb(), platform="linux")
+    internal = usb(removable=False, is_usb=False)       # same id, but it is really an internal disk
+    with pytest.raises(FormatRefused):
+        execute_plan(plan, plan.drive.id, lister=lambda: [internal])
+
+
+def test_post_write_step_failure_does_not_fail_the_format(monkeypatch):
+    monkeypatch.setattr(fm.shutil, "which", lambda n: f"/usr/bin/{n}")
+    monkeypatch.setattr(fm, "is_admin", lambda: True)
+    monkeypatch.setattr(fm, "_write", lambda p, prog, c: "ok")
+    plan = plan_format(usb(), platform="linux")
+
+    def runner(cmd):
+        if cmd[0] == "blockdev" or cmd[:2] == ["udisksctl", "mount"]:
+            raise subprocess.TimeoutExpired(cmd, 120)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    assert execute_plan(plan, plan.drive.id, runner=runner, lister=lambda: [usb()]) == "ok"

@@ -24,6 +24,7 @@ from .disc import FAT32_SPLIT, DiscError, DiscInfo, NeedsConversion, disc_info, 
 from .drives import EXFAT, FAT16, FAT32, NTFS, UNKNOWN, WBFS, Drive, human_size
 from .fat32 import MAX_SIZE
 from .layout import DriveLayout, game_folder_name, id_from_folder
+from .fileops import is_inside
 from .progress import CancelToken, ProgressFn, Reporter
 
 INFO, WARN, ERROR = "info", "warn", "error"
@@ -43,7 +44,8 @@ STARTER_APPS: dict[str, tuple[str, bool]] = {
     "wiixplorer": ("WiiXplorer", False),
 }
 
-MAC_JUNK_DIRS = frozenset({".Spotlight-V100", ".Trashes", ".fseventsd", ".TemporaryItems"})
+# not ".Trashes": that holds files the user put in the Mac trash and may still want back
+MAC_JUNK_DIRS = frozenset({".Spotlight-V100", ".fseventsd", ".TemporaryItems"})
 MAC_JUNK_FILES = frozenset({".DS_Store"})
 
 WII_EXTS = (".wbfs", ".iso", ".ciso")
@@ -514,6 +516,9 @@ def fix(layout: DriveLayout, finding: Finding, progress: Optional[ProgressFn] = 
     if fid not in SAFE_FIXES:
         raise FixError(f"'{finding.id}' can't be fixed automatically.")
     p = finding.path
+    if p is not None and not is_inside(Path(p), layout.root):
+        # a finding from another drive (the drive was switched after the check)
+        raise FixError("That finding belongs to a different drive. Check the drive again.")
 
     if fid == "delete_mac_junk":
         paths = [Path(x) for x in finding.data.get("paths", [])] or list(_walk_junk(layout.root))
@@ -623,6 +628,8 @@ def split_file(path: Path | str, part_size: int = FAT32_SPLIT,
                             dst.write(buf)
                             left -= len(buf)
                             rep.advance(len(buf))
+                        dst.flush()
+                        os.fsync(dst.fileno())     # the part must be on the drive before we truncate
                 except BaseException:
                     tmp.unlink(missing_ok=True)
                     raise

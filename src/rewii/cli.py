@@ -223,15 +223,15 @@ def cmd_format_drive(a) -> int:
     if a.confirm != a.drive_id:
         print("refusing: --confirm must equal --drive-id", file=sys.stderr)
         return 2
-    drive = next((d for d in list_drives(include_fixed=True) if d.id == a.drive_id), None)
+    drive = next((d for d in list_drives(include_fixed=a.force) if d.id == a.drive_id), None)
     if drive is None:
         print("refusing: that drive is no longer connected (or changed)", file=sys.stderr)
         return 2
     bar = _Bar()
     try:
-        plan = formatting.plan_format(drive, a.label, a.cluster_size, force=True)
+        plan = formatting.plan_format(drive, a.label, a.cluster_size, force=a.force)
         res = formatting.execute_plan(plan, a.confirm, progress=bar)
-    except (formatting.FormatRefused, formatting.FormatFailed) as e:
+    except (formatting.FormatRefused, formatting.FormatFailed, OSError) as e:
         bar.done()
         print(f"format failed: {e}", file=sys.stderr)
         return 1
@@ -286,6 +286,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--confirm", required=True, help="must repeat the drive id")
     p.add_argument("--label", default="REWII")
     p.add_argument("--cluster-size", type=int, default=32768)
+    p.add_argument("--force", action="store_true",
+                   help="allow an internal (non-USB) disk; system disks are always refused")
     p.set_defaults(fn=cmd_format_drive)
 
     p = sub.add_parser("verify", help="check game files for damage")

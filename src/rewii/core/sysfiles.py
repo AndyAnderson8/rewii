@@ -138,6 +138,11 @@ def validate_hack_block(text: str) -> list[str]:
     return errs
 
 
+def _write_lf(p: Path, text: str) -> None:
+    """Write text with plain LF line endings on every OS (the Wii reads these files)."""
+    p.write_bytes(text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8"))
+
+
 def _backup(p: Path) -> Optional[Path]:
     if p.is_file():
         b = p.with_name(p.name + f".bak-{time.strftime('%Y%m%d-%H%M%S')}")
@@ -162,13 +167,13 @@ def update_priiloader_hacks(layout: DriveLayout, progress: ProgressFn | None = N
     p = hacks_path(layout)
     custom = ""
     if keep_custom and p.is_file():
-        old = p.read_text("utf-8", "replace")
+        old = p.read_text("utf-8", "replace").replace("\r\n", "\n")
         i = old.find(CUSTOM_MARK)
         if i >= 0:
             custom = old[i:]
     _backup(p)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(text.rstrip("\r\n") + "\n" + (("\n" + custom) if custom else ""), "utf-8")
+    _write_lf(p, text.rstrip("\r\n") + "\n" + (("\n" + custom) if custom else ""))
     return p, str(rel.get("tag_name", ""))
 
 
@@ -183,11 +188,11 @@ def add_custom_hack(layout: DriveLayout, snippet: str) -> Path:
     p = hacks_path(layout)
     if not p.is_file():
         raise SysFileError("No hacks_hash.ini on the drive yet - install Priiloader or update the hack list first")
-    text = p.read_text("utf-8", "replace")
+    text = p.read_text("utf-8", "replace").replace("\r\n", "\n")
     _backup(p)
     if CUSTOM_MARK not in text:
         text = text.rstrip("\r\n") + "\n\n" + CUSTOM_MARK + "\n"
-    p.write_text(text.rstrip("\r\n") + "\n" + snippet.strip() + "\n", "utf-8")
+    _write_lf(p, text.rstrip("\r\n") + "\n" + snippet.strip() + "\n")
     return p
 
 
@@ -228,7 +233,7 @@ def write_bootmii_ini(sd_root: Path, values: dict[str, str]) -> Path:
                 done.add(k)
     lines += [f"{k}={v}" for k, v in values.items() if k not in done]
     _backup(p)
-    p.write_text("\r\n".join(lines) + "\r\n", "latin-1")
+    p.write_bytes(("\r\n".join(lines) + "\r\n").encode("latin-1", "replace"))
     return p
 
 
