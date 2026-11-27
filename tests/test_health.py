@@ -13,6 +13,7 @@ from rewii.core.health import (ERROR, INFO, WARN, Finding, FixError, check, chec
                                split_file)
 from rewii.core.layout import DriveLayout
 from rewii.core.progress import Cancelled, CancelToken
+from rewii.core.fileops import make_sparse
 
 GiB = 1024 ** 3
 
@@ -215,7 +216,9 @@ def test_orphan_split_and_conversion_formats(layout):
 
 def test_big_file_on_fat32_target(layout):
     p = make_wbfs(layout.wii_game_file("Brawl", "RSBE01"), "RSBE01", "BRAWL")
-    os.truncate(p, 5 * GiB)                       # sparse
+    with open(p, "r+b") as big:
+        make_sparse(big)
+        big.truncate(5 * GiB)                     # sparse
     f = next(f for f in check(layout) if f.id == "file_too_big")
     assert f.fix_id == "split_file" and f.severity == ERROR
     # on an NTFS drive big files are fine

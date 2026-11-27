@@ -13,6 +13,7 @@ import hashlib
 import os
 import re
 import shutil
+import sys
 import threading
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
@@ -325,6 +326,25 @@ def copy_atomic(src: Path, dest: Path, rep: Reporter | None = None, *, want_hash
         remove_quietly([tmp])
         raise
     return h.hexdigest() if h is not None else ""
+
+
+def make_sparse(f: object) -> None:
+    """Mark an open file as sparse so unwritten ranges take no disk space.
+
+    Linux and macOS files are sparse by default. On Windows (NTFS) a file must be
+    flagged first, otherwise extending it really allocates every byte."""
+    if sys.platform != "win32":
+        return
+    try:      # pragma: no cover - Windows only
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        handle = msvcrt.get_osfhandle(f.fileno())                     # type: ignore[attr-defined]
+        returned = wintypes.DWORD()
+        ctypes.windll.kernel32.DeviceIoControl(                        # type: ignore[attr-defined]
+            wintypes.HANDLE(handle), 0x000900C4, None, 0, None, 0, ctypes.byref(returned), None)
+    except (OSError, AttributeError, ValueError):
+        pass      # not NTFS, or no handle: the file is simply not sparse
 
 
 def safe_join(base: Path, rel: str) -> Path:
