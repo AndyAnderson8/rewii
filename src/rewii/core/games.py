@@ -6,6 +6,7 @@ Drive (USB):           wbfs/Title [ID]/ID.wbfs (+.wbf1...), games/Title [ID]/gam
 from __future__ import annotations
 
 import hashlib
+import re
 import shutil
 import struct
 import tempfile
@@ -175,8 +176,23 @@ def estimate_install_size(path: Path, scrub: bool = True) -> int:
         return (len(blocks) + 1) * (2 << 20)
 
 
+_PART_RE = re.compile(r"\.part\d+\.iso$", re.I)
+
+
 def _prepare_source(src: Path, tmpdir: Path, rep: Reporter) -> Path:
-    """Convert RVZ/NKit/etc. to ISO in a temp folder if needed."""
+    """Join CleanRip part files / convert RVZ/NKit/etc. to ISO in a temp folder if needed."""
+    if _PART_RE.search(src.name):
+        from . import cleanrip
+        dump = next((d for d in cleanrip.find_dumps(src.parent) if src in d.parts), None)
+        if dump is not None and dump.is_split:
+            if not dump.complete:
+                raise GameError(f"{dump.name}: dump parts {dump.missing_parts} are missing")
+            rep.note(f"Joining CleanRip dump {dump.name}")
+            out = tmpdir / f"{dump.name}.iso"
+            res = cleanrip.join_dump(dump, out, rep.fn, rep.cancel)
+            if res.dumpinfo_match is False:
+                raise GameError(f"{dump.name}: the dump is damaged ({', '.join(res.mismatches)}) - rip it again")
+            return out
     fmt = sniff_format(src)
     if fmt not in CONVERTIBLE:
         return src

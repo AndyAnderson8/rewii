@@ -165,6 +165,59 @@ def cmd_migrate(a) -> int:
     return 0
 
 
+def cmd_drives(a) -> int:
+    from .core.drives import list_drives
+    ds = list_drives(include_fixed=a.all)
+    if not ds:
+        print("No removable drives found.")
+    for d in ds:
+        print(f"{d.display_name}\n    id={d.id}  fs={d.filesystem}  {d.partition_style}  "
+              f"mount={d.mount_point or '-'}" + (f"  notes={', '.join(d.notes)}" if d.notes else ""))
+    return 0
+
+
+def cmd_health(a) -> int:
+    from .core import health
+    from .core.drives import drive_for_path
+    lay = _drive(a)
+    drv = drive_for_path(lay.root)
+    findings = health.check(lay, drv)
+    for f in findings:
+        print(f"[{f.severity:5}] {f.message}" + (f"  (fix: {f.fix_id})" if f.fix_id else ""))
+    if a.fix:
+        for f in findings:
+            if f.auto_fixable:
+                for line in health.fix(lay, f):
+                    print("  fixed:", line)
+    if not findings:
+        print("Everything looks good.")
+    return 1 if any(f.severity == "error" for f in findings) else 0
+
+
+def cmd_format_drive(a) -> int:
+    """Non-interactive formatter; the app runs this elevated (admin/root)."""
+    from .core import formatting
+    from .core.drives import list_drives
+    if a.confirm != a.drive_id:
+        print("refusing: --confirm must equal --drive-id", file=sys.stderr)
+        return 2
+    drive = next((d for d in list_drives(include_fixed=True) if d.id == a.drive_id), None)
+    if drive is None:
+        print("refusing: that drive is no longer connected (or changed)", file=sys.stderr)
+        return 2
+    bar = _Bar()
+    try:
+        plan = formatting.plan_format(drive, a.label, a.cluster_size, force=True)
+        res = formatting.execute_plan(plan, a.confirm, progress=bar)
+    except (formatting.FormatRefused, formatting.FormatFailed) as e:
+        bar.done()
+        print(f"format failed: {e}", file=sys.stderr)
+        return 1
+    bar.done()
+    print(f"formatted {drive.display_name}: FAT32, {res.cluster_size // 1024} KB clusters, label {res.label}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="rewii", description="ReWii - all-in-one Wii toolkit. "
                                  "Run without arguments for the full app.")
@@ -198,6 +251,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--drive")
     p.add_argument("--list", action="store_true")
     p.set_defaults(fn=cmd_migrate)
+
+    p = sub.add_parser("drives", help="list removable drives")
+    p.add_argument("--all", action="store_true", help="include fixed (non-system) disks")
+    p.set_defaults(fn=cmd_drives)
+    p = sub.add_parser("health", help="check the drive for problems")
+    p.add_argument("--drive")
+    p.add_argument("--fix", action="store_true", help="apply the safe automatic fixes")
+    p.set_defaults(fn=cmd_health)
+    p = sub.add_parser("format-drive", help="erase and format a drive FAT32 (needs admin)")
+    p.add_argument("--drive-id", required=True)
+    p.add_argument("--confirm", required=True, help="must repeat the drive id")
+    p.add_argument("--label", default="REWII")
+    p.add_argument("--cluster-size", type=int, default=32768)
+    p.set_defaults(fn=cmd_format_drive)
 
     p = sub.add_parser("verify", help="check game files for damage")
     p.add_argument("files", nargs="+")

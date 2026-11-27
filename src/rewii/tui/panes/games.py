@@ -169,6 +169,9 @@ class GamesPane(Pane):
                                 start=Path(self.settings.last_drive or Path.home()))
         if not paths:
             return
+        import re
+        # CleanRip dumps: picking .part0.iso is enough, the other parts are joined automatically
+        paths = [p for p in paths if not re.search(r"\.part[1-9]\d*\.iso$", p.name, re.I)]
         move = False
         put = self.layout_ is not None and await self.confirm(
             "Also put on the drive?", f"Add {len(paths)} game(s) to the library. "
