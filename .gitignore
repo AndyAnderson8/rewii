@@ -12,3 +12,8 @@ build/
 *.wad
 *.bin
 common-key
+
+# build output
+/build/
+/dist/
+*.spec.bak

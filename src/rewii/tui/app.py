@@ -135,7 +135,8 @@ class ReWiiApp(App):
         if db is None:
             return None
         try:
-            return db.title(game_id, None)
+            g = db.get(game_id)
+            return g.title if g else None
         except Exception:
             return None
 
