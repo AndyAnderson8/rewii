@@ -160,12 +160,16 @@ def write_iso(d: DiscReader, dest: Path, *, split: Optional[int] = None, scrub: 
     return w.paths
 
 
-def write_ciso(d: DiscReader, dest: Path, *, block: int = 0x8000, scrub: bool = True,
+def write_ciso(d: DiscReader, dest: Path, *, block: int = 0, scrub: bool = True,
                progress: ProgressFn | None = None, cancel: CancelToken | None = None) -> Path:
     """Write a CISO image (accepted by USB Loader GX and Nintendont)."""
     hdr = d.read(0, 0x100)
     _gid, _t, platform, _n, _v = parse_header(hdr)
     total = d.size
+    if not block:      # smallest power of two (>= 32 KiB) whose map fits in the header
+        block = 0x8000
+        while (total + block - 1) // block > 0x7FF8:
+            block *= 2
     nblk = (total + block - 1) // block
     if nblk > 0x7FF8:
         raise ValueError("disc too large for CISO with this block size")
