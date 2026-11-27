@@ -207,14 +207,14 @@ def test_conflict_is_found_before_anything_is_copied(tmp_path: Path) -> None:
 def test_failed_copy_is_rolled_back(tmp_path: Path, monkeypatch) -> None:
     drive = tmp_path / "drive"
     drive.mkdir()
-    real, n = R._copy_file, []
+    real, n = R.copy_atomic, []
 
     def flaky(src, dst):
         n.append(dst)
         if len(n) == 3:
             raise OSError(28, "No space left on device")
         real(src, dst)
-    monkeypatch.setattr(R, "_copy_file", flaky)
+    monkeypatch.setattr(R, "copy_atomic", flaky)
     with pytest.raises(OSError):
         R.install_mod(make_mod_zip(tmp_path / "m.zip"), drive)
     assert [p for p in drive.rglob("*") if p.is_file()] == []

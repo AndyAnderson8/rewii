@@ -21,10 +21,11 @@ from pathlib import Path
 from typing import Optional
 
 from . import net
-from .config import cache_dir
-from .fileops import copy_atomic, is_temp_name
-from .layout import DriveLayout
+from . import config
+from .fileops import copy_atomic, is_temp_name, part_path
+from .layout import APPS_DIR, DriveLayout
 from .progress import CancelToken, ProgressFn
+from .errors import ReWiiError
 
 HACKMII_URL = "https://bootmii.org/hackmii_installer_v1.2.zip"
 HACKMII_SHA256 = "32b7406956860ffb50d46f83e5fb6b8d67cd2612781cd97619d0c2371c84c945"
@@ -33,24 +34,23 @@ D2XL_MINI_SHA256 = "c63659112453c6b2d8383d3bdeca5ad60c400781e571d9c32016528b594a
 PRIILOADER_RELEASE_API = "https://api.github.com/repos/DacoTaco/priiloader/releases/latest"
 
 # Set this once ReWii has a public GitHub repo ("owner/name"); empty disables the check.
-UPDATE_REPO = ""
+UPDATE_REPO = "AndyAnderson8/rewii"
 
 
-class SysFileError(Exception):
+class SysFileError(ReWiiError):
     pass
 
 
 def _fetch_pinned(url: str, sha256: str, name: str, progress: ProgressFn | None,
                   cancel: CancelToken | None) -> bytes:
-    p = cache_dir() / "sysfiles" / name
+    p = config.cache_dir() / "sysfiles" / name
     if p.is_file() and hashlib.sha256(p.read_bytes()).hexdigest() == sha256:
         return p.read_bytes()
-    net.download(url, p, progress=progress, cancel=cancel)
-    data = p.read_bytes()
-    if hashlib.sha256(data).hexdigest() != sha256:
-        p.unlink(missing_ok=True)
-        raise SysFileError(f"{name}: the download doesn't match the known file - not using it")
-    return data
+    try:
+        net.download(url, p, sha256=sha256, progress=progress, cancel=cancel)
+    except net.ChecksumMismatch:
+        raise SysFileError(f"{name}: the download doesn't match the known file - not using it") from None
+    return p.read_bytes()
 
 
 # --------------------------------------------------------------------------- HackMii
@@ -69,6 +69,7 @@ HACKMII_META = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 def stage_hackmii(layout: DriveLayout, progress: ProgressFn | None = None,
                   cancel: CancelToken | None = None) -> Path:
     """Put the HackMii installer in apps/hackmii_installer/ (runs from the Homebrew Channel)."""
+    layout.require_root()              # before downloading: no point fetching for a missing drive
     data = _fetch_pinned(HACKMII_URL, HACKMII_SHA256, "hackmii_installer_v1.2.zip", progress, cancel)
     layout.require_root()
     dest = layout.app_dir("hackmii_installer")
@@ -84,6 +85,7 @@ def stage_hackmii(layout: DriveLayout, progress: ProgressFn | None = None,
 def stage_d2xl_mini(layout: DriveLayout, progress: ProgressFn | None = None,
                     cancel: CancelToken | None = None) -> Path:
     """Put the Wii mini d2xl cIOS installer in apps/ (from wii.hacks.guide)."""
+    layout.require_root()
     data = _fetch_pinned(D2XL_MINI_URL, D2XL_MINI_SHA256, "d2xl-cios-installer-mini.zip", progress, cancel)
     root = layout.require_root().resolve()
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
@@ -91,7 +93,7 @@ def stage_d2xl_mini(layout: DriveLayout, progress: ProgressFn | None = None,
             if info.is_dir():
                 continue
             target = (layout.root / info.filename).resolve()
-            if root not in target.parents or not info.filename.startswith("apps/"):
+            if root not in target.parents or not info.filename.startswith(APPS_DIR + "/"):
                 raise SysFileError("unexpected file in the d2xl zip")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(zf.read(info))
@@ -159,7 +161,7 @@ def _save_with_backup(p: Path, data: bytes) -> Optional[Path]:
     except OSError:
         pass
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".part")
+    tmp = part_path(p)
     bak: Optional[Path] = None
     try:
         tmp.write_bytes(data)
@@ -233,8 +235,9 @@ BOOTMII_KEYS = {
 }
 
 
-def read_bootmii_ini(sd_root: Path) -> dict[str, str]:
-    p = Path(sd_root) / "bootmii" / "bootmii.ini"
+def read_bootmii_ini(layout: DriveLayout | Path) -> dict[str, str]:
+    """BootMii's settings on an SD card (``layout``: the card, as a layout or its root)."""
+    p = DriveLayout.of(layout).bootmii_ini
     out: dict[str, str] = {}
     if p.is_file():
         for ln in p.read_text("latin-1").splitlines():
@@ -244,14 +247,14 @@ def read_bootmii_ini(sd_root: Path) -> dict[str, str]:
     return out
 
 
-def write_bootmii_ini(sd_root: Path, values: dict[str, str]) -> Path:
+def write_bootmii_ini(layout: DriveLayout | Path, values: dict[str, str]) -> Path:
     for k, v in values.items():
         if k not in BOOTMII_KEYS or v not in BOOTMII_KEYS[k]:
             raise SysFileError(f"invalid bootmii.ini setting {k}={v}")
-    folder = Path(sd_root) / "bootmii"
-    if not folder.is_dir():
+    layout = DriveLayout.of(layout)
+    if not layout.bootmii.is_dir():
         raise SysFileError("No bootmii folder on that card")
-    p = folder / "bootmii.ini"
+    p = layout.bootmii_ini
     lines = p.read_text("latin-1").splitlines() if p.is_file() else []
     done = set()
     for i, ln in enumerate(lines):

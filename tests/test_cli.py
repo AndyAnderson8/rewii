@@ -16,7 +16,7 @@ from rewii.core.config import Settings
 def _isolated(tmp_path, monkeypatch):
     s = Settings(library_dir=str(tmp_path / "lib"))
     monkeypatch.setattr(Settings, "load", classmethod(lambda cls, path=None: s))
-    monkeypatch.setattr(cli, "_titles", lambda settings: None)      # no GameTDB download
+    monkeypatch.setattr(cli, "_title_db", lambda settings: None)    # no GameTDB download
     monkeypatch.setattr("sys.stdin", io.StringIO(""))               # not a terminal
     return s
 
@@ -166,3 +166,46 @@ def test_app_drive_forms(capsys, tmp_path, monkeypatch):
         rc, _out, err = run(capsys, *argv)
         assert rc == 2 and err.startswith("error:"), argv
     assert len(opened) == 3
+
+
+def test_setup_command_uses_the_core_setup(drive, capsys, monkeypatch, _isolated):
+    from rewii.core import osc
+    calls = []
+
+    def fake_kit(layout, platform="", which="essential", progress=None, cancel=None, **k):
+        calls.append((layout.root, platform, which))
+        return osc.StarterKitReport(installed=["usbloader_gx"])
+    monkeypatch.setattr(osc, "install_starter_kit", fake_kit)
+    assert entry.main(["setup", "--drive", str(drive)]) == 2            # asks for -y, changes nothing
+    assert calls == [] and not (drive / "rewii").exists()
+    assert "usbloader_gx" in capsys.readouterr().out
+    _isolated.console_type = "vwii"
+    assert entry.main(["setup", "--drive", str(drive), "-y"]) == 0
+    out = capsys.readouterr().out
+    assert calls == [(drive, "vwii", "essential")] and "Installed: usbloader_gx" in out and "Next:" in out
+    assert (drive / "rewii" / "drive.json").is_file() and (drive / "apps").is_dir() and (drive / "wad").is_dir()
+    assert entry.main(["setup", "--drive", str(drive / "gone"), "-y"]) == 2
+
+
+def test_selftest_is_hidden_and_passes(capsys):
+    assert entry.main(["selftest"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("ok  ") == 4 and "FAIL" not in out and "selftest passed" in out
+    with pytest.raises(SystemExit):
+        entry.main(["--help"])
+    assert "selftest" not in capsys.readouterr().out
+
+
+def test_selftest_reports_a_missing_bundled_file(capsys, monkeypatch):
+    from rewii.core import selftest
+    monkeypatch.setattr(selftest, "BUNDLED_ASSETS", (*selftest.BUNDLED_ASSETS, "not_shipped.bin"))
+    assert entry.main(["selftest"]) == 1
+    cap = capsys.readouterr()
+    assert "FAIL  bundled files" in cap.out and "not_shipped.bin" in cap.out and "FAILED" in cap.err
+
+
+def test_version_comes_from_the_package_metadata():
+    import tomllib
+    import rewii
+    pyproject = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text("utf-8"))
+    assert rewii.__version__ == pyproject["project"]["version"]

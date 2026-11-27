@@ -11,10 +11,10 @@ from textual.widgets import Button, Input, Label, Select, Static, Switch
 
 from ...core.config import (CONSOLE_TYPES, COVER_LANGS, FORWARDER_STYLES, ONLINE_SERVERS, REGIONS,
                             check_library_path)
+from ...core.console import CONSOLE_CHOICE_LABELS
 from ..base import FAILED, Pane
 
-CONSOLE_LABELS = {"wii": "Wii (original)", "vwii": "Wii U (vWii)", "mini": "Wii mini",
-                  "family": "Wii Family Edition"}
+CONSOLE_LABELS = CONSOLE_CHOICE_LABELS
 
 
 class SettingsPane(Pane):
@@ -75,6 +75,13 @@ class SettingsPane(Pane):
                 yield Select([(r, r) for r in REGIONS],
                              value=s.console_region if s.console_region in REGIONS else Select.NULL,
                              prompt="Not set", id="region")
+            with Horizontal(classes="row"):
+                yield Label("Korean Wii, region changed")
+                yield Switch(s.korean_region_changed, id="korean")
+            yield Static("Turned on by a SysCheck report when a Wii made for Korea was changed to another "
+                         "region. While it is on, ReWii refuses Wii Menu updates and Wii Menu WADs (they "
+                         "would brick such a console: Error 003). Only turn it off if that is wrong.",
+                         classes="explain")
             with Horizontal(classes="toolbar"):
                 yield Button("Save", id="save", variant="primary")
                 yield Button("USB Loader GX settings on the drive…", id="gx")
@@ -91,6 +98,7 @@ class SettingsPane(Pane):
         s = self.settings
         self.query_one("#library", Input).value = s.library_dir
         self.query_one("#scrub", Switch).value = bool(s.scrub_games)
+        self.query_one("#korean", Switch).value = bool(s.korean_region_changed)
         fixed: list[tuple[str, str, tuple[str, ...]]] = [
             ("#style", s.forwarder_style, FORWARDER_STYLES), ("#online", s.online_server, ONLINE_SERVERS),
             ("#lang", s.cover_lang, COVER_LANGS)]
@@ -170,6 +178,7 @@ class SettingsPane(Pane):
         s.forwarder_style, s.online_server, s.cover_lang = style, online_server, lang
         s.scrub_games = self.query_one("#scrub", Switch).value
         s.console_type, s.console_region = ctype, region
+        s.korean_region_changed = self.query_one("#korean", Switch).value
         if not self.rapp.save_settings():
             return
         if str(lib) != old_lib:

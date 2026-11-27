@@ -20,7 +20,6 @@ import json
 import os
 import plistlib
 import re
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field, replace
@@ -323,14 +322,6 @@ def _plist(data: bytes | str | dict) -> dict:
     if isinstance(data, str):
         data = data.encode("utf-8")
     return plistlib.loads(data)
-
-
-def parse_diskutil_list(data: bytes | str | dict) -> list[str]:
-    """Return the whole-disk identifiers (``disk4``...) from ``diskutil list -plist``."""
-    doc = _plist(data)
-    if "WholeDisks" in doc:
-        return list(doc["WholeDisks"])
-    return [d["DeviceIdentifier"] for d in doc.get("AllDisksAndPartitions", [])]
 
 
 def parse_diskutil(list_data: bytes | str | dict,
@@ -735,7 +726,3 @@ def _drive_from_psutil(target: str) -> Optional[Drive]:
                  is_system=_norm(best.mountpoint) == sysroot, volumes=[vol],
                  partition_style="unknown")
 
-
-def has_tool(name: str) -> bool:
-    """True if an external command is on PATH."""
-    return shutil.which(name) is not None

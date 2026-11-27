@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from pathlib import Path
 from typing import Any
 from collections.abc import Callable
@@ -15,10 +14,13 @@ from textual.widgets import Button, DataTable, Label, Static
 from ...core import drives as DR
 from ...core import formatting as FM
 from ...core import health as H
-from ..base import FAILED, Pane, kit_lines
+from ...core.findings import Fix
+from ..base import FAILED, Pane, severity_icon
 from ..widgets import cursor_key, human_size
 
-SEV = {"error": "✖", "warn": "!", "info": "i"}
+#: Health fixes that aren't automatic: what the "Fix" column says (see ``action_fix``).
+FIX_LABELS = {Fix.FORMAT_DRIVE: "Prepare", Fix.INSTALL_STARTER_APPS: "Set up",
+              Fix.CONVERT_GAME: "Games → Add", Fix.IMPORT_WBFS: "Games → Import"}
 
 
 class DrivePane(Pane):
@@ -166,10 +168,8 @@ class DrivePane(Pane):
         if not fs and self.layout_:
             t.add_row("✔", "Everything looks good.", "", key="ok")
         for i, f in enumerate(fs):
-            fix = "auto" if f.auto_fixable else {"format_drive": "Prepare", "install_starter_apps": "Set up",
-                                                  "convert_game": "Games → Add", "import_wbfs": "Games → Import"
-                                                  }.get(f.fix_id or "", "")
-            t.add_row(SEV.get(f.severity, "?"), f.message, fix, key=str(i))
+            fix = "auto" if f.auto_fixable else FIX_LABELS.get(f.fix_id or "", "")  # type: ignore[call-overload]
+            t.add_row(severity_icon(f.severity), f.message, fix, key=str(i))
 
     def _sel_finding(self) -> H.Finding | None:
         i = self.cursor_index("#findings")
@@ -180,7 +180,7 @@ class DrivePane(Pane):
         f = self._sel_finding()
         if not f:
             return
-        if f.fix_id == "format_drive":
+        if f.fix_id == Fix.FORMAT_DRIVE:
             # the finding is about the drive in use - never about whatever row is highlighted
             d = self._current_listed()
             if d is None:
@@ -190,10 +190,10 @@ class DrivePane(Pane):
                 return
             self.action_format(d)
             return
-        if f.fix_id == "install_starter_apps":
+        if f.fix_id == Fix.INSTALL_STARTER_APPS:
             self.action_setup()
             return
-        if f.fix_id == "import_wbfs":
+        if f.fix_id == Fix.IMPORT_WBFS:
             self.rapp.action_section("games")
             return
         if not f.auto_fixable:
@@ -300,37 +300,17 @@ class DrivePane(Pane):
         lay = self.need_drive()
         if lay is None:
             return
-        from ...core import osc
+        from ...core import setup
         s = self.settings
-        plat = s.console_type
-        ess = osc.starter_kit(plat, "essential")
+        ess = setup.planned_apps(s)
         if not await self.confirm("Set up the drive",
                                   f"Creates the ReWii folders on {lay.root} and installs:\n  " +
                                   "\n  ".join(f"{x.slug} – {x.why}" for x in ess) +
                                   "\n\nand sets USB Loader GX's online server.", yes="Set up"):
             return
-
-        def run(progress: Any, cancel: Any) -> tuple[Any, str]:
-            lay.ensure_dirs()
-            lay.write_manifest({"created_by": "ReWii", "updated": time.strftime("%Y-%m-%d %H:%M")})
-            rep = osc.install_starter_kit(lay, plat, "essential", progress, cancel)
-            note = ""
-            try:
-                from ...core.online import set_loader_private_server
-                if lay.gx_config.parent.exists():
-                    set_loader_private_server(lay, s.online_server)
-            except Exception as e:  # noqa: BLE001 - reported, the apps are installed anyway
-                note = f"USB Loader GX's online server wasn't set: {self.explain(e)}"
-            return rep, note
-
-        res = await self.job("Setting up the drive", run, quiet=True)
+        res = await self.job("Setting up the drive", lambda p, c: setup.setup_drive(lay, s, p, c), quiet=True)
         if res is not FAILED:
-            rep, note = res
-            lines, bad = kit_lines(rep)
-            if note:
-                lines.append(note)
-            lines.append("Next: on the Wii, back up the NAND, install Priiloader and the cIOS "
-                         "(System & Guides).")
+            lines, bad = res.lines()
             await self.message("Drive set up" if not bad else "Drive set up - with problems",
                                "\n\n".join(lines), error=bad)
         self.reload()

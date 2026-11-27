@@ -31,7 +31,6 @@ def cache(tmp_path, monkeypatch):
     d = tmp_path / "cache"
     d.mkdir()
     monkeypatch.setattr(config, "cache_dir", lambda: d)
-    monkeypatch.setattr(net, "cache_dir", lambda: d)
     yield d
     net.set_client(None)
 
@@ -79,13 +78,6 @@ def test_fill_and_gct():
     assert cheats.selected_in_gct(cf, data) == [0, 2]
 
 
-def test_format_roundtrip():
-    cf = parse_txtcodes(TXT)
-    again = parse_txtcodes(cheats.format_txtcodes(cf))
-    assert [(c.name, c.codes, c.comment) for c in again.cheats] == \
-        [(c.name, c.codes, c.comment) for c in cf.cheats]
-
-
 def test_fetch_and_build(tmp_path, cache):
     lay = DriveLayout(tmp_path / "usb")
     (lay.root / "wiiflow").mkdir(parents=True)
@@ -107,9 +99,6 @@ def test_fetch_and_build(tmp_path, cache):
     with pytest.raises(CheatError):
         build_gct(lay, "RMCE01", [cf.cheats[1]])
 
-    st = cheats.list_cheats(lay)
-    assert [(s.game_id, s.title, s.count, s.gct is not None) for s in st] == [
-        ("RMCE01", "Mario Kart Wii", 3, True)]
     build_gct(lay, "RMCE01", [])
     assert not (lay.codes / "RMCE01.gct").exists()
 

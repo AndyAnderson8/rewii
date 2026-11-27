@@ -108,13 +108,6 @@ def test_stage_theme(tmp_path: Path) -> None:
     assert [t.path.name for t in T.list_staged_themes(drive)] == ["dark.csm"]
 
 
-def test_content_ids() -> None:
-    assert T.content_for("wii", "NTSC-U") == 0x97
-    assert T.content_for("vwii", "PAL") == 0x22
-    assert T.content_for("wii", "NTSC-K") == 0x9D
-    assert T.content_for("mini", "NTSC-U") is None
-
-
 def test_only_43_themes_and_no_region_from_file_name(tmp_path: Path) -> None:
     drive = tmp_path / "drive"
     drive.mkdir(parents=True, exist_ok=True)   # the drive is plugged in

@@ -26,7 +26,8 @@ from typing import Optional
 
 from .disc import open_disc, parse_fst, parse_header
 from .disc import DiscError
-from .forwarder import ChannelInfo, ForwarderError, _asset, add_argv, build_wad, save_channel
+from .layout import DriveLayout
+from .forwarder import ChannelInfo, ForwarderError, asset, add_argv, build_wad, save_channel
 
 NIN_MAGIC = 0x01070CF6
 NIN_CFG_VERSION = 0x0B                  # Nintendont v6.509+
@@ -61,7 +62,7 @@ def nintendont_version(dol: bytes) -> Optional[tuple[int, int]]:
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
-def get_nintendont_dol(drive_root: Path | None = None, allow_download: bool = True) -> bytes:
+def get_nintendont_dol(layout: DriveLayout | Path | None = None, allow_download: bool = True) -> bytes:
     """Nintendont's boot.dol: from the Open Shop Channel (cached), else the drive's copy."""
     candidates: list[bytes] = []
     if allow_download:
@@ -75,9 +76,8 @@ def get_nintendont_dol(drive_root: Path | None = None, allow_download: bool = Tr
                     candidates.append(zf.read(name))
         except Exception:
             pass
-    if drive_root is not None:
-        for folder in ("Nintendont", "nintendont"):
-            p = Path(drive_root) / "apps" / folder / "boot.dol"
+    if layout is not None:
+        for p in DriveLayout.of(layout).nintendont_dols:
             if p.is_file():
                 candidates.append(p.read_bytes())
                 break
@@ -300,7 +300,7 @@ def _image_on_black(rgba_img, w: int, h: int):
     canvas = Image.new("RGBA", (w, h), (0, 0, 0, 255))
     scale = min(w / rgba_img.width, h / rgba_img.height)
     img = rgba_img.resize((max(1, round(rgba_img.width * scale)), max(1, round(rgba_img.height * scale))),
-                          Image.LANCZOS)
+                          Image.Resampling.LANCZOS)
     canvas.alpha_composite(img.convert("RGBA"), ((w - img.width) // 2, (h - img.height) // 2))
     return canvas
 
@@ -311,7 +311,7 @@ def build_gc_banner(title: str, banner: GcBanner | None, *, publisher: str = "",
     template's own picture is kept."""
     from PIL import Image
 
-    tpl = bytearray(_asset("gc_banner_template.bnr"))
+    tpl = bytearray(asset("gc_banner_template.bnr"))
     i = tpl.find(b"IMET")
     if i != 0x80:
         raise ForwarderError("banner template is not a channel banner")
@@ -363,14 +363,18 @@ def build_gc_banner(title: str, banner: GcBanner | None, *, publisher: str = "",
 
 
 # --------------------------------------------------------------------------- WAD
-def make_gc_channel(game_path: Path, drive_root: Path, out_dir: Path, *, title: str | None = None,
+def make_gc_channel(game_path: Path, layout: DriveLayout | Path, out_dir: Path, *, title: str | None = None,
                     publisher: str = "", year: str = "", synopsis: str = "",
-                    nintendont: bytes | None = None) -> ChannelInfo:
+                    nintendont: bytes, cert_chain: bytes) -> ChannelInfo:
     """Build a channel for a GameCube game that is already on the drive at ``game_path``.
+
+    ``nintendont`` is Nintendont's boot.dol (:func:`get_nintendont_dol`) and
+    ``cert_chain`` Nintendo's certificate chain; nothing here touches the network.
 
     The banner comes from ReWii's template, not from the game, so the banner-brick
     list for Wii channels does not apply here."""
-    game_path, drive_root = Path(game_path), Path(drive_root)
+    layout = DriveLayout.of(layout)
+    game_path, drive_root = Path(game_path), layout.root
     try:
         with open_disc(game_path) as d:
             gid, disc_title, plat, disc_no, _v = parse_header(d.read(0, 0x60))
@@ -391,14 +395,13 @@ def make_gc_channel(game_path: Path, drive_root: Path, out_dir: Path, *, title: 
     if not synopsis and gb:
         synopsis = gb.description
     base_cfg = None
-    p = drive_root / "nincfg.bin"
+    p = layout.nintendont_cfg
     if p.is_file():
         base_cfg = p.read_bytes()
-    nin = nintendont or get_nintendont_dol(drive_root)
-    gct = drive_root / "codes" / f"{gid}.gct"
-    dol = build_gc_dol(nin, rel, gid, base_cfg, f"/codes/{gid}.gct" if gct.is_file() else None)
+    gct = layout.codes / f"{gid}.gct"
+    dol = build_gc_dol(nintendont, rel, gid, base_cfg, f"/{layout.codes.name}/{gid}.gct" if gct.is_file() else None)
     banner = build_gc_banner(title, gb, publisher=publisher, year=year, game_id=gid, synopsis=synopsis)
     chan = gc_channel_id(gid)
-    wad = build_wad(banner, dol, gid, channel_id=chan, ios=IOS58, access_rights=TMD_ACCESS_AHB_DVD)
+    wad = build_wad(banner, dol, gid, cert_chain=cert_chain, channel_id=chan, ios=IOS58, access_rights=TMD_ACCESS_AHB_DVD)
     out = save_channel(wad, out_dir, title, chan, gid)
     return ChannelInfo(gid, title, chan, "gamecube", out, len(wad))

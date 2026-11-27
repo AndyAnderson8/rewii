@@ -24,6 +24,8 @@ from rewii.core.config import Settings
 from rewii.core.layout import DriveLayout
 from rewii.core.progress import Cancelled, CancelToken
 
+CERTS = bytes(2560)       # a stand-in certificate chain (the builders only embed it)
+
 
 @pytest.fixture(autouse=True)
 def private_cache(tmp_path, monkeypatch):
@@ -54,7 +56,7 @@ def settings(tmp_path):
 
 @pytest.fixture
 def certs(monkeypatch):
-    monkeypatch.setattr(F, "cert_chain", lambda: bytes(2560))
+    monkeypatch.setattr("rewii.core.nus.cert_chain", lambda: CERTS)
 
 
 def big_wii(path, mb: int = 9):
@@ -239,7 +241,7 @@ def test_ticket_always_uses_the_standard_common_key(certs):
             for chan, kw in ((F.channel_id_for(gid), {}),
                              (GC.gc_channel_id(gid), dict(channel_id=GC.gc_channel_id(gid), ios=GC.IOS58,
                                                          access_rights=GC.TMD_ACCESS_AHB_DVD))):
-                r = F.unpack_wad(F.build_wad(banner, dol, gid, **kw))
+                r = F.verify_unpack(F.build_wad(banner, dol, gid, cert_chain=CERTS, **kw))
                 assert r["key_index"] == 0, gid
                 assert r["hashes_ok"] and r["fakesigned"] and r["title_id"] == chan
                 assert r["contents"][0] == banner and r["contents"][1] == dol
@@ -249,18 +251,18 @@ def test_ticket_always_uses_the_standard_common_key(certs):
 
 def test_channel_builds_for_ids_that_used_to_fail(tmp_path, certs):
     for gid in ("RAAE01", "RADE01"):                                      # old key index came out 1 and 2
-        ci = F.make_channel(make_wii_iso(tmp_path / f"{gid}.iso", game_id=gid), tmp_path / "out", style="classic")
+        ci = F.make_channel(make_wii_iso(tmp_path / f"{gid}.iso", game_id=gid), tmp_path / "out", style="classic", cert_chain=CERTS)
         assert F.verify_wad(ci.path) == (True, "ok") and F.channel_game_id(ci.path) == gid
     assert not list((tmp_path / "out").glob("*.rewii-part"))
 
 
 def test_unpack_wad_key_index_handling(certs):
-    wad = bytearray(F.build_wad(fakedisc.imet_banner(), b"DOL" * 100, "RTST01"))
+    wad = bytearray(F.build_wad(fakedisc.imet_banner(), b"DOL" * 100, "RTST01", cert_chain=CERTS))
     tik = 0x40 + 2560
     wad[tik + F.TIK_KEY_INDEX] = 29                                       # CRAP-style junk: normal key
-    assert F.unpack_wad(bytes(wad))["hashes_ok"]
+    assert F.verify_unpack(bytes(wad))["hashes_ok"]
     wad[tik + F.TIK_KEY_INDEX] = 1                                        # Korean key: contents don't decrypt
-    assert not F.unpack_wad(bytes(wad))["hashes_ok"]
+    assert not F.verify_unpack(bytes(wad))["hashes_ok"]
 
 
 # ------------------------------------------------------------------ #4 game ID validation
@@ -291,7 +293,7 @@ def test_channel_refuses_invalid_game_id(tmp_path, certs):
     with open(iso, "r+b") as f:
         f.write(b"../../")
     with pytest.raises(F.ForwarderError):
-        F.make_channel(iso, tmp_path / "out")
+        F.make_channel(iso, tmp_path / "out", cert_chain=CERTS)
     assert not (tmp_path / "out").exists() or not list((tmp_path / "out").iterdir())
 
 
@@ -381,18 +383,21 @@ def test_staging_files_are_hidden_and_stale_ones_removed(wii, lay):
     os.utime(stale, (old, old))
     os.utime(stale_part, (old, old))
     assert [x.game_id for x in G.scan_drive(lay)] == [g.game_id]
+    assert fresh.exists() and stale.exists() and stale_part.exists()     # listing games deletes nothing
+    assert sorted(G.purge_stale_temp(layout=lay)) == sorted([stale, stale_part])
     assert fresh.exists() and not stale.exists() and not stale_part.exists()
+    assert G.purge_stale_temp(layout=lay) == [] and [x.game_id for x in G.scan_drive(lay)] == [g.game_id]
     assert G.normalize_drive(lay) == [] and fresh.exists()               # never "fixed" into place
 
 
 def test_failed_install_leaves_no_staging_files(wii, lay, tmp_path, monkeypatch):
     def boom(*a, **k):
         raise OSError("drive unplugged")
-    monkeypatch.setattr(G, "_replace_files", boom)
-    with pytest.raises(OSError):
-        G.install_game(lay, wii)
+    with monkeypatch.context() as m:        # only this patch is undone, not the fixtures' isolation
+        m.setattr(G, "_replace_files", boom)
+        with pytest.raises(OSError):
+            G.install_game(lay, wii)
     assert [p for p in lay.wbfs.rglob("*") if p.is_file()] == []
-    monkeypatch.undo()
     gc = make_gc_iso(tmp_path / "gc.iso")
     tok = CancelToken()
     with pytest.raises(Cancelled):
@@ -473,7 +478,8 @@ def test_work_folder_is_cleaned_after_a_failure_and_stale_jobs_are_purged(tmp_pa
     monkeypatch.setattr(convert, "to_iso", failing)
     with pytest.raises(G.GameError, match="converter failed"):
         G.install_game(lay, rvz)
-    assert list(work.iterdir()) == []
+    assert list(work.iterdir()) == [stale]             # the failed job's folder is gone; the old one waits
+    assert G.purge_stale_temp() == [stale] and list(work.iterdir()) == []
 
 
 # ------------------------------------------------------------------ #8 redump DAT is optional
@@ -494,7 +500,7 @@ def test_broken_dat_does_not_fail_a_join(tmp_path):
     assert res.ok and (tmp_path / "o.iso").read_bytes() == data
     assert not res.dat_checked and res.dat_error
     (tmp_path / "wii.dat").write_text('<datafile><game name="G"><rom name="r" size="lots" md5="00"/></game></datafile>')
-    res = C.verify_dump(C.find_dumps(tmp_path)[0])
+    res = C.join_dump(C.find_dumps(tmp_path)[0], tmp_path / "o2.iso")
     assert res.ok and res.dat_checked and res.redump_name is None
 
 

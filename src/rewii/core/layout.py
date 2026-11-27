@@ -10,28 +10,47 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .fileops import require_drive
+from .fileops import is_reserved_name, require_drive, write_atomic
+from .ids import id_in_brackets
 
 _BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
-def safe_name(title: str, maxlen: int = 64) -> str:
-    """Make a title safe for FAT32 folder names on every OS."""
+def safe_name(title: str, maxlen: int = 64, default: str = "Game") -> str:
+    """Make a title safe as a FAT32 file/folder name on every OS: no reserved
+    characters, no trailing dot or space, and never a Windows device name
+    (``CON``, ``NUL``, ``COM1``... get a leading underscore)."""
     t = _BAD.sub("", title).strip().rstrip(".")
     t = re.sub(r"\s+", " ", t)
-    return (t[:maxlen].rstrip() or "Game")
+    t = t[:maxlen].rstrip(" .") or default
+    return "_" + t if is_reserved_name(t) else t
 
 
 def game_folder_name(title: str, game_id: str) -> str:
     return f"{safe_name(title)} [{game_id}]"
 
 
-_ID_IN_NAME = re.compile(r"\[([A-Za-z0-9]{6})\]")
-
-
 def id_from_folder(name: str) -> str | None:
-    m = _ID_IN_NAME.search(name)
-    return m.group(1) if m else None
+    """The disc ID in a ``Title [GAMEID]`` folder name (see :mod:`rewii.core.ids`)."""
+    return id_in_brackets(name)
+
+
+# Top-level folder names on the drive. Code outside this module uses the DriveLayout
+# properties (or these names, for paths inside archives) - never its own string literals.
+APPS_DIR = "apps"
+WBFS_DIR = "wbfs"                 # Wii games
+GC_GAMES_DIR = "games"            # GameCube games (Nintendont)
+WAD_DIR = "wad"
+REWII_DIR = "rewii"               # ReWii's own records
+THEMES_DIR = "themes"
+BOOTMII_DIR = "bootmii"
+RIIVOLUTION_DIR = "riivolution"
+#: The folders that hold games (what "back up without games" leaves out).
+GAME_DIR_NAMES = (WBFS_DIR, GC_GAMES_DIR)
+#: Every top-level folder ReWii (or the apps it sets up) writes to.
+MANAGED_TOPS = frozenset({APPS_DIR, WBFS_DIR, GC_GAMES_DIR, WAD_DIR, "txtcodes", "codes", "savegames",
+                          "saves", "private", RIIVOLUTION_DIR, REWII_DIR, BOOTMII_DIR, "controllers",
+                          "wiiflow"})
 
 
 @dataclass
@@ -41,10 +60,21 @@ class DriveLayout:
     def __post_init__(self) -> None:
         self.root = Path(self.root)
 
+    @classmethod
+    def of(cls, drive: DriveLayout | Path | str) -> DriveLayout:
+        """``drive`` as a DriveLayout: core functions take a layout, and accept the
+        drive's root folder in its place."""
+        return drive if isinstance(drive, DriveLayout) else cls(Path(drive))
+
     # homebrew
     @property
     def apps(self) -> Path:
-        return self.root / "apps"
+        return self.root / APPS_DIR
+
+    @property
+    def nintendont_dols(self) -> tuple[Path, ...]:
+        """Where Nintendont's boot.dol may be (its folder is spelled both ways)."""
+        return (self.apps / "Nintendont" / "boot.dol", self.apps / "nintendont" / "boot.dol")
 
     def app_dir(self, name: str) -> Path:
         return self.apps / name
@@ -52,11 +82,11 @@ class DriveLayout:
     # games
     @property
     def wbfs(self) -> Path:
-        return self.root / "wbfs"
+        return self.root / WBFS_DIR
 
     @property
     def gc_games(self) -> Path:
-        return self.root / "games"
+        return self.root / GC_GAMES_DIR
 
     def wii_game_dir(self, title: str, game_id: str) -> Path:
         return self.wbfs / game_folder_name(title, game_id)
@@ -99,6 +129,29 @@ class DriveLayout:
     def wiiflow(self) -> Path:
         return self.root / "wiiflow"
 
+    @property
+    def has_wiiflow(self) -> bool:
+        """True if WiiFlow is set up on this drive - then its copies of covers,
+        cheats and banners are written too."""
+        return self.wiiflow.is_dir()
+
+    @property
+    def wiiflow_codes(self) -> Path:          # cheat lists (<ID>.txt)
+        return self.wiiflow / "codes"
+
+    @property
+    def wiiflow_gct(self) -> Path:            # compiled cheats (<ID>.gct)
+        return self.wiiflow_codes / "gct"
+
+    @property
+    def wiiflow_covers(self) -> Path:         # flat front covers
+        return self.wiiflow / "covers"
+
+    @property
+    def wiiflow_boxcovers(self) -> Path:      # full covers
+        return self.wiiflow / "boxcovers"
+
+
     # cheats
     @property
     def txtcodes(self) -> Path:
@@ -128,7 +181,7 @@ class DriveLayout:
     # system
     @property
     def wad(self) -> Path:            # YAWMME opens this folder automatically
-        return self.root / "wad"
+        return self.root / WAD_DIR
 
     @property
     def nintendont_cfg(self) -> Path:
@@ -136,35 +189,32 @@ class DriveLayout:
 
     @property
     def riivolution(self) -> Path:
-        return self.root / "riivolution"
+        return self.root / RIIVOLUTION_DIR
 
     @property
     def themes(self) -> Path:         # csm-installer
-        return self.root / "themes"
+        return self.root / THEMES_DIR
 
     @property
     def bootmii(self) -> Path:
-        return self.root / "bootmii"
+        return self.root / BOOTMII_DIR
+
+    @property
+    def bootmii_ini(self) -> Path:
+        return self.bootmii / "bootmii.ini"
 
     @property
     def nand_dumps(self) -> Path:     # nanddumper@ios output
         return self.root / "wii" / "backups"
 
-    @property
-    def syscheck_csv(self) -> Path:
-        return self.root / "syscheck.csv"
-
     # ReWii's own folder on the drive
     @property
     def rewii(self) -> Path:
-        return self.root / "rewii"
+        return self.root / REWII_DIR
 
     @property
     def manifest(self) -> Path:
         return self.rewii / "drive.json"
-
-    def is_rewii_drive(self) -> bool:
-        return self.manifest.exists()
 
     def read_manifest(self) -> dict:
         try:
@@ -188,13 +238,7 @@ class DriveLayout:
         self.rewii.mkdir(parents=True, exist_ok=True)
         cur = self.read_manifest()
         cur.update(data)
-        tmp = self.manifest.with_name(self.manifest.name + ".part")
-        try:
-            tmp.write_text(json.dumps(cur, indent=2), "utf-8")
-            tmp.replace(self.manifest)
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            raise
+        write_atomic(self.manifest, json.dumps(cur, indent=2))
 
     def ensure_dirs(self) -> None:
         self.require_root()

@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import BinaryIO, Optional
 
 from Crypto.Cipher import AES
+from .errors import ReWiiError
+from .ids import is_disc_id
 
 WII_MAGIC = 0x5D1C9EA3
 GC_MAGIC = 0xC2339F3D
@@ -32,6 +34,15 @@ FAT32_SPLIT = 4 * 1024 ** 3 - 32 * 1024     # 0xFFFF8000, standard split size
 #: and the file extensions they usually have. The one place these are defined.
 NEEDS_CONVERSION = frozenset({"RVZ", "WIA", "GCZ", "NKIT", "WDF"})
 NEEDS_CONVERSION_EXTS = frozenset({".rvz", ".wia", ".gcz", ".wdf"})   # NKit files are ".nkit.iso"
+#: File extensions of game images - the one place they are defined.
+WII_DRIVE_EXTS = frozenset({".wbfs", ".iso", ".ciso"})      # what loaders read from wbfs/
+GC_DRIVE_EXTS = frozenset({".iso", ".gcm", ".ciso"})        # what Nintendont reads from games/
+#: Everything a game image in the PC library may be called (Wii and GameCube).
+LIBRARY_EXTS = WII_DRIVE_EXTS | GC_DRIVE_EXTS | NEEDS_CONVERSION_EXTS
+#: What the "add games" file picker offers (".nkit" for files named like "x.nkit").
+PICKABLE_EXTS = LIBRARY_EXTS | {".nkit"}
+#: One part of a CleanRip dump split for FAT32: ``<base>.part<n>.iso`` (n counts from 0).
+CLEANRIP_PART_RE = re.compile(r"^(?P<base>.+)\.part(?P<n>\d+)\.iso$", re.IGNORECASE)
 VALID_DISC_SIZES = (GC_DISC_SIZE, WII_SL_SIZE, WII_DL_SIZE)
 
 MAX_TMD_SIZE = 1024 * 1024
@@ -39,7 +50,6 @@ MAX_FST_SIZE = 64 * 1024 * 1024
 MAX_FST_ENTRIES = 0x80000
 MAX_DISC_FILE_READ = 64 * 1024 * 1024
 _BAD_DATA = (struct.error, ValueError, OverflowError, ZeroDivisionError, IndexError, MemoryError)
-_GAME_ID = re.compile(rb"[A-Za-z0-9]{6}")    # a few unlicensed discs use lowercase
 
 REGION_BY_CHAR = {
     "E": "NTSC-U", "N": "NTSC-U",
@@ -50,7 +60,7 @@ REGION_BY_CHAR = {
 }
 
 
-class DiscError(Exception):
+class DiscError(ReWiiError):
     pass
 
 
@@ -150,6 +160,12 @@ class _MultiFile:
                 f.close()
             except OSError:
                 pass
+
+
+def cleanrip_part(name: str) -> int | None:
+    """The part number if ``name`` is a CleanRip split part (``game.part1.iso`` -> 1), else None."""
+    m = CLEANRIP_PART_RE.match(name)
+    return int(m.group("n")) if m else None
 
 
 def split_parts(path: Path) -> list[Path]:
@@ -417,7 +433,7 @@ def parse_header(hdr: bytes) -> tuple[str, str, str, int, int]:
         platform = "gc"
     else:
         raise DiscError("disc header has no Wii/GameCube magic")
-    if not _GAME_ID.fullmatch(hdr[:6]):
+    if not is_disc_id(hdr[:6]):
         raise DiscError("disc header has an invalid game ID")
     game_id = hdr[:6].decode("ascii")
     title = hdr[0x20:0x60].split(b"\0")[0].decode("utf-8", "replace").strip()

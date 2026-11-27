@@ -10,7 +10,7 @@ from ...core import wad as W
 from ...core.config import Settings
 from ...core.fileops import explain_os_error
 from ...core.layout import DriveLayout
-from ...core.progress import Cancelled, Reporter
+from ...core.progress import Cancelled, ProgressEvent, Reporter, UNIT_STEPS
 
 
 def collision_warning(selected: Sequence[G.Game], others: Iterable[G.Game] = ()) -> str:
@@ -18,12 +18,8 @@ def collision_warning(selected: Sequence[G.Game], others: Iterable[G.Game] = ())
     would replace the first on the Wii Menu), or "" when there is no clash.
 
     ``selected`` are the games a channel is being made for; ``others`` are games
-    that may already have one. Uses ``core.channels.channel_id_collisions`` when
-    the core provides it.
+    that may already have one (see ``core.channels.channel_id_collisions``).
     """
-    fn = getattr(CH, "channel_id_collisions", None)
-    if fn is None:
-        return ""
     names: dict[str, str] = {}
     platforms: dict[str, str] = {}
     for g in [*others, *selected]:
@@ -31,7 +27,7 @@ def collision_warning(selected: Sequence[G.Game], others: Iterable[G.Game] = ())
         platforms[g.game_id] = g.platform
     mine = {g.game_id for g in selected}
     try:
-        clashes: dict[str, list[str]] = fn(list(platforms.items()))
+        clashes = CH.channel_id_collisions(list(platforms.items()))
     except Exception:  # noqa: BLE001 - a warning must never block the action
         return ""
     lines = []
@@ -50,14 +46,18 @@ def build_channels(games: Sequence[G.Game], settings: Settings, layout: Optional
                    progress: Any, cancel: Any) -> tuple[list[Any], list[str]]:
     """Build a channel WAD per game (and copy it to the drive's wad/ folder when
     ``stage``). Returns ``(channels, errors)``; one failing game doesn't stop the rest."""
-    rep = Reporter(progress, cancel, total=len(games))
+    rep = Reporter(progress, cancel, total=len(games), unit=UNIT_STEPS)
     out: list[Any] = []
     errs: list[str] = []
+    def step_notes(title: str) -> Callable[[ProgressEvent], None]:
+        """Show build_channel's steps ("Getting the cover art"...) under the game's name."""
+        return lambda ev: rep.note(f"{title}: {ev.message}")
+
     for g in games:
         rep.note(f"Building channel for {g.title}")
         try:
-            ci = CH.build_channel(g.path, settings, drive_root=layout.root if layout else None,
-                                  title=g.title, info=info(g.game_id))
+            ci = CH.build_channel(g.path, settings, layout=layout,
+                                  title=g.title, info=info(g.game_id), progress=step_notes(g.title))
             if stage and layout is not None:
                 W.stage_wads(layout, [ci.path], settings=settings)
             out.append(ci)

@@ -69,7 +69,7 @@ VWII = Settings(console_type="vwii", console_region="PAL")
 def test_download_title_wad(fake, tmp_path):
     fake.add(ios(38, 4123))
     events = []
-    p = nus.download_title_wad("0000000100000026", 4123, tmp_path / "a.wad", progress=events.append)
+    p = nus.download_title_wad("0000000100000026", 4123, tmp_path / "a.wad", progress=events.append, settings=WII)
     info = inspect_wad(p)
     assert info.title_id == "0000000100000026" and info.version == 4123 and info.hashes_ok
     assert all(r.headers["user-agent"] == nus.NUS_USER_AGENT for r in fake.requests)
@@ -83,7 +83,7 @@ def test_bad_content_hash(fake, tmp_path):
     key = next(k for k in fake.files if k.endswith("/00000001"))
     fake.files[key] = bytes(len(fake.files[key]))
     with pytest.raises(nus.NusError):
-        nus.download_title_wad("0000000100000026", 4123, tmp_path / "a.wad")
+        nus.download_title_wad("0000000100000026", 4123, tmp_path / "a.wad", settings=WII)
     assert not (tmp_path / "a.wad").exists()
 
 
@@ -107,6 +107,27 @@ def test_cert_chain_layout():
     raw_tmd = t.tmd.dump() + CP + CA
     cetk = t.ticket.dump() + XS + CA
     assert nus.build_cert_chain(raw_tmd, cetk) == CA + CP + XS
+
+
+def test_cert_chain_is_fetched_through_net_once_and_cached(fake):
+    """The chain every new channel embeds comes from NUS via rewii.core.net (mockable,
+    cancellable) - not through libWiiPy's own requests calls - and is cached."""
+    from rewii.core import config
+    from rewii.core.channels import fetch_cert_chain
+    from rewii.core.forwarder import ForwarderError
+    with pytest.raises(ForwarderError, match="internet"):       # nothing cached, server has nothing
+        fetch_cert_chain()
+    sm = make_title("0000000100000002", version=513, ios=80, region=1, name=None, fakesign=False)
+    fake.add(sm)
+    chain = nus.cert_chain()
+    assert chain == CA + CP + XS and len(chain) == nus.CERT_CHAIN_SIZE
+    cache = config.cache_dir() / nus.CERT_CHAIN_CACHE
+    assert cache.read_bytes() == chain and not list(cache.parent.glob("*part*"))
+    n = len(fake.requests)
+    assert {r.url.path.rsplit("/", 1)[1] for r in fake.requests[-2:]} == {"tmd.513", "cetk"}
+    assert nus.cert_chain() == chain and fetch_cert_chain() == chain and len(fake.requests) == n
+    cache.write_bytes(b"cut off")                               # a damaged cache is replaced
+    assert nus.cert_chain() == chain and cache.read_bytes() == chain
 
 
 def test_rekey_for_wii(fake):
@@ -193,20 +214,6 @@ def test_wrong_region_menu_never_written(fake, tmp_path, monkeypatch):
     assert not (tmp_path / "sm.wad").exists()
 
 
-def test_theme_base(fake, tmp_path):
-    menu = make_title("0000000100000002", version=609, ios=80, region=0, name=None, vwii=1,
-                      contents=[b"a" * 50] * 0x1F + [b"THEME" * 1000], fakesign=False)
-    # give content index 0x1F the id 0x1F (make_title uses cid == index)
-    fake.add(menu)
-    p = nus.download_theme_base(Settings(console_type="vwii", console_region="NTSC-U"), tmp_path / "themes")
-    assert p.name == "0000001F.app" and p.read_bytes() == b"THEME" * 1000
-    with pytest.raises(Refused):
-        nus.theme_base(Settings(console_type="vwii", console_region="NTSC-K"))
-    with pytest.raises(Refused):
-        nus.theme_base(Settings(console_type="mini", console_region="PAL"))
-    assert nus.theme_base(Settings(console_type="wii", console_region="PAL")).filename == "0000009A.app"
-
-
 # --------------------------------------------------------------------------- substitution / verification
 def test_other_title_served_is_rejected(fake, tmp_path):
     """A (genuinely signed) different title answering the request must never be
@@ -223,7 +230,7 @@ def test_other_version_served_is_rejected(fake, tmp_path):
     fake.add(t)
     fake.files["0000000100000026/tmd.4123"] = fake.files["0000000100000026/tmd.3867"]
     with pytest.raises(nus.NusError, match="v3867"):
-        nus.download_title_wad("0000000100000026", 4123, tmp_path / "a.wad")
+        nus.download_title_wad("0000000100000026", 4123, tmp_path / "a.wad", settings=WII)
     assert not list(tmp_path.iterdir())
 
 
@@ -255,33 +262,11 @@ def test_content_size_must_match_tmd(fake, tmp_path):
     key = next(k for k in fake.files if k.endswith("/00000001"))
     fake.files[key] = fake.files[key] + bytes(1024 * 1024)      # endless/oversized body
     with pytest.raises(nus.NusError):
-        nus.download_title_wad("0000000100000026", 4123, tmp_path / "a.wad")
+        nus.download_title_wad("0000000100000026", 4123, tmp_path / "a.wad", settings=WII)
     fake.files[key] = fake.files[key][:16]                      # truncated
     with pytest.raises(nus.NusError, match="size"):
-        nus.download_title_wad("0000000100000026", 4123, tmp_path / "a.wad")
+        nus.download_title_wad("0000000100000026", 4123, tmp_path / "a.wad", settings=WII)
     assert not list(tmp_path.iterdir())
-
-
-def test_theme_base_requires_signature_and_right_title(fake, monkeypatch, tmp_path):
-    us = Settings(console_type="wii", console_region="NTSC-U")
-    menu = make_title("0000000100000002", version=513, ios=80, region=1, name=None,
-                      contents=[b"a" * 50] * 0x97 + [b"THEME" * 1000], fakesign=False)
-    fake.add(menu)
-    assert nus.download_theme_base(us, tmp_path / "ok").read_bytes() == b"THEME" * 1000
-    # unsigned TMD/ticket: nothing may be written
-    monkeypatch.setattr(Title, "get_is_signed", lambda self: False)
-    with pytest.raises(nus.NusError, match="signature"):
-        nus.download_theme_base(us, tmp_path / "themes")
-    assert not (tmp_path / "themes").exists()
-    monkeypatch.setattr(Title, "get_is_signed", lambda self: True)
-    # another title answering for the Wii Menu
-    other = make_title("0001000148414441", version=513, name=None, fakesign=False,
-                       contents=[b"a" * 50] * 0x97 + [b"EVIL!" * 1000])
-    fake.files = {}
-    fake.add(other, path="0000000100000002")
-    with pytest.raises(nus.NusError, match="not genuine"):
-        nus.download_theme_base(us, tmp_path / "themes")
-    assert not (tmp_path / "themes").exists()
 
 
 def test_existing_modified_wad_is_downloaded_again(fake, tmp_path, monkeypatch):

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Optional
 
+from . import fileops
 from .disc import (FAT32_SPLIT, WII_DL_SECTORS, WII_SECTOR, DiscError, DiscReader,
                    WbfsFileReader, incomplete_reason, parse_header, used_sectors, wii_usage_table)
 from .progress import CancelToken, ProgressFn, Reporter
@@ -90,15 +91,8 @@ class SplitWriter:
     def abort(self) -> None:
         """Close without syncing and delete everything written (never raises)."""
         self.close(sync=False)
-        _cleanup(self.paths)
+        fileops.remove_quietly(self.paths)
 
-
-def _cleanup(paths: list[Path]) -> None:
-    for p in paths:
-        try:
-            p.unlink()
-        except OSError:
-            pass
 
 
 def write_wbfs(d: DiscReader, dest: Path, *, scrub: bool = True, include_update: bool = False,
@@ -192,27 +186,7 @@ def copy_file(src: Path, dest: Path, progress: ProgressFn | None = None,
     rep = rep or Reporter(progress, cancel, total=size)
     if rep.total == 0:
         rep.set_total(size, f"Copying {src.name}")
-    fo = None
-    try:
-        with open(src, "rb") as fi:
-            fo = open(dest, "wb")
-            while True:
-                b = fi.read(COPY_CHUNK)
-                if not b:
-                    break
-                fo.write(b)
-                rep.advance(len(b))
-            fo.flush()
-            os.fsync(fo.fileno())
-            fo.close()
-    except BaseException:
-        if fo is not None:
-            try:
-                fo.close()
-            except OSError:
-                pass
-        _cleanup([dest])
-        raise
+    fileops.copy_into(src, dest, rep, fsync=True)
 
 
 # --------------------------------------------------------------------------- legacy partitions

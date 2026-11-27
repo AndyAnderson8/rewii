@@ -229,8 +229,8 @@ def test_rescue_kit_skips_identical_files_and_checks_free_space(tmp_path: Path, 
     sd.mkdir()
     N.build_rescue_kit(a, sd, bootmii_dir=bm)
     copied: list[str] = []
-    real = N._copy
-    monkeypatch.setattr(N, "_copy", lambda s, d, r: (copied.append(d.name), real(s, d, r))[1])
+    real = N.copy_atomic
+    monkeypatch.setattr(N, "copy_atomic", lambda s, d, r, **k: (copied.append(d.name), real(s, d, r, **k))[1])
     kit = N.build_rescue_kit(a, sd, bootmii_dir=bm)
     assert copied == [] and (sd / "nand.bin") in kit.files   # all identical: nothing rewritten
     (sd / "keys.bin").write_bytes(b"\0" * 1024)

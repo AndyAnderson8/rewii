@@ -18,7 +18,7 @@ from . import __version__
 from .core.config import Settings
 from .core.fileops import copy_atomic
 from .core.layout import DriveLayout
-from .core.progress import ProgressEvent
+from .core.progress import Cancelled, ProgressEvent
 
 
 class _Bar:
@@ -50,8 +50,10 @@ class CliError(Exception):
 
 def is_user_error(e: BaseException) -> bool:
     """Errors that describe the user's files/drive rather than a bug: anything the OS
-    refuses (missing file, no permission, disk full) and every error type the core defines."""
-    return isinstance(e, OSError) or type(e).__module__.startswith("rewii.core.")
+    refuses (missing file, no permission, disk full) and every :class:`ReWiiError`.
+    (A cancelled operation is neither: :func:`main` reports it as ``Cancelled.``)"""
+    from .core.errors import ReWiiError
+    return isinstance(e, (OSError, ReWiiError))
 
 
 def _say(e: BaseException, drive: Any = None) -> str:
@@ -85,11 +87,19 @@ def _drive(args: Any) -> DriveLayout:
     return _drive_at(d)
 
 
-def _titles(settings: Settings) -> Optional[Callable[[str], Optional[str]]]:
+def _title_db(settings: Settings) -> Any:
+    """The GameTDB title database (may download it once), or None when it isn't available.
+    The one place the CLI loads it."""
     try:
         from .core.gametdb import TitleDB
-        db = TitleDB.load(settings)
+        return TitleDB.load(settings)
     except Exception:  # noqa: BLE001 - titles then come from the discs
+        return None
+
+
+def _titles(settings: Settings) -> Optional[Callable[[str], Optional[str]]]:
+    db = _title_db(settings)
+    if db is None:
         return None
 
     def look(gid: str) -> Optional[str]:
@@ -202,37 +212,27 @@ def cmd_channel(a: Any) -> int:
     s = Settings.load()
     if a.style:
         s.forwarder_style = a.style
-    drive_root = _drive_at(a.drive).root if a.drive else None
+    drive = _drive_at(a.drive) if a.drive else None
+    drive_root = drive.root if drive else None
     out = Path(a.out).expanduser() if a.out else None
-    info_db = None
-    try:
-        from .core.gametdb import TitleDB
-        info_db = TitleDB.load(s)
-    except Exception:  # noqa: BLE001 - titles then come from the discs
-        pass
+    info_db = _title_db(s)
     rc = 0
     for p in a.files:
         try:
             from .core.disc import disc_info
             gid = disc_info(p).game_id
             info = info_db.get(gid) if info_db else None
-            if a.wbfs_partition:
-                from .core.forwarder import cover_for_channel, make_channel
-                cov = cover_for_channel(gid, s.cover_lang) if s.forwarder_style == "cover" else None
-                ci = make_channel(Path(p), out or s.channels_dir, style=s.forwarder_style,
-                                  cover_png=cov, fat=False, title=info.title if info else None)
-            else:
-                ci = build_channel(Path(p), s, drive_root=drive_root,
-                                   title=info.title if info else None, info=info)
-                if out is not None:
-                    out.mkdir(parents=True, exist_ok=True)
-                    dest = out / ci.path.name
-                    if dest.resolve() != ci.path.resolve():
-                        # --out is often the USB drive: copy under a temp name and swap it in, so
-                        # a full or unplugged drive never leaves a cut-off WAD (or loses the old one)
-                        copy_atomic(ci.path, dest, fsync=True)
-                        ci.path.unlink(missing_ok=True)
-                        ci.path = dest
+            ci = build_channel(Path(p), s, layout=drive, title=info.title if info else None,
+                               info=info, fat=not a.wbfs_partition)
+            if out is not None:
+                out.mkdir(parents=True, exist_ok=True)
+                dest = out / ci.path.name
+                if dest.resolve() != ci.path.resolve():
+                    # --out is often the USB drive: copy under a temp name and swap it in, so
+                    # a full or unplugged drive never leaves a cut-off WAD (or loses the old one)
+                    copy_atomic(ci.path, dest, fsync=True)
+                    ci.path.unlink(missing_ok=True)
+                    ci.path = dest
             print(f"{ci.path}  ({ci.channel_id}, {ci.style})")
         except Exception as e:  # noqa: BLE001
             if not is_user_error(e):
@@ -295,10 +295,16 @@ def cmd_health(a: Any) -> int:
     from .core import health
     from .core.drives import drive_for_path
     lay = _drive(a)
+    # leftovers of an interrupted copy: ReWii's own folders always, the drive only with --fix
+    # (without it they are reported below, as a finding)
+    from .core.games import purge_stale_temp
+    purged = purge_stale_temp(Settings.load(), lay if a.fix else None)
+    if purged:
+        print(f"Removed {len(purged)} unfinished file(s) left by an interrupted copy.")
     drv = drive_for_path(lay.root)
     findings = health.check(lay, drv)
     for f in findings:
-        print(f"[{f.severity:5}] {f.message}" + (f"  (fix: {f.fix_id})" if f.fix_id else ""))
+        print(f"[{f.severity.short:5}] {f.message}" + (f"  (fix: {f.fix_id})" if f.fix_id else ""))
     if not findings:
         print("Everything looks good.")
     failed = 0
@@ -323,6 +329,36 @@ def cmd_health(a: Any) -> int:
         print(f"After fixing: {len(findings)} finding(s) left, {len(left)} of them errors."
               + (f" {failed} fix(es) failed." if failed else ""))
     return 1 if failed or any(f.severity == "error" for f in findings) else 0
+
+
+def cmd_setup(a: Any) -> int:
+    """Make the ReWii folders and install the essential apps (what "Set up" does in the app)."""
+    from .core import setup
+    lay = _drive(a)
+    s = Settings.load()
+    apps = setup.planned_apps(s)
+    if not a.yes:
+        print(f"This creates the ReWii folders on {lay.root} and installs:")
+        for item in apps:
+            print(f"  {item.slug} - {item.why}")
+        raise CliError("add -y to go ahead")
+    bar = _Bar()
+    try:
+        rep = setup.setup_drive(lay, s, bar)
+    finally:
+        bar.done()
+    lines, bad = rep.lines()
+    print("\n".join(lines), file=sys.stderr if bad else sys.stdout)
+    return 1 if bad else 0
+
+
+def cmd_selftest(a: Any) -> int:
+    """Check that this build works (bundled files, libraries, building channels). Hidden:
+    it is for the packaged app's smoke test, not for users."""
+    from .core import selftest
+    ok = selftest.run(print)
+    print("selftest passed" if ok else "selftest FAILED", file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
 
 
 def cmd_format_drive(a: Any) -> int:
@@ -354,7 +390,9 @@ def build_parser() -> argparse.ArgumentParser:
                                  "Run without arguments (or with just --drive PATH) for the full app.",
                                  epilog="Exit codes: 0 done, 1 failed or problems found, 2 wrong usage.")
     ap.add_argument("--version", action="version", version=f"ReWii {__version__}")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    # metavar: list the commands by hand so the hidden ones (selftest) stay out of --help
+    sub = ap.add_subparsers(dest="cmd", required=True,
+                            metavar="{info,games,drives,health,setup,format-drive,verify,channel}")
 
     p = sub.add_parser("info", help="show what game a file is")
     p.add_argument("files", nargs="+")
@@ -393,6 +431,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--drive")
     p.add_argument("--fix", action="store_true", help="apply the safe automatic fixes")
     p.set_defaults(fn=cmd_health)
+    p = sub.add_parser("selftest")          # not in --help: see cmd_selftest
+    p.set_defaults(fn=cmd_selftest)
+    p = sub.add_parser("setup", help="make the ReWii folders on the drive and install the essential apps")
+    p.add_argument("--drive")
+    p.add_argument("-y", "--yes", action="store_true", help="don't ask, go ahead")
+    p.set_defaults(fn=cmd_setup)
     p = sub.add_parser("format-drive", help="erase and format a drive FAT32 (needs admin)")
     p.add_argument("--drive-id", required=True)
     p.add_argument("--confirm", required=True, help="must repeat the drive id")
@@ -424,6 +468,9 @@ def main(argv: list[str]) -> int:
         return int(a.fn(a) or 0)
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
+        return 130
+    except Cancelled:
+        print("Cancelled.", file=sys.stderr)
         return 130
     except CliError as e:
         print(f"error: {e}", file=sys.stderr)

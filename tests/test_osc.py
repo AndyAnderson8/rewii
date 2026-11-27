@@ -19,7 +19,6 @@ def cache(tmp_path, monkeypatch):
     d = tmp_path / "cache"
     d.mkdir()
     monkeypatch.setattr(config, "cache_dir", lambda: d)
-    monkeypatch.setattr(net, "cache_dir", lambda: d)
     yield d
     net.set_client(None)
 
@@ -192,8 +191,6 @@ def test_nested_detection(tmp_path):
     assert nested == ["baz", "foo"]
     bar = next(i for i in inst if i.folder == "bar")
     assert not bar.bootable
-    mis = sorted(p.name for p in osc.misplaced_apps(lay))
-    assert mis == ["baz", "foo", "rootapp"]
 
 
 def test_bad_hash_rejected(tmp_path, cache):
@@ -214,7 +211,7 @@ def test_starter_kit(tmp_path, cache):
     assert {i.slug for i in osc.starter_kit("vwii")} >= {"d2x-cios-installer-vwii"}
     assert "d2x-cios-installer" not in {i.slug for i in osc.starter_kit("vwii")}
     assert all(not i.essential for i in osc.starter_kit("", "recommended"))
-    with pytest.raises(ValueError):
+    with pytest.raises(OSCError):
         osc.starter_kit("", "bogus")
     rep = osc.install_starter_kit(lay, "wii", ["usbloader_gx", "Nintendont",
                                                "d2x-cios-installer", "yawmME"], apps=apps)

@@ -26,11 +26,13 @@ from importlib import resources
 from pathlib import Path
 from typing import Optional
 
-from .config import cache_dir
 from .disc import DiscError, aes_cbc_decrypt, aes_cbc_encrypt, common_key, open_disc, parse_header, read_wii_file
+from .errors import ReWiiError
+from .fileops import part_path
+from .ids import BRACKETED_ID_BYTES_RE
+from .layout import safe_name
 
 STYLES = ("cover", "black", "classic")
-MAX_CHANNELS_WARN = 40       # the Wii Menu holds 48 channels incl. system ones
 
 # Games whose banners brick the Wii Menu when installed as a channel
 # (wii.hacks.guide/wiigsc). Matched on the first 3 characters of the game ID.
@@ -49,9 +51,10 @@ TIK_KEY_INDEX = 0x1F1        # which common key encrypts the title key: 0 common
 TIK_FAKESIGN_PAD = 0x1F2     # unused bytes after it: brute-forced for the fakesign
 TMD_FAKESIGN_PAD = 0x1D4     # unused bytes in the TMD header
 MAX_BANNER_SIZE = 16 * 1024 * 1024
+MAX_TMD_BYTES = 1024 * 1024
 
 
-class ForwarderError(Exception):
+class ForwarderError(ReWiiError):
     pass
 
 
@@ -59,22 +62,8 @@ class BannerBrickRisk(ForwarderError):
     pass
 
 
-def _asset(name: str) -> bytes:
+def asset(name: str) -> bytes:
     return resources.files("rewii.assets.forwarder").joinpath(name).read_bytes()
-
-
-def cert_chain() -> bytes:
-    """Nintendo's public certificate chain (from NUS, cached)."""
-    p = cache_dir() / "cert_chain.bin"
-    if p.exists() and p.stat().st_size == 2560:
-        return p.read_bytes()
-    try:
-        from libWiiPy.title.nus import download_cert_chain
-        data = download_cert_chain()
-    except Exception as e:  # pragma: no cover - network
-        raise ForwarderError("Need internet once to download the Wii certificate chain") from e
-    p.write_bytes(data)
-    return data
 
 
 def channel_id_for(game_id: str) -> str:
@@ -216,7 +205,7 @@ def splash_png(cover_png: bytes | None, budget: int = _SPLASH_LEN) -> bytes:
         if cover_png:
             img = Image.open(io.BytesIO(cover_png)).convert("RGBA")
             scale = height / img.height
-            img = img.resize((max(1, int(img.width * scale)), height), Image.LANCZOS)
+            img = img.resize((max(1, int(img.width * scale)), height), Image.Resampling.LANCZOS)
             bg = Image.new("RGBA", img.size, (0, 0, 0, 255))
             img = Image.alpha_composite(bg, img).convert("RGB")
             canvas.paste(img, ((640 - img.width) // 2, (480 - img.height) // 2))
@@ -236,8 +225,8 @@ def splash_png(cover_png: bytes | None, budget: int = _SPLASH_LEN) -> bytes:
 def build_loader_dol(game_id: str, fat: bool = True, style: str = "cover",
                      cover_png: bytes | None = None) -> bytes:
     if style not in STYLES:
-        raise ValueError(f"style must be one of {STYLES}")
-    dol = bytearray(_asset("ConfUsbLoaderFat.dol" if fat else "ConfUsbLoader.dol"))
+        raise ForwarderError(f"style must be one of {STYLES}")
+    dol = bytearray(asset("ConfUsbLoaderFat.dol" if fat else "ConfUsbLoader.dol"))
     patch_game_id(dol, game_id)
     if style == "cover":
         o = _find_splash(dol)
@@ -283,10 +272,12 @@ class ChannelInfo:
     size: int
 
 
-def build_wad(banner: bytes, dol: bytes, game_id: str, *, channel_id: str | None = None,
+def build_wad(banner: bytes, dol: bytes, game_id: str, *, cert_chain: bytes,
+              channel_id: str | None = None,
               ios: int | None = None, access_rights: int | None = None) -> bytes:
     """Build a fakesigned channel WAD: content 0 ``banner``, content 1 ``dol``,
-    content 2 the NAND loader that boots it.
+    content 2 the NAND loader that boots it. Nothing here touches the network:
+    ``cert_chain`` is Nintendo's certificate chain (:func:`rewii.core.nus.cert_chain`).
 
     Used for both kinds of channel. ``channel_id`` defaults to the Wii forwarder
     ID for ``game_id``; ``ios`` and ``access_rights`` override the TMD template's
@@ -295,14 +286,14 @@ def build_wad(banner: bytes, dol: bytes, game_id: str, *, channel_id: str | None
     # a disc's opening.bnr has IMET at 0x40, a channel banner (with build header) at 0x80
     if b"IMET" not in (banner[0x40:0x44], banner[0x80:0x84]):
         raise ForwarderError("game banner has an unexpected format")
-    nand = _asset("nand_loader.app")
+    nand = asset("nand_loader.app")
     contents = [banner, dol, nand]
     chan_id = channel_id or channel_id_for(game_id)
     if not re.fullmatch(r"[A-Z0-9]{4}", chan_id):
         raise ForwarderError(f"invalid channel ID {chan_id!r}")
     tid = struct.pack(">I", 0x00010001) + chan_id.encode("ascii")
 
-    tik = bytearray(_asset("ticket_template.tik"))
+    tik = bytearray(asset("ticket_template.tik"))
     tik[0x1DC:0x1E4] = tid
     # The contents are encrypted with a title key wrapped by the normal common key,
     # so the ticket must say so. (The template, like CRAP's tickets, has a leftover
@@ -312,7 +303,7 @@ def build_wad(banner: bytes, dol: bytes, game_id: str, *, channel_id: str | None
     tkey = aes_cbc_decrypt(ck, tid + bytes(8), bytes(tik[0x1BF:0x1CF]))
     tik_signed = fakesign(bytes(tik), TIK_FAKESIGN_PAD)
 
-    tmd = bytearray(_asset("tmd_template.tmd"))
+    tmd = bytearray(asset("tmd_template.tmd"))
     if ios is not None:
         struct.pack_into(">Q", tmd, 0x184, ios)
     tmd[0x18C:0x194] = tid
@@ -326,7 +317,7 @@ def build_wad(banner: bytes, dol: bytes, game_id: str, *, channel_id: str | None
         tmd[rec + 16:rec + 36] = hashlib.sha1(data).digest()
     tmd_signed = fakesign(bytes(tmd), TMD_FAKESIGN_PAD)
 
-    cert = cert_chain()
+    cert = cert_chain
     trailer = _pad(b"CMiiUT" + str(int(time.time())).encode(), 0x40)
     enc = []
     for i, data in enumerate(contents):
@@ -342,15 +333,14 @@ def build_wad(banner: bytes, dol: bytes, game_id: str, *, channel_id: str | None
 def save_channel(wad: bytes, out_dir: Path, title: str, channel_id: str, game_id: str) -> Path:
     """Write a freshly built channel WAD as ``Title - CHAN - GAMEID.wad`` and
     check it by unpacking it again. A WAD that fails the check is deleted."""
-    from .layout import safe_name
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{safe_name(title)} - {channel_id} - {game_id}.wad"
-    tmp = out.with_name(out.name + ".rewii-part")
+    tmp = part_path(out)
     try:
         tmp.write_bytes(wad)
         ok, msg = verify_wad(tmp)
-        if ok and unpack_wad(wad)["key_index"] != 0:
+        if ok and verify_unpack(wad)["key_index"] != 0:
             ok, msg = False, "ticket does not use the standard common key"
         if not ok:
             raise ForwarderError(f"built channel failed verification: {msg}")
@@ -362,10 +352,12 @@ def save_channel(wad: bytes, out_dir: Path, title: str, channel_id: str, game_id
 
 def make_channel(game_path: Path, out_dir: Path, *, style: str = "cover", fat: bool = True,
                  cover_png: bytes | None = None, allow_risky: bool = False,
-                 title: str | None = None) -> ChannelInfo:
+                 title: str | None = None, cert_chain: bytes) -> ChannelInfo:
     """Build a channel WAD for a Wii game image (WBFS/ISO/CISO).
 
-    ``title`` (e.g. from GameTDB) is only used for the output file name.
+    ``title`` (e.g. from GameTDB) is only used for the output file name. Works
+    offline: the cover art and the certificate chain are passed in (see
+    :func:`rewii.core.channels.build_channel`, which fetches them).
     """
     try:
         with open_disc(game_path) as d:
@@ -383,7 +375,7 @@ def make_channel(game_path: Path, out_dir: Path, *, style: str = "cover", fat: b
     except DiscError as e:
         raise ForwarderError(f"{Path(game_path).name} can't be read: {e}") from e
     dol = build_loader_dol(gid, fat=fat, style=style, cover_png=cover_png)
-    wad = build_wad(banner, dol, gid)
+    wad = build_wad(banner, dol, gid, cert_chain=cert_chain)
     out = save_channel(wad, out_dir, title, channel_id_for(gid), gid)
     return ChannelInfo(gid, title, channel_id_for(gid), style, out, len(wad))
 
@@ -397,8 +389,12 @@ def ticket_common_key(index: int) -> bytes:
     return common_key(index if index in (1, 2) else 0)
 
 
-def unpack_wad(data: bytes) -> dict:
-    """Independently unpack a WAD (no libWiiPy) to check what was built.
+def verify_unpack(data: bytes) -> dict:
+    """Independently re-parse a WAD ReWii has just built, to check it (no libWiiPy,
+    on purpose: a second implementation catches mistakes the first can't see).
+
+    This is the build verifier, not a general WAD reader - everything else
+    reads WADs through :mod:`rewii.core.wad`.
 
     Returns ``title_id``, the decrypted ``contents``, ``hashes_ok``,
     ``fakesigned`` and the ticket's raw ``key_index`` byte."""
@@ -408,13 +404,13 @@ def unpack_wad(data: bytes) -> dict:
     tik = data[pos:pos + tsz]; pos = _align(pos + tsz, 64)
     tmd = data[pos:pos + msz]; pos = _align(pos + msz, 64)
     if len(tik) < 0x2A4 or len(tmd) < 0x1E4:
-        raise ValueError("WAD is too short")
+        raise ForwarderError("WAD is too short")
     key_index = tik[TIK_KEY_INDEX]
     tid = tik[0x1DC:0x1E4]
     tkey = aes_cbc_decrypt(ticket_common_key(key_index), tid + bytes(8), tik[0x1BF:0x1CF])
     n = struct.unpack(">H", tmd[0x1DE:0x1E0])[0]
     if len(tmd) < 0x1E4 + 36 * n:
-        raise ValueError("WAD content table is cut short")
+        raise ForwarderError("WAD content table is cut short")
     contents, ok = [], True
     for i in range(n):
         rec = 0x1E4 + 36 * i
@@ -422,7 +418,7 @@ def unpack_wad(data: bytes) -> dict:
         size = struct.unpack(">Q", tmd[rec + 8:rec + 16])[0]
         encsz = _align(size, 16)
         if pos + encsz > len(data):
-            raise ValueError("WAD content is cut short")
+            raise ForwarderError("WAD content is cut short")
         dec = aes_cbc_decrypt(tkey, struct.pack(">H", idx) + bytes(14), data[pos:pos + encsz])[:size]
         pos += _align(encsz, 64)
         ok &= hashlib.sha1(dec).digest() == tmd[rec + 16:rec + 36]
@@ -434,7 +430,7 @@ def unpack_wad(data: bytes) -> dict:
 
 def verify_wad(path: Path) -> tuple[bool, str]:
     try:
-        r = unpack_wad(Path(path).read_bytes())
+        r = verify_unpack(Path(path).read_bytes())
     except Exception as e:
         return False, f"unreadable: {e}"
     if not r["hashes_ok"]:
@@ -444,37 +440,70 @@ def verify_wad(path: Path) -> tuple[bool, str]:
     return True, "ok"
 
 
+MAX_LOADER_DOL = 16 * 1024 * 1024       # a forwarder's loader is 1-2 MB; anything huge isn't one
+
+
+def read_wad_content(path: Path, position: int, max_size: int = MAX_LOADER_DOL) -> Optional[bytes]:
+    """Decrypt ONE content of a WAD file (the ``position``-th in the TMD), reading only
+    the header, ticket, TMD and that content - not the whole file. None if the WAD has
+    no such content or it is larger than ``max_size``. Raises ForwarderError/OSError
+    for files that aren't readable WADs."""
+    with open(path, "rb") as f:
+        head = f.read(0x20)
+        if len(head) < 0x20:
+            raise ForwarderError("WAD is too short")
+        hsz, _t, _v, csz, _r, tsz, msz, _dsz, _fsz = struct.unpack(">I2sHIIIIII", head)
+        if hsz != 0x20 or tsz > 0x10000 or msz > MAX_TMD_BYTES:
+            raise ForwarderError("not a WAD file")
+        pos = _align(_align(hsz, 64) + csz, 64)
+        f.seek(pos)
+        tik = f.read(tsz)
+        pos = _align(pos + tsz, 64)
+        f.seek(pos)
+        tmd = f.read(msz)
+        pos = _align(pos + msz, 64)
+        if len(tik) < 0x2A4 or len(tmd) < 0x1E4:
+            raise ForwarderError("WAD is too short")
+        n = struct.unpack(">H", tmd[0x1DE:0x1E0])[0]
+        if len(tmd) < 0x1E4 + 36 * n:
+            raise ForwarderError("WAD content table is cut short")
+        if not 0 <= position < n:
+            return None
+        for i in range(n):
+            rec = 0x1E4 + 36 * i
+            idx = struct.unpack(">H", tmd[rec + 4:rec + 6])[0]
+            size = struct.unpack(">Q", tmd[rec + 8:rec + 16])[0]
+            encsz = _align(size, 16)
+            if i < position:
+                pos += _align(encsz, 64)
+                continue
+            if size > max_size:
+                return None
+            f.seek(pos)
+            enc = f.read(encsz)
+            if len(enc) < encsz:
+                raise ForwarderError("WAD content is cut short")
+            tid = tik[0x1DC:0x1E4]
+            tkey = aes_cbc_decrypt(ticket_common_key(tik[TIK_KEY_INDEX]), tid + bytes(8), tik[0x1BF:0x1CF])
+            return aes_cbc_decrypt(tkey, struct.pack(">H", idx) + bytes(14), enc)[:size]
+    return None
+
+
 def channel_game_id(path: Path) -> Optional[str]:
-    """Which game a ReWii/CRAP channel boots (reads the patched loader)."""
+    """Which game a ReWii/CRAP channel boots (reads the patched loader, the WAD's
+    second content - only that one is read and decrypted). None if it isn't one."""
     try:
-        r = unpack_wad(Path(path).read_bytes())
-        dol = r["contents"][1]
+        dol = read_wad_content(Path(path), 1)
+        if dol is None:
+            return None
         raw = read_argv_raw(dol)               # GameCube channel: Nintendont autoboot config
         j = raw.find(b"\x01\x07\x0c\xf6")
         if j >= 0:
-            m = re.search(rb"\[([A-Z0-9]{6})\]", raw[j + 20:j + 275])
+            m = BRACKETED_ID_BYTES_RE.search(raw[j + 20:j + 275])
             return m.group(1).decode() if m else raw[j + 536:j + 540].decode("ascii", "replace")
         i = dol.find(b"CFGUSB")
         if i > 12 and dol[i - 12:i - 11] == b"#":
             return dol[i - 11:i - 5].decode("ascii")
-    except Exception:
+    except Exception:  # noqa: BLE001 - whatever it is, it isn't one of our channels
         return None
     return None
-
-
-def cover_for_channel(game_id: str, lang: str = "EN") -> bytes | None:
-    """Front cover art for the "cover" launch style: cache first, then GameTDB."""
-    from . import covers
-    for kind in ("cover", "coverfullHQ", "cover3D"):
-        p = covers.cached_cover_path(game_id, kind)
-        if p is not None:
-            return p.read_bytes()
-    try:
-        data, _region = covers.download_cover(game_id, "cover", lang)
-    except Exception:
-        return None
-    if data:
-        p = covers.cache_path(game_id, "cover")
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(data)
-    return data

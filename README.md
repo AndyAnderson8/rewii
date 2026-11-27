@@ -45,16 +45,21 @@ It runs in a terminal window and works with the mouse or keyboard.
 ```
 uv sync
 uv run rewii                # the app
-uv run rewii --help         # scriptable commands (games, channel, verify, health, drives, …)
-uv run pytest               # tests
+uv run rewii --help         # scriptable commands (games, channel, verify, health, setup, drives, …)
+uv run pytest               # tests (hermetic: no network, nothing written outside temp folders)
+uv run ruff check src tests && uv run mypy src/rewii
 uv run pyinstaller packaging/rewii.spec   # build the single-file app
+dist/rewii selftest         # check the built app: bundled files, libraries, building channels
 ```
+
+The version number is written in one place, `pyproject.toml`; a release tag `vX.Y.Z` must match it (CI checks).
 
 ## Where things are kept
 
 - **Library** (games, channels, saves, backups): `~/ReWii` by default. You can change it in Settings.
 - **Settings and log**: the per-OS config folder (`%APPDATA%\ReWii`, `~/Library/Application Support/ReWii`, `~/.config/ReWii`).
 - **Downloads cache** (covers, app zips, title database, tools): the per-OS cache folder.
+- Set `REWII_CONFIG_DIR` / `REWII_CACHE_DIR` to keep settings or the cache somewhere else (a portable copy on a USB stick, for example).
 
 ## Safety
 

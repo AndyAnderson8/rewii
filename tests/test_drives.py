@@ -6,7 +6,7 @@ import plistlib
 
 from rewii.core import drives as dr
 from rewii.core.drives import (Drive, Volume, drive_for_path, enrich, list_drives, normalize_fs,
-                               parse_diskutil, parse_diskutil_list, parse_lsblk, parse_windows)
+                               parse_diskutil, parse_lsblk, parse_windows)
 from rewii.core.fat32 import build_boot_sector, plan_fat32
 
 # --------------------------------------------------------------------------- Linux
@@ -223,7 +223,6 @@ def _mac_full_list():
 
 
 def test_parse_diskutil_external_stick():
-    assert parse_diskutil_list(DISKUTIL_LIST_XML) == ["disk4"]
     infos = {"disk4": plistlib.dumps(DISK4_INFO), "disk4s1": plistlib.dumps(DISK4S1_INFO)}
     (d,) = parse_diskutil(DISKUTIL_LIST_XML, infos)
     assert d.device == "/dev/disk4" and d.volume_device == "/dev/disk4s1"

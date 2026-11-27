@@ -18,33 +18,36 @@ from collections.abc import Callable, Iterable, Iterator
 
 from . import config as _config
 from .config import Settings
-from .disc import (FAT32_SPLIT, INCOMPLETE, NEEDS_CONVERSION, NEEDS_CONVERSION_EXTS, WII_DL_SECTORS,
+from .disc import (FAT32_SPLIT, GC_DRIVE_EXTS, INCOMPLETE, LIBRARY_EXTS, WII_DRIVE_EXTS, cleanrip_part, NEEDS_CONVERSION, NEEDS_CONVERSION_EXTS, WII_DL_SECTORS,
                    WII_SECTOR, DiscError, aes_cbc_decrypt, incomplete_reason,
                    open_disc, parse_header, region_of, sniff_format, split_parts, used_sectors,
                    wii_partitions, wii_usage_table)
-from .fileops import DriveNotConnected, explain_os_error, is_temp_name, rename_path, same_file
+from .fileops import (TEMP_PREFIX as TMP_PREFIX, DriveNotConnected, explain_os_error, is_temp_name,
+                      remove_quietly, rename_path, same_file)
+from .ids import is_disc_id, platform_guess
 from .layout import DriveLayout, game_folder_name, id_from_folder
-from .progress import CancelToken, ProgressFn, Reporter
-from .wbfs import WbfsPartition, _cleanup, copy_file, write_iso, write_wbfs
+from .progress import UNIT_STEPS, CancelToken, ProgressFn, Reporter
+from .wbfs import WbfsPartition, copy_file, write_iso, write_wbfs
+from .errors import ReWiiError
 
 #: Formats that must be converted before a console can use them (defined in ``disc``).
 CONVERTIBLE = NEEDS_CONVERSION
 CONVERTIBLE_EXTS = NEEDS_CONVERSION_EXTS
-DRIVE_WII_EXTS = {".wbfs", ".iso", ".ciso"}
-DRIVE_GC_EXTS = {".iso", ".gcm", ".ciso"}
-#: Every extension a game image in the PC library may have (Wii and GameCube).
-WII_EXTS = DRIVE_WII_EXTS | DRIVE_GC_EXTS | CONVERTIBLE_EXTS
+DRIVE_WII_EXTS = WII_DRIVE_EXTS
+DRIVE_GC_EXTS = GC_DRIVE_EXTS
 UNKNOWN_ID = "??????"             # a game that needs conversion and has no [ID] in its name
-TMP_PREFIX = ".rewii-tmp-"        # staging files; hidden from scans, removed when stale
 STALE_TMP_AGE = 24 * 3600
+WORK_DIR_NAME = "work"             # under the cache folder: joined / converted images
 
+#: Values of ``Game.problem`` ("" = fine). They are also what the lists show.
+NEEDS_CONVERSION_PROBLEM = "needs conversion"
 MISPLACED = "misplaced"
 INCOMPLETE_PROBLEM = "incomplete"   # a split part is missing, or the file is cut short
 
 TitleLookup = Callable[[str], Optional[str]]
 
 
-class GameError(Exception):
+class GameError(ReWiiError):
     pass
 
 
@@ -61,7 +64,7 @@ class Game:
     files: list[Path] = field(default_factory=list)
     size: int = 0
     location: str = "library"  # "library" | "drive"
-    problem: str = ""          # "needs conversion", "misplaced" or INCOMPLETE_PROBLEM
+    problem: str = ""          # NEEDS_CONVERSION_PROBLEM, MISPLACED or INCOMPLETE_PROBLEM
 
     @property
     def is_wii(self) -> bool:
@@ -101,10 +104,10 @@ def identify(path: Path, lookup: TitleLookup | None = None, location: str = "lib
         return None
     if fmt in CONVERTIBLE:
         gid = id_from_folder(path.stem) or id_from_folder(path.parent.name) or UNKNOWN_ID
-        plat = "gc" if gid.startswith(("G", "D")) else "wii"
+        plat = platform_guess(gid)
         t = _title(lookup, gid, path.stem)
         return Game(gid, t, path.stem, plat, 0, region_of(gid), fmt, path, files, size, location,
-                    "needs conversion")
+                    NEEDS_CONVERSION_PROBLEM)
     if fmt not in ("ISO", "WBFS", "CISO"):
         return None
     problem = ""
@@ -132,34 +135,74 @@ def _part_gap(path: Path, files: list[Path]) -> bool:
 
 
 def _iter_images(root: Path, exts: Iterable[str]) -> Iterable[Path]:
-    """Image files under ``root``. ReWii's own staging files (``.rewii-tmp-*``) are
-    never listed; ones older than a day are leftovers of a crash and are deleted
-    (younger ones may belong to a copy that is still running)."""
+    """Image files under ``root``. ReWii's own staging and temp files are never
+    listed. Read-only: leftovers of a crash are removed by :func:`purge_stale_temp`,
+    not here."""
     if not root.exists():
         return
     exts = set(exts)
     for p in sorted(root.rglob("*")):
-        if p.name.startswith(TMP_PREFIX):
-            _remove_if_stale(p)
-            continue
         if is_temp_name(p.name):
             continue
         if p.is_file() and p.suffix.lower() in exts and not p.name.startswith("._"):
             yield p
 
 
-def _remove_if_stale(p: Path) -> None:
+def _is_stale(p: Path) -> bool:
     try:
-        if p.is_file() and time.time() - p.stat().st_mtime > STALE_TMP_AGE:
-            p.unlink()
+        return time.time() - p.stat().st_mtime > STALE_TMP_AGE
     except OSError:
-        pass
+        return False
+
+
+def purge_stale_temp(settings: Settings | None = None, layout: DriveLayout | None = None) -> list[Path]:
+    """Delete what an interrupted copy or conversion left behind, and return what was removed.
+
+    * game staging files (``.rewii-tmp-*``) in the library (``settings``) and in the
+      drive's game folders (``layout``),
+    * job folders in the cache's work folder,
+
+    but only ones nothing has touched for a day - younger ones may belong to a copy
+    that is still running. This is the only place they are cleaned up: listing games
+    never deletes anything. The app calls it once at start, ``rewii health`` when run.
+    """
+    removed: list[Path] = []
+    roots: list[Path] = []
+    if settings is not None:
+        roots += [settings.wii_games_dir, settings.gc_games_dir]
+    if layout is not None and layout.connected():
+        roots += [layout.wbfs, layout.gc_games]
+    for root in roots:
+        try:
+            found = [p for p in root.rglob(TMP_PREFIX + "*") if p.is_file() and not p.is_symlink()]
+        except OSError:
+            continue
+        for p in found:
+            if _is_stale(p):
+                try:
+                    p.unlink()
+                    removed.append(p)
+                except OSError:
+                    pass
+    try:
+        work = _config.cache_dir() / WORK_DIR_NAME
+        jobs = list(work.iterdir()) if work.is_dir() else []
+    except OSError:
+        jobs = []
+    for old in jobs:
+        if _is_stale(old):
+            try:
+                shutil.rmtree(old) if old.is_dir() else old.unlink()
+                removed.append(old)
+            except OSError:
+                pass
+    return removed
 
 
 def scan_library(settings: Settings, lookup: TitleLookup | None = None) -> list[Game]:
     out: list[Game] = []
     for root in (settings.wii_games_dir, settings.gc_games_dir):
-        for p in _iter_images(root, WII_EXTS):
+        for p in _iter_images(root, LIBRARY_EXTS):
             g = identify(p, lookup, "library")
             if g:
                 out.append(g)
@@ -227,7 +270,6 @@ def estimate_install_size(path: Path, scrub: bool = True) -> int:
         return raw
 
 
-_PART_RE = re.compile(r"\.part\d+\.iso$", re.I)
 
 
 @contextlib.contextmanager
@@ -236,15 +278,9 @@ def _work_dir() -> Iterator[Path]:
 
     The system temp folder is often RAM-backed or small, and these files are
     1.4-8.5 GB. The folder is always removed again; ones left by a crash are
-    cleared when they are over a day old."""
-    base = _config.cache_dir() / "work"
+    cleared by :func:`purge_stale_temp`."""
+    base = _config.cache_dir() / WORK_DIR_NAME
     base.mkdir(parents=True, exist_ok=True)
-    for old in base.iterdir():
-        try:
-            if time.time() - old.stat().st_mtime > STALE_TMP_AGE:
-                shutil.rmtree(old, ignore_errors=True) if old.is_dir() else old.unlink()
-        except OSError:
-            pass
     d = Path(tempfile.mkdtemp(prefix="job-", dir=base))
     try:
         yield d
@@ -262,7 +298,7 @@ def _prepare_source(src: Path, tmpdir: Path, rep: Reporter) -> Path:
     """Join CleanRip part files / convert RVZ/NKit/etc. to ISO in ``tmpdir`` if needed."""
     from . import cleanrip, convert
     try:
-        if _PART_RE.search(src.name):
+        if cleanrip_part(src.name) is not None:
             dumps = cleanrip.find_dumps(src.parent)
             dump = next((d for d in dumps if any(p.name.lower() == src.name.lower() for p in d.parts)), None)
             if dump is None:
@@ -345,7 +381,7 @@ def _replace_files(tmp_paths: list[Path], final_main: Path) -> list[Path]:
             shutil.move(str(tp), str(dst))
             out.append(dst)
     except BaseException:
-        _cleanup(out)
+        remove_quietly(out)
         raise
     return out
 
@@ -427,15 +463,15 @@ def install_game(layout: DriveLayout, src: Path, *, title: str | None = None, sc
                 tmp.replace(dest)
                 files = [dest]
         except DiscError as e:
-            _cleanup(staged)
+            remove_quietly(staged)
             raise GameError(str(e)) from e
         except OSError as e:
-            _cleanup(staged)
+            remove_quietly(staged)
             if not layout.connected():      # unplugged mid-copy: say so, not "no such file"
                 raise DriveNotConnected(layout.root) from e
             raise
         except BaseException:
-            _cleanup(staged)           # no-op for files already moved into place
+            remove_quietly(staged)           # no-op for files already moved into place
             raise
     g = identify(files[0], lookup, "drive")
     if g is None:
@@ -477,7 +513,7 @@ def _is_own_folder(folder: Path, container: Path, game: Game) -> bool:
     mine = {p.name.lower() for p in (game.files or [game.path])}
     try:
         others = [x for x in folder.iterdir() if x.is_file() and x.name.lower() not in mine
-                  and x.suffix.lower() in WII_EXTS and not x.name.startswith(".")]
+                  and x.suffix.lower() in LIBRARY_EXTS and not x.name.startswith(".")]
     except OSError:
         return False
     for x in others:
@@ -496,7 +532,7 @@ def _rename_folder(folder: Path, new: Path) -> None:
 
 
 def _check_renamable(game: Game) -> None:
-    if game.game_id == UNKNOWN_ID or game.needs_conversion or not re.fullmatch(r"[A-Za-z0-9]{6}", game.game_id):
+    if game.game_id == UNKNOWN_ID or game.needs_conversion or not is_disc_id(game.game_id):
         raise GameError("this game has no readable game ID yet - convert it first, then rename it")
 
 
@@ -533,7 +569,7 @@ def normalize_drive(layout: DriveLayout, lookup: TitleLookup | None = None,
     """Move misplaced games into the proper ``Title [ID]/ID.wbfs`` / ``game.iso`` layout."""
     msgs = []
     games = [g for g in scan_drive(layout, lookup) if g.problem == MISPLACED]
-    rep = Reporter(progress, cancel, total=len(games))
+    rep = Reporter(progress, cancel, total=len(games), unit=UNIT_STEPS)
     for g in games:
         rep.check()
         dest = _proper_dest(layout, g, g.title)
@@ -580,7 +616,7 @@ def add_to_library(settings: Settings, src: Path, *, move: bool = False, scrub: 
             raise GameError(f"{g.title} is already in the library")
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(TMP_PREFIX + dest.name)
-        _cleanup([tmp])                    # a leftover from an interrupted run
+        remove_quietly([tmp])                    # a leftover from an interrupted run
         try:
             with open_disc(real) as d:
                 why = incomplete_reason(d)
@@ -599,10 +635,10 @@ def add_to_library(settings: Settings, src: Path, *, move: bool = False, scrub: 
                 copy_file(real, tmp, rep=rep)
                 tmp.replace(dest)
         except DiscError as e:
-            _cleanup([tmp])
+            remove_quietly([tmp])
             raise GameError(str(e)) from e
         except BaseException:
-            _cleanup([tmp])
+            remove_quietly([tmp])
             raise
         if move and real == src and src.exists():
             for p in split_parts(src):
@@ -688,7 +724,7 @@ def verify_game(path: Path, progress: ProgressFn | None = None,
                 needed = table[first + i]
                 if needed or d.sector_present(first + i):
                     todo.append((p, i, needed))
-        rep.set_total(len(todo), "Verifying")
+        rep.set_total(len(todo), "Verifying", unit=UNIT_STEPS)
         bad = checked = lost = 0
         for k, (p, i, needed) in enumerate(todo, 1):
             if k % 64 == 0 or k == len(todo):
@@ -810,13 +846,13 @@ def migrate_wbfs_partition(source: Path, layout: DriveLayout | None = None,
                                    "start - rip the disc again if you can.")
                         out.damaged += 1
                 except (DiscError, GameError, OSError) as e:      # Cancelled is not caught here
-                    _cleanup(tmp)
+                    remove_quietly(tmp)
                     why = explain_os_error(e, layout.root if layout is not None and where == "drive"
                                            else None)
                     out.append(f"{title}: skipped ({where}) - {why}")
                     out.skipped += 1
                 except BaseException:
-                    _cleanup(tmp)
+                    remove_quietly(tmp)
                     raise
     finally:
         part.close()

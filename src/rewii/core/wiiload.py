@@ -25,6 +25,7 @@ from typing import Optional
 from collections.abc import Sequence
 
 from .progress import CancelToken, ProgressFn, Reporter
+from .errors import ReWiiError
 
 PORT = 4299
 VERSION = (0, 5)
@@ -33,7 +34,7 @@ CHUNK = 4 * 1024
 ZIP_MAGIC = b"PK\x03\x04"
 
 
-class WiiloadError(Exception):
+class WiiloadError(ReWiiError):
     """Could not send to the console."""
 
 

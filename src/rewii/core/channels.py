@@ -1,14 +1,19 @@
 """One entry point for making a Wii Menu channel for any game (Wii or GameCube)."""
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 from typing import Any, Optional
 from collections.abc import Iterable
 
 from .config import Settings
 from .disc import disc_info
-from .forwarder import (ChannelInfo, ForwarderError, brick_risk, channel_id_for, cover_for_channel,
+from .fileops import write_atomic
+from .forwarder import (BannerBrickRisk, ChannelInfo, ForwarderError, brick_risk, channel_id_for,
                         make_channel)
+from .ids import platform_guess
+from .layout import DriveLayout
+from .progress import ProgressFn, Reporter
 
 
 def channel_problem(platform: str, disc_number: int, game_id: str, on_drive: bool) -> Optional[str]:
@@ -48,7 +53,7 @@ def channel_id_collisions(game_ids: Iterable[str | tuple[str, str]]) -> dict[str
     P are GameCube); pass pairs when the platform is known."""
     groups: dict[str, list[str]] = {}
     for item in game_ids:
-        gid, platform = item if isinstance(item, tuple) else (item, "gc" if item[:1] in "GDP" else "wii")
+        gid, platform = item if isinstance(item, tuple) else (item, platform_guess(item))
         if len(gid) < 4:
             continue
         ids = groups.setdefault(channel_id_of(gid, platform), [])
@@ -57,24 +62,79 @@ def channel_id_collisions(game_ids: Iterable[str | tuple[str, str]]) -> dict[str
     return {chan: ids for chan, ids in groups.items() if len(ids) > 1}
 
 
-def build_channel(game_path: Path, settings: Settings, *, drive_root: Path | None = None,
+def cover_for_channel(game_id: str, lang: str = "EN") -> bytes | None:
+    """Front cover art for the "cover" launch style: the cache first, then GameTDB
+    (network). None when there is no cover or it can't be fetched."""
+    from . import covers
+    for kind in ("cover", "coverfullHQ", "cover3D"):
+        p = covers.cached_cover_path(game_id, kind)
+        if p is not None:
+            return p.read_bytes()
+    try:
+        data, _region = covers.download_cover(game_id, "cover", lang)
+    except Exception:  # noqa: BLE001 - a channel without cover art is still a channel
+        return None
+    if data:
+        with contextlib.suppress(OSError):
+            write_atomic(covers.cache_path(game_id, "cover"), data)
+    return data
+
+
+def fetch_cert_chain() -> bytes:
+    """Nintendo's certificate chain for a new channel (cached; needs the internet once)."""
+    from . import nus
+    try:
+        return nus.cert_chain()
+    except nus.NusError as e:
+        raise ForwarderError(f"Need internet once to download the Wii certificate chain ({e})") from e
+
+
+def build_channel(game_path: Path, settings: Settings, *, layout: DriveLayout | Path | None = None,
                   title: str | None = None, info: Any = None,
-                  nintendont: bytes | None = None) -> ChannelInfo:
+                  nintendont: bytes | None = None, cert_chain: bytes | None = None,
+                  fat: bool = True, progress: ProgressFn | None = None) -> ChannelInfo:
     """Build a channel WAD into ``settings.channels_dir``.
 
+    This is where everything a channel needs from outside is fetched, as explicit
+    steps (each announced through ``progress``); the builders in ``forwarder`` and
+    ``gcforwarder`` only work on the bytes they are given:
+
+    1. Nintendo's certificate chain (cached; from NUS the first time),
+    2. Wii games with the "cover" style: the cover art (cache, else GameTDB),
+    3. GameCube games: Nintendont's boot.dol (Open Shop Channel, else the drive's copy).
+
+    Pass ``cert_chain`` / ``nintendont`` to skip a fetch (e.g. when building many).
     ``info`` is an optional GameTDB entry (publisher, year, synopsis) used for
     GameCube banners. GameCube games must already be on the drive at ``game_path``.
+    ``fat=False`` makes a Wii channel for an old WBFS-formatted drive.
     """
+    rep = Reporter(progress)
     di = disc_info(game_path)
     if di.platform == "wii":
-        cov = cover_for_channel(di.game_id, settings.cover_lang) if settings.forwarder_style == "cover" else None
-        return make_channel(game_path, settings.channels_dir, style=settings.forwarder_style,
-                            cover_png=cov, title=title)
-    if drive_root is None:
+        risk = brick_risk(di.game_id)
+        if risk:                       # refuse before fetching anything
+            raise BannerBrickRisk(f"{risk} is known to brick the Wii Menu as a channel - refusing")
+    elif layout is None:
         raise ForwarderError("GameCube channels need the game on the Wii drive")
-    from .gcforwarder import make_gc_channel
+    if cert_chain is None:
+        rep.note("Getting the Wii certificate chain")
+        cert_chain = fetch_cert_chain()
+    if di.platform == "wii":
+        cov = None
+        if settings.forwarder_style == "cover":
+            rep.note("Getting the cover art")
+            cov = cover_for_channel(di.game_id, settings.cover_lang)
+        rep.note("Building the channel")
+        return make_channel(game_path, settings.channels_dir, style=settings.forwarder_style,
+                            cover_png=cov, title=title, fat=fat, cert_chain=cert_chain)
+    assert layout is not None
+    from .gcforwarder import get_nintendont_dol, make_gc_channel
+    if nintendont is None:
+        rep.note("Getting Nintendont")
+        nintendont = get_nintendont_dol(layout)
     publisher = getattr(info, "publisher", "") or ""
     year = str(getattr(info, "year", "") or "")
     synopsis = getattr(info, "synopsis", "") or ""
-    return make_gc_channel(game_path, drive_root, settings.channels_dir, title=title, publisher=publisher,
-                           year=year, synopsis=synopsis, nintendont=nintendont)
+    rep.note("Building the channel")
+    return make_gc_channel(game_path, layout, settings.channels_dir, title=title, publisher=publisher,
+                           year=year, synopsis=synopsis, nintendont=nintendont, cert_chain=cert_chain)

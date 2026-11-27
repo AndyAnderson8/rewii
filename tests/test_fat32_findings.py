@@ -41,8 +41,6 @@ def private_cache(tmp_path, monkeypatch):
     from rewii.core import config
     (tmp_path / "cache").mkdir()
     monkeypatch.setattr(config, "cache_dir", lambda: tmp_path / "cache")
-    monkeypatch.setattr(net, "cache_dir", lambda: tmp_path / "cache")
-    monkeypatch.setattr(S, "cache_dir", lambda: tmp_path / "cache")
     yield
     net.set_client(None)
 
@@ -159,10 +157,10 @@ def test_nothing_recreates_a_vanished_drive(tmp_path, settings, monkeypatch):
         lambda: gone.ensure_dirs(),
         lambda: gone.write_manifest({"a": 1}),
         lambda: G.install_game(gone, src),
-        lambda: covers.fetch_covers(gone, ["RSPE01"], settings=settings),
+        lambda: covers.fetch_covers(gone, ["RSPE01"], None, settings),
         lambda: cheats.fetch_cheats(gone, "RSPE01"),
         lambda: cheats.build_gct(gone, "RSPE01", []),
-        lambda: WD.stage_wads(gone, [wad]),
+        lambda: WD.stage_wads(gone, [wad], settings=settings),
         lambda: osc.install_starter_kit(gone, "wii", apps=[]),
         lambda: R.install_mod(tmp_path / "nomod.zip", gone.root),
         lambda: S.stage_hackmii(gone),
@@ -195,11 +193,11 @@ def test_cli_and_explain_report_a_missing_drive(capsys, tmp_path, monkeypatch):
 
 
 # ------------------------------------------------------------------ 3: channel --out is atomic
-def test_channel_out_never_leaves_a_cut_off_wad(capsys, tmp_path, monkeypatch):
+def test_channel_out_never_leaves_a_cut_off_wad(capsys, tmp_path, local_patch):
     from rewii.core import channels
     from rewii.core.forwarder import ChannelInfo
     s = Settings(library_dir=str(tmp_path / "lib"))
-    monkeypatch.setattr(Settings, "load", classmethod(lambda cls, path=None: s))
+    local_patch.setattr(Settings, "load", classmethod(lambda cls, path=None: s))
     iso = make_wii_iso(tmp_path / "RAAE01.iso", "RAAE01", "Alpha")
     made = tmp_path / "lib" / "Channels" / "Alpha - UAAE - RAAE01.wad"
 
@@ -207,7 +205,7 @@ def test_channel_out_never_leaves_a_cut_off_wad(capsys, tmp_path, monkeypatch):
         made.parent.mkdir(parents=True, exist_ok=True)
         made.write_bytes(b"N" * 5000)
         return ChannelInfo("RAAE01", "Alpha", "UAAE", "black", made, 5000)
-    monkeypatch.setattr(channels, "build_channel", fake_build)
+    local_patch.setattr(channels, "build_channel", fake_build)
     out = tmp_path / "usb" / "wad"
     out.mkdir(parents=True)
     good = out / made.name
@@ -234,9 +232,9 @@ def test_channel_out_never_leaves_a_cut_off_wad(capsys, tmp_path, monkeypatch):
     def fake_open(p, mode="r", *a, **k):
         f = real_open(p, mode, *a, **k)
         return Full(f) if "w" in mode and str(p).startswith(str(out)) else f
-    monkeypatch.setattr("builtins.open", fake_open)
+    local_patch.setattr("builtins.open", fake_open)
     rc = entry.main(["channel", str(iso), "--style", "black", "--out", str(out)])
-    monkeypatch.undo()
+    local_patch.undo()
     err = capsys.readouterr().err
     assert rc == 1 and "full" in err and "Errno" not in err and "rewii-part" not in err
     assert good.read_bytes() == b"the good old wad"         # not deleted first, not half-replaced
@@ -315,7 +313,7 @@ def _fat_same_file(monkeypatch):
     monkeypatch.setattr(G, "_same_file", ci)
 
 
-def test_case_only_misnamed_games_can_be_normalised(lay, tmp_path, monkeypatch):
+def test_case_only_misnamed_games_can_be_normalised(lay, tmp_path, local_patch):
     wii = G.install_game(lay, make_wii_iso(tmp_path / "w.iso", "RHAE01", "Play"), title="Wii Play")
     gc = G.install_game(lay, make_gc_iso(tmp_path / "g.iso", "GKYE01", "Kirby"), title="Kirby")
     low = wii.path.with_name("rhae01.wbfs")
@@ -334,31 +332,31 @@ def test_case_only_misnamed_games_can_be_normalised(lay, tmp_path, monkeypatch):
     # ... and through the health fix, on a filesystem where the right name "already exists"
     wii.path.rename(low)
     gc.path.rename(up)
-    _fat_same_file(monkeypatch)
+    _fat_same_file(local_patch)
     real_exists = Path.exists
 
     def exists(self: Path) -> bool:                     # FAT32: RHAE01.wbfs "exists" as rhae01.wbfs
         return real_exists(self) or any(p.name.lower() == self.name.lower()
                                         for p in (self.parent.iterdir() if real_exists(self.parent) else []))
-    monkeypatch.setattr(Path, "exists", exists)
+    local_patch.setattr(Path, "exists", exists)
     for f in [f for f in H.check(lay) if f.fix_id in ("move_wii_game", "move_gc_game")]:
         log = H.fix(lay, f)
         assert log and not any(line.startswith(H.NOT_FIXED) for line in log)
-    monkeypatch.undo()
+    local_patch.undo()
     assert [p.name for p in wii.path.parent.iterdir()] == ["RHAE01.wbfs"]
     assert [p.name for p in gc.path.parent.iterdir()] == ["game.iso"]
 
 
-def test_normalize_does_not_skip_a_case_only_rename_on_fat32(lay, tmp_path, monkeypatch):
+def test_normalize_does_not_skip_a_case_only_rename_on_fat32(lay, tmp_path, local_patch):
     wii = G.install_game(lay, make_wii_iso(tmp_path / "w.iso", "RHAE01", "Play"), title="Wii Play")
     low = wii.path.with_name("rhae01.wbfs")
     wii.path.rename(low)
-    _fat_same_file(monkeypatch)
+    _fat_same_file(local_patch)
     real_exists = Path.exists
-    monkeypatch.setattr(Path, "exists", lambda self: real_exists(self) or (
+    local_patch.setattr(Path, "exists", lambda self: real_exists(self) or (
         real_exists(self.parent) and any(p.name.lower() == self.name.lower() for p in self.parent.iterdir())))
     msgs = G.normalize_drive(lay)
-    monkeypatch.undo()
+    local_patch.undo()
     assert msgs and msgs[0].startswith("moved"), msgs
     assert [p.name for p in wii.path.parent.iterdir()] == ["RHAE01.wbfs"]
 
@@ -522,7 +520,7 @@ def test_config_backups_are_atomic_only_on_change_and_only_the_newest_is_kept(la
     assert sorted(x.name for x in p.parent.iterdir()) == ["hacks_hash.ini", baks()[0]]
 
 
-def test_failed_app_install_leaves_no_empty_app_folder(lay, monkeypatch):
+def test_failed_app_install_leaves_no_empty_app_folder(lay, local_patch):
     import hashlib
     import io
     buf = io.BytesIO()
@@ -542,10 +540,10 @@ def test_failed_app_install_leaves_no_empty_app_folder(lay, monkeypatch):
         if "w" in mode and str(p).startswith(str(lay.apps)):
             raise oserr(errno.ENOSPC, str(p))
         return real_open(p, mode, *a, **k)
-    monkeypatch.setattr("builtins.open", full)
+    local_patch.setattr("builtins.open", full)
     with pytest.raises(OSError):
         osc.install_app(lay, app)
-    monkeypatch.undo()
+    local_patch.undo()
     assert not (lay.apps / "CleanRip").exists()
     assert [f for f in H.check(lay) if f.id == "app_no_boot"] == []
     rep = osc.install_starter_kit(lay, "wii", ["CleanRip"], apps=[app], skip_current=False)

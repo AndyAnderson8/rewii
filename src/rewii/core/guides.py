@@ -8,6 +8,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .errors import ReWiiError
+
+
+class UnknownGuide(ReWiiError, KeyError):
+    """No guide has this id."""
+
+    def __str__(self) -> str:
+        return f"There is no guide called {self.args[0]!r}." if self.args else "There is no such guide."
+
 
 @dataclass
 class Guide:
@@ -215,4 +224,4 @@ def get(gid: str) -> Guide:
     for g in GUIDES:
         if g.id == gid:
             return g
-    raise KeyError(gid)
+    raise UnknownGuide(gid)

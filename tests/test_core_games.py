@@ -10,6 +10,8 @@ from rewii.core.config import Settings
 from rewii.core.layout import DriveLayout, game_folder_name, safe_name
 from rewii.core.wbfs import SplitWriter, WbfsPartition, write_iso, write_wbfs
 
+CERTS = bytes(2560)       # a stand-in certificate chain (the builders only embed it)
+
 
 @pytest.fixture(autouse=True)
 def private_cache(tmp_path, monkeypatch):
@@ -168,28 +170,34 @@ def test_layout_names():
 # ------------------------------------------------------------------ forwarder
 @pytest.fixture
 def certs(monkeypatch):
-    monkeypatch.setattr(F, "cert_chain", lambda: bytes(2560))
+    monkeypatch.setattr("rewii.core.nus.cert_chain", lambda: CERTS)
 
 
 def test_channel_styles(wii, tmp_path, certs):
     for style in F.STYLES:
-        ci = F.make_channel(wii, tmp_path / style, style=style, cover_png=None)
+        ci = F.make_channel(wii, tmp_path / style, style=style, cover_png=None, cert_chain=CERTS)
         assert F.verify_wad(ci.path) == (True, "ok")
         assert F.channel_game_id(ci.path) == "RTST01"
         assert ci.channel_id == "UTST"
-        dol = F.unpack_wad(ci.path.read_bytes())["contents"][1]
+        dol = F.verify_unpack(ci.path.read_bytes())["contents"][1]
         assert F.read_argv(dol) == (["rewii", "intro=0"] if style == "black" else [])
+    # the WAD list asks for just the loader: one small partial read, not a second full parse
+    assert F.read_wad_content(ci.path, 1) == dol and F.read_wad_content(ci.path, 9) is None
+    assert F.read_wad_content(ci.path, 1, max_size=10) is None
+    junk = tmp_path / "junk.wad"
+    junk.write_bytes(b"not a wad at all" * 10)
+    assert F.channel_game_id(junk) is None
 
 
 def test_channel_refuses_brick_games(tmp_path, certs):
     p = make_wii_iso(tmp_path / "mp9.iso", game_id="SSQE01")
     with pytest.raises(F.BannerBrickRisk):
-        F.make_channel(p, tmp_path)
+        F.make_channel(p, tmp_path, cert_chain=CERTS)
 
 
 def test_channel_rejects_gamecube(tmp_path, certs):
     with pytest.raises(F.ForwarderError):
-        F.make_channel(make_gc_iso(tmp_path / "gc.iso"), tmp_path)
+        F.make_channel(make_gc_iso(tmp_path / "gc.iso"), tmp_path, cert_chain=CERTS)
 
 
 def test_splash_fits():

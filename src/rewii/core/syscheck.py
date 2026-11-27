@@ -25,9 +25,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from . import console
+from .findings import Finding, Fix, Severity
+from .layout import DriveLayout
+
 # --------------------------------------------------------------------------- versions
-_REGION_LETTER = {0: "J", 1: "U", 2: "E", 6: "K"}
-_LETTER_TO_REGION = {"U": "NTSC-U", "E": "PAL", "J": "NTSC-J", "K": "NTSC-K"}
+_REGION_LETTER = console.SYSMENU_LETTER_BY_BITS      # low bits of the menu version -> letter
+_LETTER_TO_REGION = console.REGION_BY_LETTER
 _MAJOR = {1: "1.0", 2: "1.0", 3: "2.0", 4: "2.0", 5: "2.1", 6: "2.2", 7: "3.0", 8: "3.1",
           9: "3.2", 10: "3.3", 11: "3.3", 12: "3.4", 13: "4.0", 14: "4.1", 15: "4.2", 16: "4.3"}
 # explicit table (wiibrew "System Menu"); keys are title versions
@@ -89,12 +93,9 @@ class IosInfo:
         return "d2x" in self.info.lower()
 
 
-@dataclass
-class Finding:
-    """A health-check result: severity is "error", "warning" or "info"."""
-    severity: str
-    message: str
-    fix: str = ""                     # suggested fix id, "" for none
+def _note(severity: str, message: str, fix: str = "") -> Finding:
+    """A SysCheck finding; its id is the fix it suggests (``syscheck_note`` when none)."""
+    return Finding(fix or "syscheck_note", Severity(severity), message, fix or None)
 
 
 @dataclass
@@ -166,8 +167,6 @@ _IOS_LINE = re.compile(
     r"\s*:?\s*(?P<rest>.*)$")
 _SYSMENU = re.compile(r"(\d\.\d)(?:/[\d./]+)?([UEJKX])?\s*\(v(\d+)")
 _HBC = re.compile(r"Homebrew Channel\s+(\d+)\.(\d+)(?:\.(\d+))?.*?IOS\s*(\d+)", re.I)
-_PATCH_NAMES = {"trucha bug", "es identify", "flash access", "nand access", "es_version",
-                "boot2 access", "usb 2.0", "beer ticket", "no patches"}
 
 
 def _norm(line: str) -> str:
@@ -225,27 +224,8 @@ def parse_syscheck(text: str) -> SysCheckReport:
         if m:
             r.boot2_version = int(m.group(1))
             continue
-        if ":" in line:
-            key, _, val = line.partition(":")
-            k, val = key.strip().lower(), val.strip()
-            if k == "region" or k.startswith("région") or k.startswith("regione") \
-                    or k.startswith("región"):
-                rm = re.match(r"([A-Za-z-]+)(?:\s*\((?:[^:]*):\s*([A-Z]+)\))?", val)
-                if rm:
-                    r.region = rm.group(1)
-                    r.original_region = rm.group(2) or ""
-                continue
-            if "console" in k and "id" in k or "konsolen-id" in k:
-                r.console_id = val
-                continue
-            if val.lower() in ("wii", "vwii", "unknown", "unbekannt", "inconnu", "sconosciuto",
-                               "desconocido") and ("typ" in k or "tipo" in k or "type" in k):
-                v = val.lower()
-                r.console_type = v if v in ("wii", "vwii") else ""
-                continue
-            if "country" in k or "land" in k or "pays" in k or "paese" in k or "país" in k:
-                r.country = val
-                continue
+        if ":" in line and _parse_keyed_line(r, line):
+            continue
         m = re.search(r"(\d+)\s+(?:titles|Titel|titres|titoli|títulos)", line, re.I)
         if m and r.titles is None and "ios" not in low:
             r.titles = int(m.group(1))
@@ -253,7 +233,40 @@ def parse_syscheck(text: str) -> SysCheckReport:
         m = re.search(r"(\d{1,4}[./]\d{1,2}[./]\d{2,4})", line)
         if m and line is lines[-1]:
             r.report_date = m.group(1)
-    # console type refinements
+    _refine_console_type(r)
+    r.findings = analyze(r)
+    return r
+
+
+def _parse_keyed_line(r: SysCheckReport, line: str) -> bool:
+    """A ``Key: value`` line (region, console id, console type, country), in any of the
+    report's languages. True if it was one of those and is now stored in ``r``."""
+    key, _, val = line.partition(":")
+    k, val = key.strip().lower(), val.strip()
+    if k == "region" or k.startswith("région") or k.startswith("regione") \
+            or k.startswith("región"):
+        rm = re.match(r"([A-Za-z-]+)(?:\s*\((?:[^:]*):\s*([A-Z]+)\))?", val)
+        if rm:
+            r.region = rm.group(1)
+            r.original_region = rm.group(2) or ""
+        return True
+    if "console" in k and "id" in k or "konsolen-id" in k:
+        r.console_id = val
+        return True
+    if val.lower() in ("wii", "vwii", "unknown", "unbekannt", "inconnu", "sconosciuto",
+                       "desconocido") and ("typ" in k or "tipo" in k or "type" in k):
+        v = val.lower()
+        r.console_type = v if v in ("wii", "vwii") else ""
+        return True
+    if "country" in k or "land" in k or "pays" in k or "paese" in k or "país" in k:
+        r.country = val
+        return True
+    return False
+
+
+def _refine_console_type(r: SysCheckReport) -> None:
+    """What the report's own "console type" line can't say: a Wii mini (by its menu
+    version), and vWii / Wii when the line is missing (older SysCheck versions)."""
     if r.sysmenu_version in MINI_SYSMENU:
         r.console_type = "mini"
     elif not r.console_type:
@@ -261,8 +274,6 @@ def parse_syscheck(text: str) -> SysCheckReport:
             r.console_type = "vwii"
         elif r.ios:
             r.console_type = "wii"
-    r.findings = analyze(r)
-    return r
 
 
 def _parse_ios(m: re.Match) -> IosInfo:
@@ -302,9 +313,9 @@ def read_syscheck(path: Path) -> SysCheckReport:
     return parse_syscheck(raw.decode("latin-1", "replace"))
 
 
-def find_syscheck(root: Path) -> Optional[Path]:
-    """Locate SysCheck.csv at a drive root (case-insensitive)."""
-    root = Path(root)
+def find_syscheck(layout: DriveLayout | Path) -> Optional[Path]:
+    """Locate SysCheck.csv at the root of a drive (case-insensitive)."""
+    root = DriveLayout.of(layout).root
     try:
         for p in root.iterdir():
             if p.is_file() and p.name.lower() == "syscheck.csv":
@@ -324,38 +335,38 @@ def analyze(r: SysCheckReport) -> list[Finding]:
     f: list[Finding] = []
     ctype = r.console_type
     if not r.ios:
-        f.append(Finding("error", "This doesn't look like a SysCheck report (no IOS list found).",
+        f.append(_note("error", "This doesn't look like a SysCheck report (no IOS list found).",
                          ""))
         return f
     korean_changed = r.korean_region_changed
     if r.sysmenu_version is None:
-        f.append(Finding("warning", "The System Menu version couldn't be read.", ""))
+        f.append(_note("warning", "The System Menu version couldn't be read.", ""))
     elif ctype == "wii" and r.sysmenu_version < 512 and r.sysmenu_version not in VWII_SYSMENU \
             and not korean_changed:
-        f.append(Finding("warning", f"The Wii Menu is version {r.sysmenu or r.sysmenu_version}. "
+        f.append(_note("warning", f"The Wii Menu is version {r.sysmenu or r.sysmenu_version}. "
                          "Updating to 4.3 is recommended (do it only after Priiloader and a "
-                         "NAND backup).", "update_43"))
+                         "NAND backup).", Fix.UPDATE_43))
     if korean_changed:
-        f.append(Finding("error", "This is a Korean console that was changed to another region "
+        f.append(_note("error", "This is a Korean console that was changed to another region "
                          f"({r.region or r.sysmenu or 'unknown'}). Do NOT update the Wii Menu or "
                          "install a different Wii Menu on it: Wii Menu 4.2 and newer refuse to "
                          "start on such consoles (\"Error 003\"), which bricks them. ReWii won't "
                          "offer the 4.3 update for this console.", ""))
     elif r.original_region:
-        f.append(Finding("warning", f"This console was region-changed (originally "
+        f.append(_note("warning", f"This console was region-changed (originally "
                          f"{r.original_region}). Be careful with themes and system updates.",
                          ""))
     if not r.priiloader:
-        f.append(Finding("warning", "Priiloader isn't installed. It protects against many "
-                         "bricks; install it.", "install_priiloader"))
+        f.append(_note("warning", "Priiloader isn't installed. It protects against many "
+                         "bricks; install it.", Fix.INSTALL_PRIILOADER))
     if r.hbc_installed is False:
-        f.append(Finding("error", "The Homebrew Channel isn't installed.", "install_hbc"))
+        f.append(_note("error", "The Homebrew Channel isn't installed.", Fix.INSTALL_HBC))
     elif r.hbc_version is not None and r.hbc_version < HBC_LATEST:
-        f.append(Finding("warning", "The Homebrew Channel is out of date ("
-                         + ".".join(map(str, r.hbc_version)) + "); update to 1.1.2.", "update_hbc"))
+        f.append(_note("warning", "The Homebrew Channel is out of date ("
+                         + ".".join(map(str, r.hbc_version)) + "); update to 1.1.2.", Fix.UPDATE_HBC))
     if r.hbc_ios is not None and r.hbc_ios != 58:
-        f.append(Finding("info", f"The Homebrew Channel runs on IOS{r.hbc_ios}, not IOS58; "
-                         "USB 2.0 may not work in homebrew.", "update_hbc"))
+        f.append(_note("info", f"The Homebrew Channel runs on IOS{r.hbc_ios}, not IOS58; "
+                         "USB 2.0 may not work in homebrew.", Fix.UPDATE_HBC))
     # cIOS
     missing, wrong = [], []
     for slot, base in EXPECTED_CIOS.items():
@@ -369,43 +380,51 @@ def analyze(r: SysCheckReport) -> list[Finding]:
         if ctype != "mini" and (v is None or v < D2X_MIN_VERSION):
             wrong.append(f"IOS{slot} is {i.info or 'an old d2x'} (v{D2X_MIN_VERSION} expected)")
     if missing:
-        f.append(Finding("error" if len(missing) == len(EXPECTED_CIOS) else "warning",
+        f.append(_note("error" if len(missing) == len(EXPECTED_CIOS) else "warning",
                          "d2x cIOS is missing from slot(s) " + ", ".join(map(str, missing))
-                         + ". USB loaders need it.", "install_d2x_cios"))
+                         + ". USB loaders need it.", Fix.INSTALL_D2X_CIOS))
     if wrong:
-        f.append(Finding("warning", "cIOS should be reinstalled: " + "; ".join(wrong) + ".",
-                         "install_d2x_cios"))
+        f.append(_note("warning", "cIOS should be reinstalled: " + "; ".join(wrong) + ".",
+                         Fix.INSTALL_D2X_CIOS))
     for base in sorted(set(EXPECTED_CIOS.values())):
         b = r.ios.get(base)
         if b is not None and b.stub:
-            f.append(Finding("warning", f"IOS{base} is a stub, so the d2x cIOS built on it "
-                             "can't be installed until it's restored.", "restore_ios"))
+            f.append(_note("warning", f"IOS{base} is a stub, so the d2x cIOS built on it "
+                             "can't be installed until it's restored.", Fix.RESTORE_IOS))
     if ctype == "wii" and 58 not in r.ios:
-        f.append(Finding("warning", "IOS58 is missing (needed for USB 2.0 in homebrew).",
-                         "" if korean_changed else "update_43"))
+        f.append(_note("warning", "IOS58 is missing (needed for USB 2.0 in homebrew).",
+                         "" if korean_changed else Fix.UPDATE_43))
     if ctype == "wii" and not r.bootmii_ios and not r.bootmii_boot2:
-        f.append(Finding("info", "BootMii isn't installed. It's needed for NAND backups and "
-                         "unbricking.", "install_bootmii"))
+        f.append(_note("info", "BootMii isn't installed. It's needed for NAND backups and "
+                         "unbricking.", Fix.INSTALL_BOOTMII))
     skipped = [s for s, i in r.ios.items() if i.skipped]
     if skipped:
-        f.append(Finding("info", f"{len(skipped)} IOS were skipped by SysCheck.", ""))
+        f.append(_note("info", f"{len(skipped)} IOS were skipped by SysCheck.", ""))
     if ctype == "mini":
-        f.append(Finding("info", "Wii mini detected: it has no SD slot and no BootMii, and "
+        f.append(_note("info", "Wii mini detected: it has no SD slot and no BootMii, and "
                          "uses d2xl cIOS.", ""))
     if ctype == "vwii":
-        f.append(Finding("info", "vWii (Wii U) detected: BootMii and NAND restore aren't "
+        f.append(_note("info", "vWii (Wii U) detected: BootMii and NAND restore aren't "
                          "available in Wii mode.", ""))
     return f
 
 
-def profile_from_syscheck(report: SysCheckReport) -> tuple[str, str]:
+def profile_from_syscheck(report: SysCheckReport, current_type: str = "") -> tuple[str, str]:
     """``(console_type, region)`` in :mod:`config` terms (``""`` if unknown).
 
     The region follows the System Menu's region letter (what matters for
     themes/updates), falling back to the ``Region:`` line.
+
+    SysCheck can't tell a Wii Family Edition from an original Wii (it reports
+    both as "Wii"). Pass the type the user chose as ``current_type``: it is kept
+    when the report describes the same platform, so "family" is never turned
+    back into "wii".
     """
     region = _LETTER_TO_REGION.get(report.region_letter, "")
     if not region:
         region = {"NTSC-U": "NTSC-U", "PAL": "PAL", "NTSC-J": "NTSC-J",
                   "KOR": "NTSC-K"}.get(report.region, "")
-    return report.console_type, region
+    ctype = report.console_type
+    if ctype and console.same_platform(ctype, current_type):
+        ctype = current_type
+    return ctype, region

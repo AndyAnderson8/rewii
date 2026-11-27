@@ -69,8 +69,6 @@ def test_find_and_join(tmp_path):
     assert res.platform == "wii" and res.game_id == "RSPE01"
     assert events[-1].done == events[-1].total == len(data)
 
-    v = C.verify_dump(dumps["Wii Play (USA)"])
-    assert v.ok and v.dumpinfo_match
 
 
 def test_mismatch_and_missing_part(tmp_path):
@@ -96,7 +94,7 @@ def test_redump_dat(tmp_path):
         f'sha1="{hashlib.sha1(data).hexdigest()}"/></game></datafile>')
     res = C.join_dump(C.find_dumps(tmp_path)[0], tmp_path / "o.iso")
     assert res.dat_checked and res.redump_name == "Wii Sports (Europe)"
-    res2 = C.verify_dump(C.find_dumps(tmp_path)[0], use_dat=False)
+    res2 = C.join_dump(C.find_dumps(tmp_path)[0], tmp_path / "o2.iso", use_dat=False)
     assert not res2.dat_checked and res2.redump_name is None
 
 

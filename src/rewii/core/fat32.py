@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import BinaryIO, Optional
 
 from .progress import CancelToken, ProgressFn, Reporter
+from .errors import ReWiiError
 
 SECTOR = 512
 PART_START_LBA = 2048                 # 1 MiB alignment
@@ -65,7 +66,7 @@ _CHUNK = 4 * 1024 * 1024              # write zeros in 4 MiB chunks (multiple of
 _LABEL_OK = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 !#$%&'()-@^_`{}~")
 
 
-class Fat32Error(Exception):
+class Fat32Error(ReWiiError):
     """The requested FAT32 layout is impossible (too small/large, bad label...)."""
 
 
@@ -96,10 +97,6 @@ class Fat32Geometry:
     def data_start(self) -> int:
         """Absolute LBA of cluster 2 (the root directory)."""
         return self.fat_start + NUM_FATS * self.fat_sectors
-
-    @property
-    def volume_bytes(self) -> int:
-        return self.partition_sectors * SECTOR
 
 
 def normalize_label(label: str) -> str:

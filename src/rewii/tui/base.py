@@ -15,6 +15,7 @@ from textual.widgets import Button, DataTable
 
 from ..core.config import Settings
 from ..core.fileops import explain_os_error
+from ..core.findings import Severity
 from ..core.layout import DriveLayout
 from ..core.progress import Cancelled
 from .widgets import Choice, Confirm, Job, JobFailed, Message, PickPath, Prompt, cursor_key
@@ -23,6 +24,17 @@ if TYPE_CHECKING:
     from .app import ReWiiApp
 
 log = logging.getLogger("rewii")
+
+
+#: The one severity -> icon mapping (drive health, SysCheck report, WAD risks).
+SEVERITY_ICON = {Severity.ERROR: "✖", Severity.WARNING: "!", Severity.INFO: "i"}
+
+
+def severity_icon(severity: object) -> str:
+    try:
+        return SEVERITY_ICON[Severity(severity)]        # type: ignore[arg-type]
+    except ValueError:
+        return "?"
 
 
 class _Failed:
@@ -82,8 +94,8 @@ class Pane(Vertical):
     def focus_main(self) -> None:
         """Put the keyboard in the pane (its first table, else its first control), so
         the pane's shortcuts work right after switching to it."""
-        for w in self.query(DataTable):
-            w.focus()
+        for table in self.query(DataTable):
+            table.focus()
             return
         for w in self.query("*"):
             if w.focusable and not w.disabled:
@@ -211,23 +223,5 @@ class Pane(Vertical):
 
 def kit_lines(rep: Any) -> tuple[list[str], bool]:
     """Plain-language lines for an ``osc.StarterKitReport`` and whether anything went wrong."""
-    failed = dict(rep.failed)
-    lines = []
-    if rep.installed:
-        lines.append("Installed: " + ", ".join(rep.installed))
-    elif not (failed or rep.not_found or rep.unsupported):
-        lines.append("Everything was already installed and up to date.")
-    else:
-        lines.append("Nothing was installed.")
-    if failed:
-        lines.append("Failed:\n" + "\n".join(f"  {k}: {v}" for k, v in failed.items()))
-    if rep.not_found:
-        lines.append("Not on the Open Shop Channel any more: " + ", ".join(rep.not_found))
-    if rep.unsupported:
-        lines.append("Not for this console type (skipped): " + ", ".join(rep.unsupported))
-    if getattr(rep, "needs_console", None):
-        lines.append("Left out because the console type isn't set yet: " + ", ".join(rep.needs_console)
-                     + ".\nThe cIOS installer depends on the console (Wii, Wii U or Wii mini). Set the "
-                     "console in Settings, then use System & Guides \u2192 cIOS \u2192 \"Prepare files "
-                     "for this guide\" to put the right one on the drive.")
-    return lines, bool(failed or rep.not_found)
+    from ..core.osc import kit_lines as core_kit_lines
+    return core_kit_lines(rep)

@@ -10,7 +10,6 @@ the game ID picks the first region to try, then US, EN and the remaining regions
 """
 from __future__ import annotations
 
-import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -20,15 +19,13 @@ from collections.abc import Iterable
 
 from . import config, net
 from .config import Settings
-from .fileops import explain_os_error
+from .errors import ReWiiError
+from .fileops import explain_os_error, write_atomic
 from .ids import id_for_filename, valid_game_id
 from .layout import DriveLayout
-from .progress import CancelToken, Cancelled, ProgressFn, Reporter
+from .progress import UNIT_STEPS, Cancelled, CancelToken, ProgressFn, Reporter
 
 ART_URL = "https://art.gametdb.com/wii/{kind}/{region}/{game_id}.png"
-BANNER_URL = "https://banner.rc24.xyz/{id}.bnr"
-"""Custom banners (WiiFlow Lite's default ``custom_banner_url``); mostly GameCube games.
-Served by ID6 or ID3."""
 
 COVER_KINDS = ("cover3D", "cover", "coverfull", "coverfullHQ", "disc")
 # extra art types tried when the requested one is missing everywhere
@@ -96,7 +93,7 @@ def _png_file_ok(path: Path) -> bool:
 def cache_path(game_id: str, kind: str) -> Path:
     """Where the local cached copy of a cover lives (may not exist)."""
     if kind not in ALL_KINDS:
-        raise ValueError(f"unknown cover kind {kind!r}")
+        raise CoverError(f"unknown cover kind {kind!r}")
     return config.cache_dir() / "covers" / kind / f"{id_for_filename(game_id)}.png"
 
 
@@ -109,9 +106,9 @@ def cached_cover_path(game_id: str, kind: str = "cover3D") -> Optional[Path]:
 def wiiflow_cover_path(layout: DriveLayout, game_id: str, kind: str) -> Optional[Path]:
     """WiiFlow Lite location for ``kind`` (flat -> covers/, full -> boxcovers/), or None."""
     if kind == "cover":
-        return layout.wiiflow / "covers" / f"{id_for_filename(game_id)}.png"
+        return layout.wiiflow_covers / f"{id_for_filename(game_id)}.png"
     if kind in ("coverfull", "coverfullHQ"):
-        return layout.wiiflow / "boxcovers" / f"{id_for_filename(game_id)}.png"
+        return layout.wiiflow_boxcovers / f"{id_for_filename(game_id)}.png"
     return None
 
 
@@ -151,6 +148,10 @@ def download_cover(game_id: str, kind: str, lang: str = "EN",
     return None, ""
 
 
+class CoverError(ReWiiError, ValueError):
+    """A cover request that can't be carried out (unknown cover kind...)."""
+
+
 @dataclass
 class CoverReport:
     """Outcome of :func:`fetch_covers`: ``results[game_id][kind]`` is ok/missing/error/skipped."""
@@ -169,19 +170,9 @@ class CoverReport:
     def missing(self) -> int:
         return self.count(MISSING)
 
-    def missing_ids(self) -> list[str]:
-        return [g for g, kinds in self.results.items() if MISSING in kinds.values()]
-
 
 def _write(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".part")
-    try:
-        tmp.write_bytes(data)
-        tmp.replace(path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    write_atomic(path, data)
 
 
 def _targets(layout: DriveLayout, game_id: str, kind: str, gx: bool, wiiflow: bool) -> list[Path]:
@@ -196,28 +187,28 @@ def _targets(layout: DriveLayout, game_id: str, kind: str, gx: bool, wiiflow: bo
 
 
 def fetch_covers(layout: DriveLayout, game_ids: Iterable[str],
-                 kinds: Optional[Iterable[str]] = None, settings: Optional[Settings] = None,
+                 kinds: Optional[Iterable[str]], settings: Settings,
                  progress: Optional[ProgressFn] = None, cancel: Optional[CancelToken] = None,
                  *, wiiflow: Optional[bool] = None, usbloadergx: bool = True,
                  refresh: bool = False, overwrite: bool = False,
                  workers: int = 4) -> CoverReport:
     """Download covers for many games onto the drive (and the local cache).
 
-    ``kinds`` defaults to ``settings.cover_types``. ``wiiflow=None`` writes WiiFlow
+    ``kinds=None`` means ``settings.cover_types`` (``settings`` is required: the cover
+    types and language are the user's choice, never silent defaults). ``wiiflow=None`` writes WiiFlow
     copies only if a ``wiiflow/`` folder already exists. A cached cover is reused
     unless ``refresh``; covers already on the drive are skipped unless ``overwrite``.
     Raises :class:`Cancelled` if cancelled.
     """
-    settings = settings or Settings()
     layout.require_root()
     kinds_l = [k for k in (kinds or settings.cover_types) if k in COVER_KINDS]
     ids = list(dict.fromkeys(g.strip().upper() for g in game_ids if g and g.strip()))
     if wiiflow is None:
-        wiiflow = layout.wiiflow.is_dir()
+        wiiflow = layout.has_wiiflow
     lang = settings.cover_lang or "EN"
     report = CoverReport({g: {} for g in ids})
     jobs = [(g, k) for g in ids for k in kinds_l]
-    rep = Reporter(progress, cancel, total=len(jobs), message="Downloading covers")
+    rep = Reporter(progress, cancel, total=len(jobs), message="Downloading covers", unit=UNIT_STEPS)
     rep.set_total(len(jobs))
     write_lock = threading.Lock()
     tok = cancel
@@ -282,88 +273,11 @@ def cover_status(layout: DriveLayout, game_id: str) -> dict[str, bool]:
     """
     gid = id_for_filename(game_id)
     out = {k: gx_cover_path(layout, gid, k).is_file() for k in COVER_KINDS}
-    out["wiiflow_cover"] = (layout.wiiflow / "covers" / f"{gid}.png").is_file()
-    out["wiiflow_box"] = (layout.wiiflow / "boxcovers" / f"{gid}.png").is_file()
+    out["wiiflow_cover"] = (layout.wiiflow_covers / f"{gid}.png").is_file()
+    out["wiiflow_box"] = (layout.wiiflow_boxcovers / f"{gid}.png").is_file()
     out["cached"] = any(cached_cover_path(gid, k) is not None for k in COVER_KINDS)
     return out
 
 
-def best_cached_cover(game_id: str,
-                      prefer: Iterable[str] = ("cover", "cover3D", "coverfullHQ",
-                                               "coverfull", "disc")) -> Optional[Path]:
-    """First cached cover found in ``prefer`` order (handy for previews)."""
-    for k in prefer:
-        p = cached_cover_path(game_id, k)
-        if p is not None:
-            return p
-    return None
-
-
-def remove_covers(layout: DriveLayout, game_id: str) -> int:
-    """Delete every cover for ``game_id`` from the drive (not the cache). Returns count."""
-    gid = id_for_filename(game_id)
-    n = 0
-    paths = {gx_cover_path(layout, gid, k) for k in COVER_KINDS}
-    paths |= {layout.wiiflow / "covers" / f"{gid}.png", layout.wiiflow / "boxcovers" / f"{gid}.png"}
-    for p in paths:
-        if p.is_file():
-            p.unlink()
-            n += 1
-    return n
-
-
 # --------------------------------------------------------------------------- banners
-def gx_banner_dir(layout: DriveLayout) -> Path:
-    """USB Loader GX ``BNRCachePath`` (``apps/usbloader_gx/cache_bnr/``, per CSettings.cpp)."""
-    return layout.usbloadergx / "cache_bnr"
 
-
-def wiiflow_banner_dir(layout: DriveLayout) -> Path:
-    """WiiFlow Lite ``dir_custom_banners`` (``wiiflow/custom_banners``)."""
-    return layout.wiiflow / "custom_banners"
-
-
-def _valid_banner(data: Optional[bytes]) -> bool:
-    return (data is not None and len(data) > 0x5000 and data[:1] != b"<"
-            and b"IMET" in data[:0x100])
-
-
-def download_custom_banner(layout: DriveLayout, game_id: str, *,
-                           wiiflow: Optional[bool] = None, refresh: bool = False,
-                           overwrite: bool = False) -> Optional[Path]:
-    """Fetch a custom ``.bnr`` from banner.rc24.xyz (ID6, then ID3) into USB Loader GX's
-    ``cache_bnr/<ID6>.bnr`` (and WiiFlow's ``custom_banners/`` if used).
-
-    Returns the GX path, or None if no banner exists. Mostly available for GameCube
-    games. Raises :class:`net.NetError` when offline and nothing is cached.
-    """
-    gid = game_id.strip().upper()
-    if not valid_game_id(gid):
-        return None
-    layout.require_root()
-    if wiiflow is None:
-        wiiflow = layout.wiiflow.is_dir()
-    dest = gx_banner_dir(layout) / f"{gid}.bnr"
-    cp = config.cache_dir() / "banners" / f"{gid}.bnr"
-    data: Optional[bytes] = None
-    if dest.is_file() and not overwrite and not refresh:
-        data = dest.read_bytes()
-    elif cp.is_file() and not refresh:
-        data = cp.read_bytes()
-    else:
-        for ident in dict.fromkeys((gid, gid[:3])):
-            d = net.get_bytes(BANNER_URL.format(id=ident), ok404=True)
-            if _valid_banner(d):
-                data = d
-                break
-        if data is None:
-            return None
-        _write(cp, data)
-    if overwrite or refresh or not dest.is_file():
-        _write(dest, data)
-    if wiiflow:
-        wf = wiiflow_banner_dir(layout) / f"{gid}.bnr"
-        if overwrite or not wf.is_file():
-            wf.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(dest, wf)
-    return dest

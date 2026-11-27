@@ -20,16 +20,8 @@ from textual.screen import ModalScreen
 from textual.widgets import (Button, DataTable, DirectoryTree, Input, Label, ProgressBar,
                              SelectionList, Static)
 
-from ..core.progress import Cancelled, CancelToken, ProgressEvent
-
-
-def human_size(n: float | None) -> str:
-    n = float(n or 0)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if abs(n) < 1000 or unit == "TB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1000
-    return str(n)
+from ..core.drives import human_size  # noqa: F401 - the one human_size; panes import it from here
+from ..core.progress import UNIT_BYTES, Cancelled, CancelToken, ProgressEvent
 
 
 def cursor_key(table: DataTable) -> Optional[str]:
@@ -295,7 +287,9 @@ class Job(ModalScreen[Any]):
         else:
             bar.update(total=None)
         if ev.message:
-            extra = f"  ({human_size(ev.done)} / {human_size(ev.total)})" if ev.total > 10_000_000 else ""
+            # sizes only for byte counts (ev.unit says so), and only when they are worth showing
+            sized = ev.unit == UNIT_BYTES and ev.total > 10_000_000
+            extra = f"  ({human_size(ev.done)} / {human_size(ev.total)})" if sized else ""
             self.query_one("#msg", Static).update(ev.message + extra)
 
     def _run(self) -> None:

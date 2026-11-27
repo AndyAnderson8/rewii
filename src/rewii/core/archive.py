@@ -18,16 +18,17 @@ from pathlib import Path
 from typing import Optional
 from collections.abc import Callable, Sequence
 
+from .fileops import is_reserved_name, part_path
 from .progress import CancelToken, ProgressFn, Reporter
+from .errors import ReWiiError
 
 MAX_UNCOMPRESSED = 4 * 1024 ** 3      # zip-bomb guard
 CHUNK = 256 * 1024
 
-_RESERVED = re.compile(r"^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])$", re.I)
 _BAD_CHARS = set(':*?"<>|')
 
 
-class ArchiveError(Exception):
+class ArchiveError(ReWiiError):
     """The archive is unsafe or unreadable."""
 
 
@@ -35,11 +36,6 @@ class UnusableName(ArchiveError):
     """An entry whose name can't exist on a FAT32/Windows drive (odd characters, a
     reserved device name, a trailing dot...). Harmless, so extraction skips it
     instead of refusing the whole archive."""
-
-
-def is_reserved_name(part: str) -> bool:
-    """True for Windows device names (``CON``, ``nul.txt``, ``COM1`` ...)."""
-    return _RESERVED.match(part.split(".", 1)[0].rstrip(" ")) is not None
 
 
 def safe_parts(name: str) -> Optional[list[str]]:
@@ -168,7 +164,7 @@ def extract_zip(zip_path: Path | str, dest_root: Path | str, *,
         budget = max_total
         for info, target in todo:
             target.parent.mkdir(parents=True, exist_ok=True)
-            tmp = target.with_name(target.name + ".part")
+            tmp = part_path(target)
             try:
                 with z.open(info) as src, open(tmp, "wb") as dst:
                     while True:
