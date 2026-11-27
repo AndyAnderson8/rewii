@@ -12,7 +12,7 @@ import hashlib
 import struct
 from pathlib import Path
 
-from .fileops import make_sparse
+from .fileops import make_sparse, set_length
 from .disc import (GC_MAGIC, WII_MAGIC, WII_SECTOR, WII_SECTOR_DATA, aes_cbc_encrypt, common_key)
 
 PART_OFF = 0x50000
@@ -111,7 +111,7 @@ def make_wii_iso(path: Path, game_id: str = "RTST01", title: str = "TEST GAME",
         logical_size = (end + (2 << 20) - 1) // (2 << 20) * (2 << 20)
     with open(path, "wb") as f:
         make_sparse(f)
-        f.truncate(logical_size)
+        set_length(f, logical_size)
         f.seek(0)
         f.write(_header(game_id, title, True))
         f.seek(0x40000)
@@ -153,7 +153,7 @@ def make_gc_iso(path: Path, game_id: str = "GTST01", title: str = "GC TEST", dis
     with open(path, "wb") as f:
         f.write(fs)
         make_sparse(f)
-        f.truncate(max(size, len(fs)))
+        set_length(f, max(size, len(fs)))
     return Path(path)
 
 

@@ -14,7 +14,7 @@ from typing import BinaryIO, Optional
 from . import fileops
 from .disc import (FAT32_SPLIT, WII_DL_SECTORS, WII_SECTOR, DiscError, DiscReader,
                    WbfsFileReader, incomplete_reason, parse_header, used_sectors, wii_usage_table)
-from .fileops import make_sparse
+from .fileops import make_sparse, set_length
 from .progress import CancelToken, ProgressFn, Reporter
 
 WBFS_SEC_S = 21                    # 2 MiB WBFS blocks, what WBM/wit use for files
@@ -68,9 +68,9 @@ class SplitWriter:
             last = max(0, (total - 1) // self.split)
             for i in range(last + 1):
                 f = self._open(i)
-                f.truncate(min(self.split, total - i * self.split))
+                set_length(f, min(self.split, total - i * self.split))
         else:
-            self._open(0).truncate(total)
+            set_length(self._open(0), total)
 
     def close(self, sync: bool = True) -> None:
         """Close every part. With ``sync`` the data is flushed to the device first

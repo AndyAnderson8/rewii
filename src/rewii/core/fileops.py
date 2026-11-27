@@ -347,6 +347,30 @@ def make_sparse(f: object) -> None:
         pass      # not NTFS, or no handle: the file is simply not sparse
 
 
+def set_length(f: object, size: int) -> None:
+    """Set an open file's length to ``size`` without writing the new part.
+
+    Use instead of ``f.truncate(size)`` when growing a (sparse) file: on Windows
+    Python's truncate fills the new range with real zeros, which takes the time
+    and disk space of the whole file. Call :func:`make_sparse` first."""
+    if sys.platform != "win32":
+        f.truncate(size)                                               # type: ignore[attr-defined]
+        return
+    try:      # pragma: no cover - Windows only
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        f.flush()                                                      # type: ignore[attr-defined]
+        k32 = ctypes.windll.kernel32                                   # type: ignore[attr-defined]
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(f.fileno()))     # type: ignore[attr-defined]
+        pos = f.tell()                                                 # type: ignore[attr-defined]
+        if not k32.SetFilePointerEx(handle, ctypes.c_longlong(size), None, 0) or not k32.SetEndOfFile(handle):
+            raise OSError("SetEndOfFile failed")
+        f.seek(pos)                                                    # type: ignore[attr-defined]
+    except (OSError, AttributeError, ValueError):
+        f.truncate(size)                                               # type: ignore[attr-defined]
+
+
 def safe_join(base: Path, rel: str) -> Path:
     """Join a forward-slash relative path from a manifest/archive onto ``base``.
 
