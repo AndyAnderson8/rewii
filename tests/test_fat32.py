@@ -14,7 +14,7 @@ from rewii.core.fat32 import (MAX_SIZE, MIN_CLUSTERS, PART_START_LBA, SECTOR, Fa
                               format_fat32, normalize_label, parse_boot_sector, parse_mbr,
                               plan_fat32)
 from rewii.core.progress import Cancelled, CancelToken
-from rewii.core.fileops import make_sparse
+from rewii.core.fileops import make_sparse, set_length
 
 MiB = 1024 ** 2
 GiB = 1024 ** 3
@@ -180,7 +180,7 @@ def test_reformat_overwrites_old_data(tmp_path):
     img = tmp_path / "disk.img"
     with open(img, "wb") as f:
         make_sparse(f)
-        f.truncate(256 * MiB)
+        set_length(f, 256 * MiB)
         f.seek(512)
         f.write(b"EFI PART" + b"\xff" * 504)          # fake primary GPT header
         f.seek(256 * MiB - 512)

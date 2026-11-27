@@ -46,7 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Optional
 
-from .fileops import make_sparse
+from .fileops import make_sparse, set_length
 from .progress import CancelToken, ProgressFn, Reporter
 from .errors import ReWiiError
 
@@ -384,7 +384,7 @@ def format_fat32(target: str | os.PathLike[str] | BinaryIO, size_bytes: Optional
                 if path.stat().st_size < size_bytes:
                     with open(path, "r+b") as grow:
                         make_sparse(grow)          # NTFS would otherwise allocate the whole image
-                        grow.truncate(size_bytes)
+                        set_length(grow, size_bytes)
         f: BinaryIO = open(path, "r+b", buffering=0)
     else:
         f = target  # type: ignore[assignment]
